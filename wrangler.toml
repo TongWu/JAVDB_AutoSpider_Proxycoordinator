@@ -1,0 +1,66 @@
+name = "proxy-coordinator"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# SQLite-backed Durable Object class.  Required on the Workers Free plan
+# (only SQLite-backed DOs are available there; KV-backed DOs require Paid).
+[[durable_objects.bindings]]
+name = "PROXY_DO"
+class_name = "ProxyCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProxyCoordinator"]
+
+# Workers Analytics Engine for per-lease metrics (free tier: 100k data points/day).
+#
+# DISABLED BY DEFAULT because Analytics Engine requires a one-time
+# manual opt-in in the Cloudflare Dashboard before any Worker can bind
+# to it.  Without that opt-in `wrangler deploy` fails with:
+#   "You need to enable Analytics Engine. Head to the Cloudflare Dashboard..."
+#
+# To enable observability:
+#   1. Open the URL printed in the deploy error (or
+#      https://dash.cloudflare.com/<account-id>/workers/analytics-engine )
+#      and click "Enable Analytics Engine".
+#   2. Uncomment the block below.
+#   3. Re-run `npx wrangler deploy`.
+#
+# The Worker's analytics writes are guarded by `if (!env.LEASE_ANALYTICS)`
+# so leaving this commented out has zero functional impact — only the
+# `proxy_coordinator_leases` dataset is unavailable for observability.
+[[analytics_engine_datasets]]
+binding = "LEASE_ANALYTICS"
+dataset = "proxy_coordinator_leases"
+
+# Workers Logs (observability) — 持久化 console.log/warn/error 到 Dashboard。
+# 启用后日志默认保留 3 天，可在 Dashboard → Workers → Logs 查看。
+# Free 计划 200k 事件/天免费；超出按 $0.60/百万事件计费（Paid 计划前 20M/月免费）。
+# 高 QPS 时可调低 head_sampling_rate（如 0.2 = 20% 采样），错误日志仍优先保留。
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+
+# `wrangler dev` exposes the Worker on http://localhost:8787 by default.
+# Logs are streamed to the terminal; use `--local` for full in-memory mode
+# (no Cloudflare account / API token required).
+[dev]
+port = 8787
+
+# Optional vars (non-secret).  Tuning the throttle windows here lets ops
+# adjust limits without redeploying client code.  Defaults match the Python
+# `TripleWindowThrottle` (30s/3, 300s/30, 1800s/200) and the Penalty TIERS
+# (1→1.30, 2→1.65, 4→2.00).
+[vars]
+SHORT_WINDOW_SEC = "30"
+SHORT_MAX = "3"
+LONG_WINDOW_SEC = "300"
+LONG_MAX = "30"
+EXTRA_WINDOW_SEC = "1800"
+EXTRA_MAX = "200"
+PENALTY_WINDOW_SEC = "300"
+JITTER_MAX_MS = "500"
+
+# Secrets (set via `wrangler secret put`):
+#   PROXY_COORDINATOR_TOKEN — bearer token required on every /lease, /report
