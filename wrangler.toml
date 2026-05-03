@@ -48,10 +48,7 @@ new_sqlite_classes = ["GlobalLoginState"]
 binding = "LEASE_ANALYTICS"
 dataset = "proxy_coordinator_leases"
 
-# Workers Logs (observability) — 持久化 console.log/warn/error 到 Dashboard。
-# 启用后日志默认保留 3 天，可在 Dashboard → Workers → Logs 查看。
-# Free 计划 200k 事件/天免费；超出按 $0.60/百万事件计费（Paid 计划前 20M/月免费）。
-# 高 QPS 时可调低 head_sampling_rate（如 0.2 = 20% 采样），错误日志仍优先保留。
+# Workers Logs (observability)
 [observability]
 enabled = true
 head_sampling_rate = 1.0
