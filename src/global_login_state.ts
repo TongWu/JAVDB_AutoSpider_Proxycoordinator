@@ -1,6 +1,9 @@
 import {
   AcquireLeaseRequest,
   AcquireLeaseResponse,
+  DEFAULT_LOGIN_COOLDOWN_DURATION_MS,
+  DEFAULT_LOGIN_COOLDOWN_THRESHOLD,
+  DEFAULT_LOGIN_COOLDOWN_WINDOW_SEC,
   Env,
   InvalidateRequest,
   InvalidateResponse,
@@ -9,6 +12,10 @@ import {
   LOGIN_LEASE_TTL_MIN_MS,
   PublishRequest,
   PublishResponse,
+  RECENT_ATTEMPTS_MAX_LEN,
+  RecordAttemptOutcome,
+  RecordAttemptRequest,
+  RecordAttemptResponse,
   ReleaseLeaseRequest,
   ReleaseLeaseResponse,
 } from "./types";
@@ -45,6 +52,23 @@ interface LoginLease {
   expires_at: number;
 }
 
+/**
+ * P2-C — single login attempt record kept in
+ * {@link GlobalLoginStateData.recent_attempts}.  Stored verbatim so ops
+ * can dump the buffer for diagnostics; the cooldown function only
+ * inspects ``at`` + ``outcome``.
+ */
+interface LoginAttemptRecord {
+  /** Wall-clock ms epoch when the attempt was recorded. */
+  at: number;
+  /** Proxy that performed (or attempted) the login.  Free-form string
+   *  capped to ``RUNNER_FIELD_MAX_LEN``-equivalent length on input. */
+  proxy_name: string;
+  outcome: RecordAttemptOutcome;
+  /** Caller-side opaque identity; ops only. */
+  holder_id: string;
+}
+
 interface GlobalLoginStateData {
   proxy_name: string | null;
   /**
@@ -57,6 +81,14 @@ interface GlobalLoginStateData {
   version: number;
   last_verified_at: number;
   lease: LoginLease | null;
+  /**
+   * P2-C — sliding window of the most recent login attempts.  Pruned on
+   * every read against ``LOGIN_COOLDOWN_WINDOW_SEC``; capped at
+   * ``RECENT_ATTEMPTS_MAX_LEN`` entries to defend against a hot-loop
+   * caller.  Optional in storage so old snapshots written before P2-C
+   * round-trip cleanly through ``loadState``.
+   */
+  recent_attempts?: LoginAttemptRecord[];
 }
 
 const STORAGE_KEY = "state";
@@ -113,6 +145,8 @@ export class GlobalLoginState implements DurableObject {
           return await this.handleInvalidate(request);
         case "/do/login_state/release_lease":
           return await this.handleReleaseLease(request);
+        case "/do/login_state/record_attempt":
+          return await this.handleRecordAttempt(request);
         default:
           return new Response("Not Found", { status: 404 });
       }
@@ -166,6 +200,18 @@ export class GlobalLoginState implements DurableObject {
     const now = Date.now();
     const data = await this.loadState();
 
+    // P2-C: prune stale attempt records on every acquire (cheap, single
+    // pass over a bounded buffer) so the cooldown decision below sees
+    // only entries inside the configured window.  Persisted only when
+    // the lease itself changes — pruning alone doesn't justify a write
+    // because next acquire will prune again from scratch.
+    const cfg = loadCooldownConfig(this.env);
+    const recentAttempts = pruneRecentAttempts(
+      data.recent_attempts ?? [],
+      now,
+      cfg.windowSec,
+    );
+
     const leaseExpired =
       data.lease === null || now >= data.lease.expires_at;
     const sameHolder =
@@ -182,15 +228,96 @@ export class GlobalLoginState implements DurableObject {
         target_proxy_name: targetProxy,
         expires_at: now + ttlMs,
       };
+      // Persist the pruned buffer alongside the lease change so we never
+      // grow recent_attempts unboundedly across acquires.
+      data.recent_attempts = recentAttempts;
       await this.persistState(data);
       acquired = true;
     }
+
+    // P2-C cooldown calculation: count failures inside the window; emit
+    // ``cooldown_until_ms`` only when the failure count crosses the
+    // configured threshold.  We always grant the lease (per the plan's
+    // explicit "still granted" contract) — the caller is expected to
+    // park its login flow until ``cooldown_until_ms``.
+    const failureCount = recentAttempts.reduce(
+      (n, a) => (a.outcome === "failure" ? n + 1 : n),
+      0,
+    );
+    const cooldownUntilMs =
+      failureCount >= cfg.threshold
+        ? computeCooldownUntilMs(recentAttempts, now, cfg.durationMs)
+        : 0;
 
     const response: AcquireLeaseResponse = {
       acquired,
       holder_id: data.lease!.holder_id,
       target_proxy_name: data.lease!.target_proxy_name,
       lease_expires_at: data.lease!.expires_at,
+      cooldown_until_ms: cooldownUntilMs,
+      recent_attempt_count: recentAttempts.length,
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  private async handleRecordAttempt(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<RecordAttemptRequest>;
+    const holderId = String(body.holder_id ?? "").trim();
+    const proxyName = String(body.proxy_name ?? "").trim();
+    const outcome = String(body.outcome ?? "") as RecordAttemptOutcome;
+    if (!holderId || !proxyName) {
+      return jsonResponse(
+        { error: "missing holder_id or proxy_name" },
+        400,
+      );
+    }
+    if (outcome !== "success" && outcome !== "failure") {
+      return jsonResponse(
+        { error: 'outcome must be "success" or "failure"' },
+        400,
+      );
+    }
+
+    const now = Date.now();
+    const data = await this.loadState();
+    const cfg = loadCooldownConfig(this.env);
+
+    // Append + prune + cap.  The pruning happens before the append so a
+    // single flood of records cannot push older legitimate entries out
+    // before they would naturally expire from the window.
+    const pruned = pruneRecentAttempts(
+      data.recent_attempts ?? [],
+      now,
+      cfg.windowSec,
+    );
+    pruned.push({
+      at: now,
+      proxy_name: clipShortString(proxyName),
+      outcome,
+      holder_id: clipShortString(holderId),
+    });
+    // Hard cap: drop oldest entries if the buffer somehow exceeds the
+    // safety bound (shouldn't happen in practice given window pruning).
+    while (pruned.length > RECENT_ATTEMPTS_MAX_LEN) {
+      pruned.shift();
+    }
+    data.recent_attempts = pruned;
+    await this.persistState(data);
+
+    const failureCount = pruned.reduce(
+      (n, a) => (a.outcome === "failure" ? n + 1 : n),
+      0,
+    );
+    const cooldownUntilMs =
+      failureCount >= cfg.threshold
+        ? computeCooldownUntilMs(pruned, now, cfg.durationMs)
+        : 0;
+
+    const response: RecordAttemptResponse = {
+      recent_attempt_count: pruned.length,
+      recent_failure_count: failureCount,
+      cooldown_until_ms: cooldownUntilMs,
       server_time: now,
     };
     return jsonResponse(response);
@@ -310,15 +437,23 @@ export class GlobalLoginState implements DurableObject {
   private async loadState(): Promise<GlobalLoginStateData> {
     const stored =
       (await this.state.storage.get<GlobalLoginStateData>(STORAGE_KEY)) ?? null;
-    return (
-      stored ?? {
+    if (stored === null) {
+      return {
         proxy_name: null,
         cookie_ciphertext: null,
         version: 0,
         last_verified_at: 0,
         lease: null,
-      }
-    );
+        recent_attempts: [],
+      };
+    }
+    // Defensive backfill: pre-P2-C snapshots may not have
+    // ``recent_attempts``; default to an empty array so downstream
+    // code (acquire / record_attempt) doesn't have to null-check.
+    if (!Array.isArray(stored.recent_attempts)) {
+      stored.recent_attempts = [];
+    }
+    return stored;
   }
 
   private async persistState(data: GlobalLoginStateData): Promise<void> {
@@ -402,6 +537,89 @@ function clampTtlMs(raw: number): number {
   }
   if (raw > LOGIN_LEASE_TTL_MAX_MS) return LOGIN_LEASE_TTL_MAX_MS;
   return Math.floor(raw);
+}
+
+/**
+ * P2-C — read the cooldown tuning values from Worker env, falling back
+ * to the defaults defined in `types.ts`.  Each call re-reads the env so
+ * a `wrangler` redeploy with new values takes effect on the next
+ * `acquire_lease` without a DO restart.  Costs ~one numeric parse per
+ * call; cheaper than caching + invalidating across token-rotation.
+ */
+function loadCooldownConfig(env: Env): {
+  threshold: number;
+  windowSec: number;
+  durationMs: number;
+} {
+  const num = (v: string | undefined, fallback: number): number => {
+    if (v === undefined || v === "") return fallback;
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  return {
+    threshold: num(env.LOGIN_COOLDOWN_THRESHOLD, DEFAULT_LOGIN_COOLDOWN_THRESHOLD),
+    windowSec: num(env.LOGIN_COOLDOWN_WINDOW_SEC, DEFAULT_LOGIN_COOLDOWN_WINDOW_SEC),
+    durationMs: num(
+      env.LOGIN_COOLDOWN_DURATION_MS,
+      DEFAULT_LOGIN_COOLDOWN_DURATION_MS,
+    ),
+  };
+}
+
+/**
+ * Drop entries older than ``windowSec`` and return a fresh array.
+ * Linear scan over a buffer that is bounded by `RECENT_ATTEMPTS_MAX_LEN`
+ * so the cost is negligible (a few hundred Date arithmetic ops worst case).
+ */
+function pruneRecentAttempts(
+  attempts: LoginAttemptRecord[],
+  now: number,
+  windowSec: number,
+): LoginAttemptRecord[] {
+  const cutoff = now - windowSec * 1000;
+  const out: LoginAttemptRecord[] = [];
+  for (const a of attempts) {
+    if (typeof a.at === "number" && a.at >= cutoff) {
+      out.push(a);
+    }
+  }
+  return out;
+}
+
+/**
+ * Compute ``cooldown_until_ms`` based on the latest failure inside the
+ * pruned window.  Anchoring on the most recent failure (rather than
+ * "now") means a successful login does NOT extend the cooldown — only
+ * fresh failures push it forward.  Returns ``0`` when there are no
+ * failures (caller should already short-circuit on threshold, but this
+ * keeps the function safe to call in any state).
+ */
+function computeCooldownUntilMs(
+  attempts: LoginAttemptRecord[],
+  now: number,
+  durationMs: number,
+): number {
+  let lastFailureAt = 0;
+  for (const a of attempts) {
+    if (a.outcome === "failure" && a.at > lastFailureAt) {
+      lastFailureAt = a.at;
+    }
+  }
+  if (lastFailureAt <= 0) return 0;
+  const until = lastFailureAt + durationMs;
+  return until > now ? until : 0;
+}
+
+/**
+ * Truncate caller-provided strings to a sensible bound before persisting
+ * them in DO storage.  Mirrors ``clipShortString`` in
+ * `movie_claim_state.ts`; kept module-private so the cap can be tuned
+ * independently per-DO.
+ */
+function clipShortString(value: string): string {
+  const MAX = 256;
+  if (value.length <= MAX) return value;
+  return value.slice(0, MAX);
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

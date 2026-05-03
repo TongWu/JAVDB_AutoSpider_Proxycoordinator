@@ -2,20 +2,28 @@ import { Env, LeaseRequest, ReportRequest } from "./types";
 
 export { ProxyCoordinator } from "./proxy_coordinator";
 export { GlobalLoginState } from "./global_login_state";
+export { MovieClaimState } from "./movie_claim_state";
+export { RunnerRegistry } from "./runner_registry";
 
 /**
  * Endpoints that accept GET (every other request must be POST).  Kept as a
  * `Set` so adding new read-only routes is a one-line edit instead of touching
  * the conditional in two places.
  */
-const GET_ALLOWED_PATHS = new Set<string>(["/state", "/login_state"]);
+const GET_ALLOWED_PATHS = new Set<string>([
+  "/state",
+  "/login_state",
+  "/movie_status",
+  "/active_runners",
+]);
 
 /**
  * Worker entry point.  Routes:
  *
  * Per-proxy throttling (ProxyCoordinator DO, addressed by `idFromName(proxy_id)`):
  * - `POST /lease`   — body `{ proxy_id, intended_sleep_ms }` → grant pacing slot.
- * - `POST /report`  — body `{ proxy_id, kind }`              → record CF/failure event.
+ * - `POST /report`  — body `{ proxy_id, kind, ttl_ms?, reason? }` → record
+ *                     CF/failure event OR mutate ban / cf_bypass state (P1-A).
  * - `GET  /state?proxy_id=...` — debug snapshot.
  *
  * Cross-runtime login state (GlobalLoginState DO, addressed by `idFromName("global")`):
@@ -24,6 +32,23 @@ const GET_ALLOWED_PATHS = new Set<string>(["/state", "/login_state"]);
  * - `POST /login_state/publish`          — publish a fresh cookie (lease holder only).
  * - `POST /login_state/invalidate`       — mark current cookie bad (optimistic version lock).
  * - `POST /login_state/release_lease`    — owner releases the re-login mutex.
+ * - `POST /login_state/record_attempt`   — append a `{success|failure}` record
+ *   (P2-C) to the rolling buffer used by the cooldown function.
+ *
+ * Cross-runner movie detail claim (MovieClaimState DO, addressed by
+ * `idFromName("YYYY-MM-DD")` — per-day shard):
+ * - `POST /claim_movie`    — body `{ href, holder_id, ttl_ms?, date? }` → claim or check status.
+ * - `POST /release_movie`  — body `{ href, holder_id, date? }` → relinquish a held claim.
+ * - `POST /complete_movie` — body `{ href, holder_id, date? }` → mark claim done.
+ * - `POST /report_failure` — body `{ href, holder_id?, error_kind?, cooldown_ms?, date? }`
+ *                            → record a failure + bump cooldown (P2-A).
+ * - `GET  /movie_status?href=...&date=YYYY-MM-DD` — ops debug.
+ *
+ * Runner registry (RunnerRegistry DO, singleton `idFromName("runners")`, P2-E):
+ * - `POST /register`       — body `{ holder_id, workflow_run_id?, workflow_name?, started_at?, proxy_pool_hash?, page_range? }`.
+ * - `POST /heartbeat`      — body `{ holder_id }` → refresh `last_heartbeat`.
+ * - `POST /unregister`     — body `{ holder_id }` → atexit-style removal.
+ * - `GET  /active_runners` — read-only snapshot for ops dashboards.
  *
  * Liveness:
  * - `GET  /health`  — unauthenticated 200 OK probe.
@@ -96,6 +121,66 @@ export default {
             env, "/do/login_state/release_lease", "POST", body,
           );
         }
+        case "/login_state/record_attempt": {
+          // P2-C — append a {success|failure} record into the
+          // GlobalLoginState DO's rolling `recent_attempts` buffer.
+          // The DO returns the post-append cooldown so the caller can
+          // ack the next acquire_lease decision without an extra
+          // round-trip — this matters for the cookie publisher path
+          // which reports its own outcome immediately after publish().
+          const body = await request.json();
+          return await forwardToGlobalLoginStateDo(
+            env, "/do/login_state/record_attempt", "POST", body,
+          );
+        }
+        // ── P1-B: per-day movie claim shard ────────────────────────────
+        case "/claim_movie": {
+          const body = (await request.json()) as { href?: string; date?: string };
+          const shard = resolveClaimShard(body?.date);
+          return await forwardToMovieClaimDo(env, shard, "/do/claim_movie", "POST", body);
+        }
+        case "/release_movie": {
+          const body = (await request.json()) as { date?: string };
+          const shard = resolveClaimShard(body?.date);
+          return await forwardToMovieClaimDo(env, shard, "/do/release_movie", "POST", body);
+        }
+        case "/complete_movie": {
+          const body = (await request.json()) as { date?: string };
+          const shard = resolveClaimShard(body?.date);
+          return await forwardToMovieClaimDo(env, shard, "/do/complete_movie", "POST", body);
+        }
+        case "/report_failure": {
+          // P2-A — failure / cooldown / dead-letter.  Same per-day shard
+          // routing as the rest of the MovieClaim cluster so a failure is
+          // observed by every claim attempt within the same shard.
+          const body = (await request.json()) as { date?: string };
+          const shard = resolveClaimShard(body?.date);
+          return await forwardToMovieClaimDo(env, shard, "/do/report_failure", "POST", body);
+        }
+        case "/movie_status": {
+          // Dual-purpose endpoint: callers may pass `date` either as a query
+          // arg (preferred) or rely on the server's "today" default.  href is
+          // forwarded via the same query string so the DO can deserialise.
+          const date = url.searchParams.get("date");
+          const shard = resolveClaimShard(date);
+          const upstreamUrl = `/do/movie_status?${url.searchParams.toString()}`;
+          return await forwardToMovieClaimDo(env, shard, upstreamUrl, "GET", null);
+        }
+        // ── P2-E: runner registry singleton ───────────────────────────
+        case "/register": {
+          const body = await request.json();
+          return await forwardToRunnerRegistryDo(env, "/do/register", "POST", body);
+        }
+        case "/heartbeat": {
+          const body = await request.json();
+          return await forwardToRunnerRegistryDo(env, "/do/heartbeat", "POST", body);
+        }
+        case "/unregister": {
+          const body = await request.json();
+          return await forwardToRunnerRegistryDo(env, "/do/unregister", "POST", body);
+        }
+        case "/active_runners":
+          return await forwardToRunnerRegistryDo(env, "/do/active_runners", "GET", null);
         default:
           return jsonResponse({ error: "not found" }, 404);
       }
@@ -195,6 +280,126 @@ async function forwardToGlobalLoginStateDo(
     status: upstream.status,
     headers: upstream.headers,
   });
+}
+
+/**
+ * Forward to a per-day-sharded {@link MovieClaimState} DO (P1-B).  The shard
+ * key is a `YYYY-MM-DD` string in the operational time zone (Asia/Singapore,
+ * mirroring `path_helper.ensure_dated_dir` on the Python side); a single
+ * day's claims live in one DO instance and old shards naturally evict via
+ * the Cloudflare DO LRU.
+ *
+ * The DO response body is buffered through ``await text()`` before being
+ * re-emitted, mirroring `forwardToGlobalLoginStateDo` — see that function's
+ * comment for why streaming would break vitest-pool-workers' isolated
+ * storage stack-frame cleanup.
+ *
+ * Returns a 503 when the binding is missing (i.e. the v3 migration has not
+ * been applied yet) so the Python client treats it as ``Unavailable`` and
+ * falls open to local-only behaviour.
+ */
+async function forwardToMovieClaimDo(
+  env: Env,
+  shardId: string,
+  path: string,
+  method: "GET" | "POST",
+  body: unknown,
+): Promise<Response> {
+  if (!env.MOVIE_CLAIM_DO) {
+    return jsonResponse(
+      { error: "movie_claim_state binding not configured (apply v3 migration)" },
+      503,
+    );
+  }
+  const id = env.MOVIE_CLAIM_DO.idFromName(shardId);
+  const stub = env.MOVIE_CLAIM_DO.get(id);
+  const init: RequestInit =
+    method === "GET"
+      ? { method: "GET" }
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body ?? {}),
+        };
+  const upstream = await stub.fetch(`https://do${path}`, init);
+  const text = await upstream.text();
+  return new Response(text, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
+}
+
+/**
+ * Compute the per-day shard ID for a `MovieClaimState` request.  Accepts an
+ * explicit `YYYY-MM-DD` from the caller (mandatory when crossing day
+ * boundaries within a long-running ingestion — the caller passes the *task
+ * dispatch time* date so the same movie always maps to the same shard) and
+ * falls back to the Worker's current time in Asia/Singapore.
+ *
+ * Returns the bare date string; the Asia/Singapore tz is implicit and stays
+ * out of the shard ID to keep DO names compact (Cloudflare caps `idFromName`
+ * at 256 chars but recommends much shorter for log readability).
+ */
+/**
+ * Forward to the singleton {@link RunnerRegistry} DO (P2-E).  The fixed
+ * `idFromName("runners")` collapses every Worker / runner to one DO so a
+ * register/heartbeat from any runtime joins the same registry.
+ *
+ * Body buffering mirrors `forwardToGlobalLoginStateDo` / `forwardToMovieClaimDo`
+ * for the same vitest-pool-workers reason — see those functions' comments.
+ *
+ * Returns 503 when the binding is missing (i.e. v3 migration not yet
+ * deployed to register the `RunnerRegistry` class).  The Python client
+ * treats 503 as ``Unavailable`` and falls open to "no registry, no
+ * heartbeat", so a stale Worker deploy is graceful rather than fatal.
+ */
+async function forwardToRunnerRegistryDo(
+  env: Env,
+  path: string,
+  method: "GET" | "POST",
+  body: unknown,
+): Promise<Response> {
+  if (!env.RUNNER_REGISTRY_DO) {
+    return jsonResponse(
+      { error: "runner_registry binding not configured (apply v3 migration)" },
+      503,
+    );
+  }
+  const id = env.RUNNER_REGISTRY_DO.idFromName("runners");
+  const stub = env.RUNNER_REGISTRY_DO.get(id);
+  const init: RequestInit =
+    method === "GET"
+      ? { method: "GET" }
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body ?? {}),
+        };
+  const upstream = await stub.fetch(`https://do${path}`, init);
+  const text = await upstream.text();
+  return new Response(text, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
+}
+
+function resolveClaimShard(rawDate?: string | null): string {
+  const cleaned =
+    rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate.trim())
+      ? rawDate.trim()
+      : currentSingaporeDate();
+  return cleaned;
+}
+
+function currentSingaporeDate(): string {
+  // Asia/Singapore is UTC+08:00 and DST-free, so a fixed offset is exact.
+  // Avoiding `Intl.DateTimeFormat` here keeps the path allocator-free and
+  // sidesteps a workerd IANA tz-data dependency.
+  const now = new Date(Date.now() + 8 * 60 * 60_000);
+  const yyyy = now.getUTCFullYear();
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

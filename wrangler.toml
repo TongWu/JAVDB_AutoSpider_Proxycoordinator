@@ -16,6 +16,22 @@ class_name = "ProxyCoordinator"
 name = "GLOBAL_LOGIN_STATE_DO"
 class_name = "GlobalLoginState"
 
+# Per-day-sharded DO that arbitrates JavDB detail-page fetches across multiple
+# GH Actions runners.  Addressed by `idFromName("YYYY-MM-DD")` so a single
+# day's claims live in one DO instance and old shards naturally evict via
+# the Cloudflare DO LRU.  See src/movie_claim_state.ts.
+[[durable_objects.bindings]]
+name = "MOVIE_CLAIM_DO"
+class_name = "MovieClaimState"
+
+# Singleton runner-registry DO (P2-E).  Tracks live spider runners across
+# GH Actions workflow runs for ops visibility + proxy_pool_hash drift
+# detection (which subsumes the originally-planned P3-B drift DO).
+# Addressed by `idFromName("runners")`.  See src/runner_registry.ts.
+[[durable_objects.bindings]]
+name = "RUNNER_REGISTRY_DO"
+class_name = "RunnerRegistry"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProxyCoordinator"]
@@ -26,6 +42,16 @@ new_sqlite_classes = ["ProxyCoordinator"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["GlobalLoginState"]
+
+# v3 introduces both the MovieClaimState (P1-B) and RunnerRegistry (P2-E)
+# classes — wrangler accepts multiple classes per migration tag, so a single
+# `wrangler deploy` rolls both out atomically.  Append only — never edit
+# the array in-place once deployed (would re-create the DOs from scratch
+# and lose persisted state).  Future P2-A schema additions live inside
+# MovieClaimState's storage layout and do not require a new migration.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["MovieClaimState", "RunnerRegistry"]
 
 # Workers Analytics Engine for per-lease metrics (free tier: 100k data points/day).
 #
@@ -72,6 +98,30 @@ EXTRA_WINDOW_SEC = "1800"
 EXTRA_MAX = "200"
 PENALTY_WINDOW_SEC = "300"
 JITTER_MAX_MS = "500"
+# P1-A — default ban duration (3 days). Override per-deploy without
+# touching client code.  Clients may also pass `ttl_ms` per /report, in
+# which case this fallback is unused.
+BAN_TTL_MS = "259200000"
+# P1-B — default per-claim TTL for MovieClaimState (30 min).  Sized to
+# cover detail-page fetch + parser + qB add for a slow proxy without
+# locking the slot if the runner crashes (DO Alarm GC sweeps stale
+# claims every 10 min regardless).
+MOVIE_CLAIM_TTL_MS = "1800000"
+# P2-E — staleness threshold for RunnerRegistry GC.  Runners whose
+# `last_heartbeat` is older than this are evicted by the singleton DO's
+# 5 min alarm.  10 min default = 5x the canonical 60 s heartbeat cadence
+# so a single missed heartbeat doesn't evict a healthy runner.  Server
+# floors the value at 60 s defensively if a typo is set here.
+RUNNER_STALE_TTL_MS = "600000"
+# P2-C — login attempt cooldown knobs (cross-runner login budget).
+# Counted within `LOGIN_COOLDOWN_WINDOW_SEC`; once recent FAILURES reach
+# `LOGIN_COOLDOWN_THRESHOLD`, `acquire_lease` returns a non-zero
+# `cooldown_until_ms` (still grants the lease — caller parks its login
+# flow until the cooldown expires).  Defaults: 5 failures / hour →
+# 30 min cooldown.  Override per-deploy without touching client code.
+LOGIN_COOLDOWN_THRESHOLD = "5"
+LOGIN_COOLDOWN_WINDOW_SEC = "3600"
+LOGIN_COOLDOWN_DURATION_MS = "1800000"
 
 # Secrets (set via `wrangler secret put`):
 #   PROXY_COORDINATOR_TOKEN — bearer token required on every /lease, /report

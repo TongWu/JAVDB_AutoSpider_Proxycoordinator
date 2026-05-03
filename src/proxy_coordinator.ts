@@ -1,7 +1,10 @@
 import {
+  DEFAULT_BAN_TTL_MS,
   Env,
   LeaseRequest,
   LeaseResponse,
+  PROXY_LATENCY_EMA_ALPHA,
+  ProxyHealthSnapshot,
   ReportRequest,
   ReportResponse,
   ThrottleConfig,
@@ -29,6 +32,56 @@ interface CoordinatorState {
   nextAvailableAt: number;
   requestTimestamps: number[];
   cfEvents: number[];
+  /**
+   * P1-A — cross-runner proxy ban state.  ``null`` means "not banned".  When
+   * ``bannedUntil > now`` the lease handler still computes ``wait_ms`` (so old
+   * Python clients that ignore the boolean still throttle correctly) but flags
+   * ``banned: true`` + ``reason: "banned"`` so new clients can short-circuit.
+   * Defaults to ``null`` for backward compatibility with snapshots persisted
+   * before this field existed (see ``loadState``).
+   */
+  bannedUntil: number | null;
+  /**
+   * P1-A — cross-runner CF-bypass requirement.  Mirrors the per-process
+   * ``state.proxies_requiring_cf_bypass`` dict semantics:
+   *   ``null``  → no requirement
+   *   ``> now`` → requirement active until that wall-clock ms epoch
+   *   ``0``     → permanent for this session (mirrors
+   *               ``state.always_bypass_time == 0`` on the Python side).
+   */
+  cfBypassUntil: number | null;
+  /**
+   * P2-D — wall-clock ms epochs of recent successful requests, pruned
+   * against ``penaltyWindowSec`` on every ``loadState`` so the count
+   * is naturally bounded by the throughput of the proxy * window
+   * size.  Defaults to ``[]`` for snapshots written before P2-D.
+   */
+  successEvents: number[];
+  /**
+   * P2-D — wall-clock ms epochs of recent HTTP failures.  Distinct
+   * from ``cfEvents`` because the latter feeds into the penalty
+   * factor (Python side scaled by tier); we want a separate counter
+   * so a runner that only reports ``"failure"`` (no CF) still
+   * influences the health score.  Same pruning policy as
+   * ``successEvents``.
+   */
+  failureEvents: number[];
+  /**
+   * P2-D — exponentially-weighted moving average of recent HTTP
+   * latency reports (ms).  ``0`` when no latency report has ever
+   * landed for this proxy.  Updated on every ``ReportRequest`` that
+   * carries a ``latency_ms`` regardless of ``kind`` so success and
+   * failure latencies both influence the EMA.
+   */
+  latencyEma: number;
+}
+
+/** Read `BAN_TTL_MS` from env vars; falls back to 3 days. */
+function loadBanTtlMs(env: Env): number {
+  const v = env.BAN_TTL_MS;
+  if (v === undefined || v === "") return DEFAULT_BAN_TTL_MS;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_BAN_TTL_MS;
 }
 
 const PENALTY_TIERS: Array<[number, number]> = [
@@ -128,15 +181,46 @@ export class ProxyCoordinator implements DurableObject {
     state.nextAvailableAt = grantedAt;
     state.requestTimestamps.push(grantedAt);
 
+    // P1-A — auto-expire ban / cf_bypass before we surface them. ``cfBypassUntil
+    // === 0`` is the "permanent for this session" sentinel and must NOT be
+    // pruned (it intentionally never expires until ``unban`` / TTL refresh).
+    if (state.bannedUntil !== null && state.bannedUntil <= now) {
+      state.bannedUntil = null;
+    }
+    if (
+      state.cfBypassUntil !== null &&
+      state.cfBypassUntil !== 0 &&
+      state.cfBypassUntil <= now
+    ) {
+      state.cfBypassUntil = null;
+    }
+
     await this.persistState(state);
 
     const penaltyFactor = this.computePenaltyFactor(state, now);
+
+    // P1-A — once the proxy is banned, surface ``reason: "banned"`` so new
+    // clients short-circuit the request loop. Old clients that ignore the
+    // boolean still see a normal ``wait_ms`` (computed above) so behaviour
+    // remains backwards-compatible.
+    const banned = state.bannedUntil !== null && state.bannedUntil > now;
+    if (banned) {
+      reason = "banned";
+    }
+    const requiresCfBypass =
+      state.cfBypassUntil !== null &&
+      (state.cfBypassUntil === 0 || state.cfBypassUntil > now);
 
     const response: LeaseResponse = {
       wait_ms: waitMs,
       penalty_factor: penaltyFactor,
       server_time: now,
       reason,
+      banned,
+      banned_until: state.bannedUntil,
+      requires_cf_bypass: requiresCfBypass,
+      cf_bypass_until: state.cfBypassUntil,
+      health: this.computeHealthSnapshot(state),
     };
 
     this.writeAnalytics(proxyId, "lease", waitMs, penaltyFactor);
@@ -146,14 +230,100 @@ export class ProxyCoordinator implements DurableObject {
 
   private async handleReport(request: Request): Promise<Response> {
     const body = (await request.json()) as ReportRequest;
-    const kind = body.kind === "failure" ? "failure" : "cf";
     const proxyId = String(body.proxy_id ?? "");
     const now = Date.now();
+    const rawKind = body.kind;
 
     const state = await this.loadState();
     this.purgeExpired(state, now);
 
-    state.cfEvents.push(now);
+    // P2-D — fold latency into the EMA regardless of kind so a slow
+    // success and a slow failure both pull the EMA up.  Done before
+    // the kind-specific dispatch so even an unknown kind contributes
+    // to the health latency picture.
+    const rawLatency = body.latency_ms;
+    if (
+      rawLatency !== undefined &&
+      rawLatency !== null &&
+      Number.isFinite(rawLatency as number) &&
+      (rawLatency as number) >= 0
+    ) {
+      const sample = Number(rawLatency);
+      const prior = state.latencyEma;
+      state.latencyEma =
+        prior === 0
+          ? sample
+          : prior * (1 - PROXY_LATENCY_EMA_ALPHA) + sample * PROXY_LATENCY_EMA_ALPHA;
+    }
+
+    // P1-A — ban / unban / cf_bypass are *out-of-band* kinds: they mutate the
+    // ban / cf_bypass state but do NOT push into ``cfEvents`` (which would
+    // double-count an already-throttled proxy through the penalty factor).
+    let kind: "cf" | "failure" | "ban" | "unban" | "cf_bypass" | "success" = "cf";
+    if (rawKind === "ban") {
+      kind = "ban";
+      const ttl = Number.isFinite(body.ttl_ms as number) && (body.ttl_ms as number) > 0
+        ? Number(body.ttl_ms)
+        : loadBanTtlMs(this.env);
+      // Take the max of any existing ban so concurrent runners can't shorten
+      // a longer ban; matches the plan's "TTL 取最大值" guidance.
+      const newBannedUntil = now + ttl;
+      state.bannedUntil =
+        state.bannedUntil !== null && state.bannedUntil > newBannedUntil
+          ? state.bannedUntil
+          : newBannedUntil;
+    } else if (rawKind === "unban") {
+      kind = "unban";
+      state.bannedUntil = null;
+    } else if (rawKind === "cf_bypass") {
+      kind = "cf_bypass";
+      // ``ttl_ms`` honours the same tri-state as `state.always_bypass_time`:
+      //   - ``0``  → permanent for this session (sentinel; persisted as `0`)
+      //   - ``>0`` → expires at ``now + ttl``
+      //   - omitted → treat as permanent for safety
+      const rawTtl = body.ttl_ms;
+      if (rawTtl === undefined || rawTtl === null) {
+        // Once permanent, stay permanent. Otherwise upgrade to permanent.
+        state.cfBypassUntil = 0;
+      } else if (state.cfBypassUntil === 0) {
+        // Sticky permanent: a finite-TTL refresh after a permanent flag must
+        // NOT downgrade the proxy's bypass requirement.
+        state.cfBypassUntil = 0;
+      } else {
+        const ttl = Number(rawTtl);
+        if (!Number.isFinite(ttl) || ttl <= 0) {
+          state.cfBypassUntil = 0;
+        } else {
+          const newCfBypassUntil = now + ttl;
+          // Monotonic-max policy: prefer the longer of the two finite windows.
+          state.cfBypassUntil =
+            state.cfBypassUntil !== null &&
+              state.cfBypassUntil > newCfBypassUntil
+              ? state.cfBypassUntil
+              : newCfBypassUntil;
+        }
+      }
+    } else if (rawKind === "failure") {
+      kind = "failure";
+      state.cfEvents.push(now);
+      // P2-D — track failure separately from cfEvents so a runner that
+      // only reports plain ``failure`` (no CF challenge) still moves
+      // the health needle.  cfEvents already mirrors this when CF
+      // attribution is present, but health needs the broader signal.
+      state.failureEvents.push(now);
+    } else if (rawKind === "success") {
+      // P2-D — happy-path counter for the health scorer.  Does NOT
+      // touch cfEvents (so a successful request never deflates the
+      // penalty factor) and does NOT touch bannedUntil / cfBypass.
+      kind = "success";
+      state.successEvents.push(now);
+    } else {
+      // Any unknown kind (including the historical default ``"cf"``) is treated
+      // as a CF event for backward compatibility.
+      kind = "cf";
+      state.cfEvents.push(now);
+    }
+
     await this.persistState(state);
 
     const penaltyFactor = this.computePenaltyFactor(state, now);
@@ -174,9 +344,19 @@ export class ProxyCoordinator implements DurableObject {
     const state = await this.loadState();
     const now = Date.now();
     this.purgeExpired(state, now);
+    // Surface the *current* effective ban / cf_bypass status so operators don't
+    // have to recompute it from raw timestamps. Mirrors the booleans returned
+    // by ``handleLease`` so the two views agree.
+    const banned = state.bannedUntil !== null && state.bannedUntil > now;
+    const requiresCfBypass =
+      state.cfBypassUntil !== null &&
+      (state.cfBypassUntil === 0 || state.cfBypassUntil > now);
     return jsonResponse({
       ...state,
       penalty_factor: this.computePenaltyFactor(state, now),
+      banned,
+      requires_cf_bypass: requiresCfBypass,
+      health: this.computeHealthSnapshot(state),
       now,
       config: this.cfg,
     });
@@ -186,11 +366,20 @@ export class ProxyCoordinator implements DurableObject {
 
   private async loadState(): Promise<CoordinatorState> {
     if (this.cached !== null) return this.cached;
-    const stored = (await this.state.storage.get<CoordinatorState>("state")) ?? null;
-    this.cached = stored ?? {
-      nextAvailableAt: 0,
-      requestTimestamps: [],
-      cfEvents: [],
+    const stored = (await this.state.storage.get<Partial<CoordinatorState>>("state")) ?? null;
+    // Always normalise the loaded payload so snapshots written *before* the
+    // P1-A fields existed still satisfy the current `CoordinatorState` shape.
+    // This is the explicit cached-invalidation point called out in the plan
+    // (see `proxy_coordinator.ts:188-201`).
+    this.cached = {
+      nextAvailableAt: stored?.nextAvailableAt ?? 0,
+      requestTimestamps: stored?.requestTimestamps ?? [],
+      cfEvents: stored?.cfEvents ?? [],
+      bannedUntil: stored?.bannedUntil ?? null,
+      cfBypassUntil: stored?.cfBypassUntil ?? null,
+      successEvents: stored?.successEvents ?? [],
+      failureEvents: stored?.failureEvents ?? [],
+      latencyEma: stored?.latencyEma ?? 0,
     };
     return this.cached;
   }
@@ -202,7 +391,10 @@ export class ProxyCoordinator implements DurableObject {
 
   /**
    * Drop timestamps older than the longest window we still care about,
-   * so the in-memory deques never grow unbounded.
+   * so the in-memory deques never grow unbounded.  P2-D `successEvents`
+   * and `failureEvents` share the same `penaltyWindowSec` cutoff as
+   * `cfEvents` so health is computed against the same horizon as the
+   * penalty factor — keeps the health/penalty semantics aligned.
    */
   private purgeExpired(state: CoordinatorState, now: number): void {
     const reqCutoff = now - this.cfg.extraWindowSec * 1000;
@@ -213,6 +405,44 @@ export class ProxyCoordinator implements DurableObject {
     while (state.cfEvents.length > 0 && state.cfEvents[0] < cfCutoff) {
       state.cfEvents.shift();
     }
+    while (state.successEvents.length > 0 && state.successEvents[0] < cfCutoff) {
+      state.successEvents.shift();
+    }
+    while (state.failureEvents.length > 0 && state.failureEvents[0] < cfCutoff) {
+      state.failureEvents.shift();
+    }
+  }
+
+  /**
+   * P2-D — derive the public health snapshot from the persisted
+   * primitives.  Score is a normalized success ratio in 0..1 with a
+   * linearised latency penalty (each 1000ms over the 500ms baseline
+   * shaves 0.1 off the score, capped at 0).  No data → neutral 0.5
+   * so a brand-new proxy is neither favored nor punished.
+   */
+  private computeHealthSnapshot(state: CoordinatorState): ProxyHealthSnapshot {
+    const successCount = state.successEvents.length;
+    const failureCount = state.failureEvents.length;
+    const total = successCount + failureCount;
+    let score: number;
+    if (total === 0) {
+      score = 0.5;
+    } else {
+      // Success ratio in [0, 1].
+      const ratio = successCount / total;
+      // Latency penalty: each 1000ms above 500ms removes 0.1.  EMA of 0
+      // (no data yet) is treated as the 500ms baseline so a healthy
+      // proxy with low success-count isn't double-penalised.
+      const ema = state.latencyEma > 0 ? state.latencyEma : 500;
+      const latencyPenalty = Math.max(0, (ema - 500) / 1000) * 0.1;
+      score = Math.max(0, Math.min(1, ratio - latencyPenalty));
+    }
+    return {
+      success_count: successCount,
+      failure_count: failureCount,
+      latency_ema_ms: state.latencyEma,
+      score,
+    };
   }
 
   /**

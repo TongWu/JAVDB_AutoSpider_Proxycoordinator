@@ -67,6 +67,15 @@ interface AcquireLeaseResp {
   holder_id: string;
   target_proxy_name: string;
   lease_expires_at: number;
+  cooldown_until_ms?: number;
+  recent_attempt_count?: number;
+  server_time: number;
+}
+
+interface RecordAttemptResp {
+  recent_attempt_count: number;
+  recent_failure_count: number;
+  cooldown_until_ms: number;
   server_time: number;
 }
 
@@ -102,6 +111,49 @@ const invalidate = (version: number) =>
   jsonPost<InvalidateResp>("/login_state/invalidate", { version });
 const releaseLease = (holder: string) =>
   jsonPost<ReleaseLeaseResp>("/login_state/release_lease", { holder_id: holder });
+const recordAttempt = (
+  holder: string,
+  proxy: string,
+  outcome: "success" | "failure",
+  expectStatus = 200,
+) =>
+  jsonPost<RecordAttemptResp & { error?: string }>(
+    "/login_state/record_attempt",
+    { holder_id: holder, proxy_name: proxy, outcome },
+    expectStatus,
+  );
+
+/**
+ * P2-C — drop a failure record at a synthetic past timestamp directly
+ * into DO storage.  Letting tests "rewind the clock" lets us exercise
+ * the cooldown ladder + window pruning without `setTimeout`-style waits.
+ *
+ * Each call appends a single failure entry whose ``at`` is ``now - ageSec``;
+ * the helper preserves any pre-existing snapshot fields (lease, cookie,
+ * etc.) so tests can mix this with the normal acquire/publish helpers.
+ */
+async function seedHistoricalFailure(ageSec: number): Promise<void> {
+  const id = env.GLOBAL_LOGIN_STATE_DO.idFromName("global");
+  const stub = env.GLOBAL_LOGIN_STATE_DO.get(id);
+  await runInDurableObject(stub, async (_inst, state) => {
+    const data = (await state.storage.get<any>("state")) ?? {
+      proxy_name: null,
+      cookie_ciphertext: null,
+      version: 0,
+      last_verified_at: 0,
+      lease: null,
+      recent_attempts: [],
+    };
+    data.recent_attempts = data.recent_attempts ?? [];
+    data.recent_attempts.push({
+      at: Date.now() - ageSec * 1000,
+      proxy_name: "Pseed",
+      outcome: "failure",
+      holder_id: "seed",
+    });
+    await state.storage.put("state", data);
+  });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // auth — the new routes inherit the existing bearer check + GET on
@@ -476,5 +528,160 @@ describe("payload validation", () => {
       body: JSON.stringify({}),
     });
     expect(res.status).toBe(400);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P2-C: cross-runner login attempt cooldown
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("P2-C record_attempt", () => {
+  it("auth: rejects without bearer token", async () => {
+    const res = await rawFetch("/login_state/record_attempt", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        holder_id: "runner-A", proxy_name: "P1", outcome: "failure",
+      }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("validates holder_id", async () => {
+    const res = await rawFetch("/login_state/record_attempt", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({ proxy_name: "P1", outcome: "failure" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("validates proxy_name", async () => {
+    const res = await rawFetch("/login_state/record_attempt", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({ holder_id: "runner-A", outcome: "failure" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("validates outcome must be success|failure", async () => {
+    const res = await rawFetch("/login_state/record_attempt", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        holder_id: "runner-A", proxy_name: "P1", outcome: "neutral",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("first record on a fresh DO returns count=1, no cooldown", async () => {
+    const r = await recordAttempt("runner-A", "P1", "failure");
+    expect(r.recent_attempt_count).toBe(1);
+    expect(r.recent_failure_count).toBe(1);
+    expect(r.cooldown_until_ms).toBe(0);
+  });
+
+  it("success records also count toward attempt_count but not failure_count", async () => {
+    await recordAttempt("runner-A", "P1", "failure");
+    const r = await recordAttempt("runner-A", "P1", "success");
+    expect(r.recent_attempt_count).toBe(2);
+    expect(r.recent_failure_count).toBe(1);
+    expect(r.cooldown_until_ms).toBe(0);
+  });
+
+  it("crossing the failure threshold emits a cooldown_until_ms anchored on last failure", async () => {
+    // Threshold is 5 in the test env; record 5 failures.
+    for (let i = 0; i < 4; i++) {
+      const r = await recordAttempt("runner-A", "P1", "failure");
+      expect(r.cooldown_until_ms).toBe(0);
+    }
+    const fifth = await recordAttempt("runner-A", "P1", "failure");
+    expect(fifth.recent_failure_count).toBe(5);
+    // Cooldown should be ~ now + 30 min (the default duration).
+    const expectedMin = fifth.server_time + 29 * 60_000;
+    expect(fifth.cooldown_until_ms).toBeGreaterThan(expectedMin);
+  });
+
+  it("attempts older than the window are pruned and don't count", async () => {
+    // Seed 5 failures from 2h ago — outside the default 1h window.
+    for (let i = 0; i < 5; i++) {
+      await seedHistoricalFailure(7200);
+    }
+    // A single fresh failure should NOT trip the cooldown because the
+    // pruned buffer only holds the new entry.
+    const r = await recordAttempt("runner-A", "P1", "failure");
+    expect(r.recent_attempt_count).toBe(1);
+    expect(r.recent_failure_count).toBe(1);
+    expect(r.cooldown_until_ms).toBe(0);
+  });
+});
+
+describe("P2-C acquire_lease cooldown", () => {
+  it("default response includes cooldown_until_ms=0 + recent_attempt_count=0", async () => {
+    const r = await acquire("runner-A", "P1", 60_000);
+    expect(r.acquired).toBe(true);
+    expect(r.cooldown_until_ms).toBe(0);
+    expect(r.recent_attempt_count).toBe(0);
+  });
+
+  it("acquire still grants the lease while cooldown is active", async () => {
+    // Cross the threshold via record_attempt.
+    for (let i = 0; i < 5; i++) {
+      await recordAttempt("runner-A", "P1", "failure");
+    }
+    // Now attempt to acquire — must still succeed (P2-C contract).
+    const r = await acquire("runner-B", "P1", 60_000);
+    expect(r.acquired).toBe(true);
+    expect(r.holder_id).toBe("runner-B");
+    expect(r.cooldown_until_ms).toBeGreaterThan(r.server_time);
+    expect(r.recent_attempt_count).toBe(5);
+  });
+
+  it("cooldown decays as failures age out of the window", async () => {
+    // Seed 4 ancient failures (outside the window) + one fresh failure.
+    for (let i = 0; i < 4; i++) {
+      await seedHistoricalFailure(7200);
+    }
+    await recordAttempt("runner-A", "P1", "failure");
+    // Only 1 in-window failure → below threshold.
+    const r = await acquire("runner-A", "P1", 60_000);
+    expect(r.cooldown_until_ms).toBe(0);
+    expect(r.recent_attempt_count).toBe(1);
+  });
+
+  it("a successful login does NOT cancel an active cooldown", async () => {
+    for (let i = 0; i < 5; i++) {
+      await recordAttempt("runner-A", "P1", "failure");
+    }
+    const r1 = await acquire("runner-B", "P1", 60_000);
+    expect(r1.cooldown_until_ms).toBeGreaterThan(r1.server_time);
+
+    // Now a success — should NOT zero out the cooldown because the
+    // failure count inside the window is still 5.
+    await recordAttempt("runner-B", "P1", "success");
+    const r2 = await acquire("runner-B", "P1", 60_000);
+    expect(r2.cooldown_until_ms).toBeGreaterThan(r2.server_time);
+  });
+
+  it("legacy acquire response without record_attempt history is unchanged shape", async () => {
+    // Pre-P2-C snapshots have no recent_attempts; loadState backfills.
+    const id = env.GLOBAL_LOGIN_STATE_DO.idFromName("global");
+    const stub = env.GLOBAL_LOGIN_STATE_DO.get(id);
+    await runInDurableObject(stub, async (_inst, state) => {
+      await state.storage.put("state", {
+        proxy_name: null,
+        cookie_ciphertext: null,
+        version: 0,
+        last_verified_at: 0,
+        lease: null,
+        // intentionally no recent_attempts field
+      });
+    });
+    const r = await acquire("runner-A", "P1", 60_000);
+    expect(r.acquired).toBe(true);
+    expect(r.cooldown_until_ms).toBe(0);
+    expect(r.recent_attempt_count).toBe(0);
   });
 });
