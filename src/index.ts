@@ -1,19 +1,39 @@
 import { Env, LeaseRequest, ReportRequest } from "./types";
 
 export { ProxyCoordinator } from "./proxy_coordinator";
+export { GlobalLoginState } from "./global_login_state";
+
+/**
+ * Endpoints that accept GET (every other request must be POST).  Kept as a
+ * `Set` so adding new read-only routes is a one-line edit instead of touching
+ * the conditional in two places.
+ */
+const GET_ALLOWED_PATHS = new Set<string>(["/state", "/login_state"]);
 
 /**
  * Worker entry point.  Routes:
  *
- * - `POST /lease`   — body `{ proxy_id, intended_sleep_ms }` → forwarded to
- *   the per-proxy DO instance addressed by `idFromName(proxy_id)`.
- * - `POST /report`  — body `{ proxy_id, kind }` → forwarded similarly.
- * - `GET  /state?proxy_id=...` — debug snapshot of a DO (auth required).
- * - `GET  /health`  — unauthenticated liveness probe (returns 200 OK).
+ * Per-proxy throttling (ProxyCoordinator DO, addressed by `idFromName(proxy_id)`):
+ * - `POST /lease`   — body `{ proxy_id, intended_sleep_ms }` → grant pacing slot.
+ * - `POST /report`  — body `{ proxy_id, kind }`              → record CF/failure event.
+ * - `GET  /state?proxy_id=...` — debug snapshot.
+ *
+ * Cross-runtime login state (GlobalLoginState DO, addressed by `idFromName("global")`):
+ * - `GET  /login_state`                  — current logged-in proxy + decrypted cookie.
+ * - `POST /login_state/acquire_lease`    — mutex for the next re-login attempt.
+ * - `POST /login_state/publish`          — publish a fresh cookie (lease holder only).
+ * - `POST /login_state/invalidate`       — mark current cookie bad (optimistic version lock).
+ * - `POST /login_state/release_lease`    — owner releases the re-login mutex.
+ *
+ * Liveness:
+ * - `GET  /health`  — unauthenticated 200 OK probe.
  *
  * Auth: every endpoint except `/health` requires header
  * `Authorization: Bearer <PROXY_COORDINATOR_TOKEN>` (set via
- * `wrangler secret put PROXY_COORDINATOR_TOKEN`).
+ * `wrangler secret put PROXY_COORDINATOR_TOKEN`).  The same token also
+ * derives the AES-GCM key used by GlobalLoginState to encrypt cookies at
+ * rest, so rotating it forces the next runner to re-login (see
+ * `src/global_login_state.ts`).
  */
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -27,7 +47,7 @@ export default {
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
-    if (request.method !== "POST" && url.pathname !== "/state") {
+    if (request.method !== "POST" && !GET_ALLOWED_PATHS.has(url.pathname)) {
       return jsonResponse({ error: "method not allowed" }, 405);
     }
 
@@ -37,18 +57,44 @@ export default {
           const body = (await request.json()) as LeaseRequest;
           const proxyId = normalizeProxyId(body?.proxy_id);
           if (!proxyId) return jsonResponse({ error: "missing proxy_id" }, 400);
-          return await forwardToDo(env, proxyId, "/do/lease", body);
+          return await forwardToProxyDo(env, proxyId, "/do/lease", body);
         }
         case "/report": {
           const body = (await request.json()) as ReportRequest;
           const proxyId = normalizeProxyId(body?.proxy_id);
           if (!proxyId) return jsonResponse({ error: "missing proxy_id" }, 400);
-          return await forwardToDo(env, proxyId, "/do/report", body);
+          return await forwardToProxyDo(env, proxyId, "/do/report", body);
         }
         case "/state": {
           const proxyId = normalizeProxyId(url.searchParams.get("proxy_id"));
           if (!proxyId) return jsonResponse({ error: "missing proxy_id" }, 400);
-          return await forwardToDo(env, proxyId, "/do/state", null);
+          return await forwardToProxyDo(env, proxyId, "/do/state", null);
+        }
+        case "/login_state":
+          return await forwardToGlobalLoginStateDo(env, "/do/login_state/get", "GET", null);
+        case "/login_state/acquire_lease": {
+          const body = await request.json();
+          return await forwardToGlobalLoginStateDo(
+            env, "/do/login_state/acquire_lease", "POST", body,
+          );
+        }
+        case "/login_state/publish": {
+          const body = await request.json();
+          return await forwardToGlobalLoginStateDo(
+            env, "/do/login_state/publish", "POST", body,
+          );
+        }
+        case "/login_state/invalidate": {
+          const body = await request.json();
+          return await forwardToGlobalLoginStateDo(
+            env, "/do/login_state/invalidate", "POST", body,
+          );
+        }
+        case "/login_state/release_lease": {
+          const body = await request.json();
+          return await forwardToGlobalLoginStateDo(
+            env, "/do/login_state/release_lease", "POST", body,
+          );
         }
         default:
           return jsonResponse({ error: "not found" }, 404);
@@ -93,7 +139,7 @@ function normalizeProxyId(raw: unknown): string {
   return trimmed;
 }
 
-async function forwardToDo(
+async function forwardToProxyDo(
   env: Env,
   proxyId: string,
   path: string,
@@ -110,6 +156,45 @@ async function forwardToDo(
           body: JSON.stringify(body),
         };
   return stub.fetch(`https://do${path}`, init);
+}
+
+/**
+ * Forward to the singleton GlobalLoginState DO.  The fixed `idFromName("global")`
+ * means every Worker instance / GH Actions runner converges on the same DO,
+ * which is essential — a per-runner DO id would silently fragment the login
+ * state and re-introduce the very problem this DO exists to solve.
+ *
+ * The DO response body is materialised here (``await response.text()``)
+ * before being re-emitted as a fresh Response.  Streaming the original body
+ * across the JSRPC boundary would leak the DO's SQLite read transaction
+ * past the Worker fetch handler's await point, which `vitest-pool-workers`
+ * detects as "Failed to pop isolated storage stack frame" — see
+ * https://developers.cloudflare.com/workers/runtime-apis/rpc/lifecycle.
+ * In production the body is small (≤ 200 bytes JSON) so the buffering cost
+ * is negligible.
+ */
+async function forwardToGlobalLoginStateDo(
+  env: Env,
+  path: string,
+  method: "GET" | "POST",
+  body: unknown,
+): Promise<Response> {
+  const id = env.GLOBAL_LOGIN_STATE_DO.idFromName("global");
+  const stub = env.GLOBAL_LOGIN_STATE_DO.get(id);
+  const init: RequestInit =
+    method === "GET"
+      ? { method: "GET" }
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body ?? {}),
+        };
+  const upstream = await stub.fetch(`https://do${path}`, init);
+  const text = await upstream.text();
+  return new Response(text, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
