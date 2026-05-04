@@ -1,5 +1,6 @@
 import {
   ActiveRunnersResponse,
+  DEFAULT_MOVIE_CLAIM_MIN_RUNNERS,
   DEFAULT_RUNNER_STALE_TTL_MS,
   Env,
   HeartbeatRequest,
@@ -159,15 +160,25 @@ export class RunnerRegistry implements DurableObject {
           ? null
           : clipString(String(body.page_range)),
     };
+    // Order matters: write *this* runner first, then read the full set,
+    // then derive `movie_claim_recommended`.  DO calls are serialized
+    // per-instance, so the second of two concurrent registers always
+    // observes its peer's record and produces `recommended=true` — the
+    // exact property the Python client's `auto` mode relies on to avoid
+    // a race where both runners think they are alone.
     data.runners[holderId] = info;
     await this.persistState(data);
     await this.scheduleAlarm();
 
+    const activeRunners = snapshotRunners(data.runners);
     const summary = summarizePoolHashes(data.runners);
+    const minRunners = loadMovieClaimMinRunners(this.env);
     const response: RegisterRunnerResponse = {
       registered: wasFresh,
-      active_runners: snapshotRunners(data.runners),
+      active_runners: activeRunners,
       pool_hash_summary: summary,
+      movie_claim_recommended: activeRunners.length >= minRunners,
+      movie_claim_min_runners: minRunners,
       server_time: now,
     };
     return jsonResponse(response);
@@ -183,9 +194,21 @@ export class RunnerRegistry implements DurableObject {
     const now = Date.now();
     const data = await this.loadState();
     pruneStale(data, this.env, now);
+    const minRunners = loadMovieClaimMinRunners(this.env);
     const existing = data.runners[holderId];
     if (existing === undefined) {
-      const response: HeartbeatResponse = { alive: false, server_time: now };
+      // Evicted holder: surface the live cohort size sans the unknown
+      // caller so the client still gets a defensible recommendation
+      // (the heartbeat loop re-registers right after this response and
+      // will reconcile on the register response).
+      const recommended =
+        Object.keys(data.runners).length >= minRunners;
+      const response: HeartbeatResponse = {
+        alive: false,
+        movie_claim_recommended: recommended,
+        movie_claim_min_runners: minRunners,
+        server_time: now,
+      };
       return jsonResponse(response);
     }
     existing.last_heartbeat = now;
@@ -194,7 +217,18 @@ export class RunnerRegistry implements DurableObject {
     // happy path is "alarm already scheduled" so this is a no-op cheap.
     await this.scheduleAlarm();
 
-    const response: HeartbeatResponse = { alive: true, server_time: now };
+    // Same write-then-derive ordering as `handleRegister`: the heartbeat
+    // refresh is already persisted, so reading `data.runners` here yields
+    // the up-to-date cohort.  This is the signal the Python heartbeat
+    // loop feeds into `_apply_movie_claim_recommendation` on every tick.
+    const activeRunners = snapshotRunners(data.runners);
+    const recommended = activeRunners.length >= minRunners;
+    const response: HeartbeatResponse = {
+      alive: true,
+      movie_claim_recommended: recommended,
+      movie_claim_min_runners: minRunners,
+      server_time: now,
+    };
     return jsonResponse(response);
   }
 
@@ -275,6 +309,20 @@ function loadStaleTtlMs(env: Env): number {
   if (raw === undefined || raw === "") return DEFAULT_RUNNER_STALE_TTL_MS;
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 60_000) return DEFAULT_RUNNER_STALE_TTL_MS;
+  return Math.floor(n);
+}
+
+/** Read the configured MovieClaim activation threshold from env, falling
+ *  back to {@link DEFAULT_MOVIE_CLAIM_MIN_RUNNERS} on missing/invalid
+ *  values.  Floored at 1 so a misconfigured "0" can't make the
+ *  recommendation always-true (which would defeat the auto-toggle's
+ *  whole purpose — single-runner deployments would still pay claim
+ *  overhead for nothing). */
+function loadMovieClaimMinRunners(env: Env): number {
+  const raw = env.MOVIE_CLAIM_MIN_RUNNERS;
+  if (raw === undefined || raw === "") return DEFAULT_MOVIE_CLAIM_MIN_RUNNERS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MOVIE_CLAIM_MIN_RUNNERS;
   return Math.floor(n);
 }
 

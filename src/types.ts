@@ -29,6 +29,13 @@ export interface Env {
    *  considered dead and pruned by the registry's GC alarm.  Defaults to
    *  10 minutes (≥ 5× the 60 s heartbeat interval). */
   RUNNER_STALE_TTL_MS?: string;
+  /** Minimum live-runner count at which `RunnerRegistry` recommends
+   *  enabling the per-day MovieClaim mutex.  Returned to the client as
+   *  `movie_claim_recommended = active_runners.length >= this` on every
+   *  `/register` / `/heartbeat` response so Python clients in `auto`
+   *  mode can mount / unmount their `MovieClaimClient` automatically.
+   *  Defaults to 2; floored at 1 server-side. */
+  MOVIE_CLAIM_MIN_RUNNERS?: string;
   /** P2-C — number of recent failed login attempts (within
    *  `LOGIN_COOLDOWN_WINDOW_SEC`) above which `acquire_lease` returns a
    *  non-zero `cooldown_until_ms`.  Defaults to 5; tunable per-deploy via
@@ -581,6 +588,15 @@ export const DEFAULT_RUNNER_STALE_TTL_MS = 10 * 60_000;
  * cadence on purpose (clients drive heartbeats; the DO drives GC). */
 export const RUNNER_REGISTRY_ALARM_INTERVAL_MS = 5 * 60_000;
 
+/** Default minimum live-runner count for recommending MovieClaim activation.
+ *  Mirrors {@link Env.MOVIE_CLAIM_MIN_RUNNERS} and is the ground truth when
+ *  the env var is unset or invalid.  Set to 2 because a lone runner gains
+ *  nothing from claim coordination (no peers to race) yet pays +2 DO calls
+ *  per detail page.  Floored at 1 server-side: setting "0" or a negative
+ *  value would make `recommended` always-true regardless of cohort size,
+ *  which defeats the auto-toggle. */
+export const DEFAULT_MOVIE_CLAIM_MIN_RUNNERS = 2;
+
 /** Maximum length cap on caller-provided string fields.  Prevents a buggy
  * caller from filling the singleton DO with arbitrarily large GH workflow
  * metadata; values that exceed this are truncated server-side and a
@@ -634,6 +650,26 @@ export interface RegisterRunnerResponse {
    *  present.  Lets the client emit a single ``WARN`` if its own hash
    *  doesn't match the majority — replaces the original P3-B drift DO. */
   pool_hash_summary: Array<{ hash: string; count: number }>;
+  /** Derived recommendation for whether the per-day MovieClaim mutex
+   *  should be active right now.  Equals
+   *  ``active_runners.length >= movie_claim_min_runners`` and is computed
+   *  AFTER the current register has been written to storage, so the
+   *  second of two concurrent registers reliably observes ``true`` (DO
+   *  calls are serialized — see `runner_registry.ts`).
+   *
+   *  Python clients in ``MOVIE_CLAIM_ENABLED=auto`` mode use this flag
+   *  to mount / unmount their global `MovieClaimClient` without operator
+   *  intervention; ``force_on`` / ``off`` modes ignore it.  Optional
+   *  field for forward-compat with old clients (they ignore unknown
+   *  keys; new clients default to ``false`` when missing — equivalent
+   *  to "single-runner" semantics, the safe default). */
+  movie_claim_recommended?: boolean;
+  /** Server-side threshold used to compute {@link movie_claim_recommended}.
+   *  Surfaced for ops visibility (so a runner can log the active
+   *  threshold instead of trusting a hard-coded constant on the
+   *  Python side).  Sourced from {@link Env.MOVIE_CLAIM_MIN_RUNNERS},
+   *  defaulting to {@link DEFAULT_MOVIE_CLAIM_MIN_RUNNERS}. */
+  movie_claim_min_runners?: number;
   server_time: number;
 }
 
@@ -646,6 +682,14 @@ export interface HeartbeatResponse {
    *  for an unknown ``holder_id`` (e.g. the GC alarm pruned it because
    *  the runner stopped heartbeating; the client should re-``register``). */
   alive: boolean;
+  /** Mirror of {@link RegisterRunnerResponse.movie_claim_recommended} on
+   *  every successful heartbeat — lets clients in ``auto`` mode pick up
+   *  cohort changes (e.g. a peer's atexit `unregister` arriving) without
+   *  forcing them to call ``/register`` again.  Always reflects the
+   *  registry state AFTER this heartbeat refresh. */
+  movie_claim_recommended?: boolean;
+  /** Mirror of {@link RegisterRunnerResponse.movie_claim_min_runners}. */
+  movie_claim_min_runners?: number;
   server_time: number;
 }
 

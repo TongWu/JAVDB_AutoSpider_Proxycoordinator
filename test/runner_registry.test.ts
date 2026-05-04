@@ -70,11 +70,15 @@ interface RegisterResp {
   registered: boolean;
   active_runners: RunnerInfo[];
   pool_hash_summary: PoolHashSummary[];
+  movie_claim_recommended?: boolean;
+  movie_claim_min_runners?: number;
   server_time: number;
 }
 
 interface HeartbeatResp {
   alive: boolean;
+  movie_claim_recommended?: boolean;
+  movie_claim_min_runners?: number;
   server_time: number;
 }
 
@@ -519,5 +523,81 @@ describe("field length clipping", () => {
     });
     const info = r.active_runners.find((x) => x.holder_id === "clip-2")!;
     expect(info.page_range!.length).toBe(512);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// movie_claim_recommended — derived field returned to Python clients in
+// `MOVIE_CLAIM_ENABLED=auto` mode.  The contract is "write self → read full
+// set → derive `>= MOVIE_CLAIM_MIN_RUNNERS`"; DO single-thread serialization
+// guarantees the second of two concurrent registers always observes the
+// peer's record.  Tested at both endpoint level (register + heartbeat) so a
+// future refactor can't silently regress one path.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("movie_claim_recommended derived signal", () => {
+  it("first runner sees recommended=false (single-runner cohort)", async () => {
+    const r = await register({ holder_id: "mc-solo", proxy_pool_hash: "h" });
+    expect(r.active_runners.length).toBe(1);
+    expect(r.movie_claim_recommended).toBe(false);
+    expect(r.movie_claim_min_runners).toBe(2);
+  });
+
+  it("second runner sees recommended=true and surfaces threshold", async () => {
+    await register({ holder_id: "mc-A", proxy_pool_hash: "h" });
+    const second = await register({ holder_id: "mc-B", proxy_pool_hash: "h" });
+    expect(second.active_runners.length).toBe(2);
+    expect(second.movie_claim_recommended).toBe(true);
+    expect(second.movie_claim_min_runners).toBe(2);
+  });
+
+  it("first runner's next heartbeat picks up the recommendation flip", async () => {
+    // Solo register is not enough for the recommendation; once a peer
+    // registers, the original runner observes the change on its next
+    // heartbeat tick (matches the Python loop's expected behaviour).
+    const solo = await register({ holder_id: "mc-flip-A" });
+    expect(solo.movie_claim_recommended).toBe(false);
+    await register({ holder_id: "mc-flip-B" });
+    const hb = await heartbeat("mc-flip-A");
+    expect(hb.alive).toBe(true);
+    expect(hb.movie_claim_recommended).toBe(true);
+    expect(hb.movie_claim_min_runners).toBe(2);
+  });
+
+  it("heartbeat for an evicted holder still surfaces cohort recommendation", async () => {
+    // Even when alive=false the response includes the threshold &
+    // recommendation: the Python heartbeat loop re-registers right
+    // after, but having the signal here keeps logs symmetric.
+    await register({ holder_id: "mc-keep" });
+    const hb = await heartbeat("mc-evicted-never-registered");
+    expect(hb.alive).toBe(false);
+    // Cohort has 1 live runner ("mc-keep"); recommendation = false.
+    expect(hb.movie_claim_recommended).toBe(false);
+    expect(hb.movie_claim_min_runners).toBe(2);
+  });
+
+  it("heartbeat after a peer registers returns recommended=true", async () => {
+    await register({ holder_id: "mc-hb-A" });
+    await register({ holder_id: "mc-hb-B" });
+    const hb = await heartbeat("mc-hb-A");
+    expect(hb.alive).toBe(true);
+    expect(hb.movie_claim_recommended).toBe(true);
+  });
+
+  it("recommendation drops back to false after the peer unregisters", async () => {
+    await register({ holder_id: "mc-drop-A" });
+    await register({ holder_id: "mc-drop-B" });
+    await unregister("mc-drop-B");
+    const hb = await heartbeat("mc-drop-A");
+    expect(hb.alive).toBe(true);
+    expect(hb.movie_claim_recommended).toBe(false);
+  });
+
+  it("min_runners reflects the env var (bound to default 2 in this suite)", async () => {
+    // The default vitest worker env is hardcoded in wrangler.toml /
+    // vitest.config.ts; if the test fixture ever overrides
+    // MOVIE_CLAIM_MIN_RUNNERS it should be reflected here.  This guards
+    // against an accidental env-shadowing regression.
+    const r = await register({ holder_id: "mc-thresh" });
+    expect(r.movie_claim_min_runners).toBe(2);
   });
 });

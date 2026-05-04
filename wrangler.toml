@@ -113,6 +113,13 @@ MOVIE_CLAIM_TTL_MS = "1800000"
 # so a single missed heartbeat doesn't evict a healthy runner.  Server
 # floors the value at 60 s defensively if a typo is set here.
 RUNNER_STALE_TTL_MS = "600000"
+# Minimum live-runner count at which the registry recommends enabling
+# the per-day MovieClaim mutex.  Used by RunnerRegistry to derive the
+# `movie_claim_recommended` flag returned on every register / heartbeat
+# response — Python clients in `auto` mode follow this signal to mount /
+# unmount their MovieClaimClient automatically.  Default 2: a single
+# runner doesn't benefit from claim coordination; two or more runners do.
+MOVIE_CLAIM_MIN_RUNNERS = "2"
 # P2-C — login attempt cooldown knobs (cross-runner login budget).
 # Counted within `LOGIN_COOLDOWN_WINDOW_SEC`; once recent FAILURES reach
 # `LOGIN_COOLDOWN_THRESHOLD`, `acquire_lease` returns a non-zero
