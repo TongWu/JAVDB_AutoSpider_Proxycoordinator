@@ -1,10 +1,14 @@
 import {
   ClaimMovieRequest,
   ClaimMovieResponse,
+  CommitCompletedMoviesRequest,
+  CommitCompletedMoviesResponse,
   CompleteMovieRequest,
   CompleteMovieResponse,
   DEFAULT_MOVIE_CLAIM_TTL_MS,
+  DEFAULT_SWEEP_ORPHAN_MS,
   Env,
+  MIN_SWEEP_ORPHAN_MS,
   MOVIE_CLAIM_ALARM_INTERVAL_MS,
   MOVIE_CLAIM_COOLDOWN_LADDER_MS,
   MOVIE_CLAIM_DEAD_LETTER_THRESHOLD,
@@ -16,6 +20,11 @@ import {
   ReleaseMovieResponse,
   ReportFailureRequest,
   ReportFailureResponse,
+  RollbackStagedMoviesRequest,
+  RollbackStagedMoviesResponse,
+  StageCompleteMovieRequest,
+  StageCompleteMovieResponse,
+  SweepOrphanStagesResponse,
 } from "./types";
 
 /**
@@ -71,16 +80,42 @@ interface MovieFailure {
   last_error_kind: string;
 }
 
+/** Phase-1 — staged-but-not-yet-committed completion record.  A successful
+ *  detail fetch records the href here instead of jumping straight to
+ *  ``completed_committed[]``; the spider's session-end CLI then either
+ *  promotes the entry to ``completed_committed[]`` (commit path) or
+ *  removes it (rollback path).  The ``session_id`` ties the staged entry
+ *  to the spider session that produced it so a per-session
+ *  commit / rollback never touches a sibling session's stages. */
+interface StagedCompletion {
+  /** ``ReportSessions.Id`` rendered as a string (D1 / SQLite uses INTEGER
+   *  but we keep the wire format stringy so JSON round-trips don't
+   *  silently truncate via the JS Number 53-bit limit). */
+  session_id: string;
+  /** Wall-clock ms epoch when the stage was recorded.  Drives the
+   *  ``sweep_orphan_stages`` cron's age comparison. */
+  ts: number;
+}
+
 interface MovieClaimData {
   /** Active per-href claims keyed by movie detail href. */
   claims: Record<string, MovieClaim>;
   /**
-   * Hrefs that have already completed within this shard.  Stored as a plain
-   * array (not a Set) to round-trip cleanly through DO storage; we de-dupe
-   * via {@link Array.includes} at the few mutation points so repeated
-   * completes are idempotent.
+   * Hrefs that have already finished this shard *and* whose owning
+   * session is committed.  Stored as a plain array (not a Set) to
+   * round-trip cleanly through DO storage; we de-dupe via
+   * {@link Array.includes} at the few mutation points so repeated
+   * completes are idempotent.  Phase-1 renamed this field from
+   * ``completed`` — :func:`loadState` migrates the legacy field on
+   * read so deployed shards stay readable.
    */
-  completed: string[];
+  completed_committed: string[];
+  /** Phase-1 — staged completions waiting on a commit / rollback decision.
+   *  Keyed by href; the value tracks the owning session_id and the wall-
+   *  clock timestamp.  ``undefined`` (legacy) when this shard predates
+   *  the Phase-1 schema bump; :func:`loadState` initialises the field
+   *  on read. */
+  staged_complete?: Record<string, StagedCompletion>;
   /** P2-A — per-href failure stats; ``undefined`` (legacy) when this
    *  shard predates the P2-A schema bump.  We initialise the field on
    *  read to keep the on-disk migration zero-cost. */
@@ -118,6 +153,14 @@ export class MovieClaimState implements DurableObject {
           return await this.handleRelease(request);
         case "/do/complete_movie":
           return await this.handleComplete(request);
+        case "/do/stage_complete_movie":
+          return await this.handleStageComplete(request);
+        case "/do/commit_completed_movies":
+          return await this.handleCommitCompleted(request);
+        case "/do/rollback_staged_movies":
+          return await this.handleRollbackStaged(request);
+        case "/do/sweep_orphan_stages":
+          return await this.handleSweepOrphanStages(url);
         case "/do/report_failure":
           return await this.handleReportFailure(request);
         case "/do/movie_status":
@@ -164,9 +207,16 @@ export class MovieClaimState implements DurableObject {
     }
     // Re-arm only when the shard still has live state to track; an idle
     // shard stops costing alarm invocations until the next claim arrives.
+    // Phase-1: ``staged_complete`` is treated as live state — an alarm
+    // is the safety net that catches a stage written without its
+    // matching commit / rollback (e.g. coordinator-side outage during
+    // session shutdown).  We don't auto-prune stages here (the cron
+    // route is the policy choice) but keeping the alarm armed lets a
+    // future operator-driven sweep find the shard.
     const hasLiveState =
       Object.keys(data.claims).length > 0 ||
-      (data.failures !== undefined && Object.keys(data.failures).length > 0);
+      (data.failures !== undefined && Object.keys(data.failures).length > 0) ||
+      (data.staged_complete !== undefined && Object.keys(data.staged_complete).length > 0);
     if (hasLiveState) {
       await this.scheduleAlarm();
     } else {
@@ -185,21 +235,41 @@ export class MovieClaimState implements DurableObject {
     if (!href || !holderId) {
       return jsonResponse({ error: "missing href or holder_id" }, 400);
     }
+    const sessionId = String(body.session_id ?? "").trim();
     const ttlMs = clampTtlMs(Number(body.ttl_ms ?? 0));
 
     const now = Date.now();
     const data = await this.loadState();
     const failure = data.failures?.[href];
+    const staged = data.staged_complete?.[href];
 
-    // Already completed inside this shard → never re-claim, surface to caller
+    // Already committed inside this shard → never re-claim, surface to caller
     // so they can short-circuit + mark their local history.
-    if (data.completed.includes(href)) {
+    if (data.completed_committed.includes(href)) {
       const response: ClaimMovieResponse = {
         acquired: false,
         current_holder_id: "",
         expires_at: 0,
         already_completed: true,
         cooldown_until: 0,
+        staged_session_id: staged?.session_id ?? "",
+        server_time: now,
+      };
+      return jsonResponse(response);
+    }
+
+    // Phase-1 — same-session idempotent skip on a staged completion.
+    // A peer session's staged entry deliberately does NOT block: that's
+    // the whole point of the rollback-safety split (a daily-run rollback
+    // must not block adhoc retries on the same href).
+    if (staged && sessionId && staged.session_id === sessionId) {
+      const response: ClaimMovieResponse = {
+        acquired: false,
+        current_holder_id: "",
+        expires_at: 0,
+        already_completed: true,
+        cooldown_until: 0,
+        staged_session_id: staged.session_id,
         server_time: now,
       };
       return jsonResponse(response);
@@ -219,6 +289,7 @@ export class MovieClaimState implements DurableObject {
         cooldown_until: failure.next_attempt_at,
         last_error_kind: failure.last_error_kind,
         fail_count: failure.fail_count,
+        staged_session_id: staged?.session_id ?? "",
         server_time: now,
       };
       return jsonResponse(response);
@@ -256,6 +327,7 @@ export class MovieClaimState implements DurableObject {
       cooldown_until: failure?.next_attempt_at ?? 0,
       last_error_kind: failure?.last_error_kind ?? "",
       fail_count: failure?.fail_count ?? 0,
+      staged_session_id: staged?.session_id ?? "",
       server_time: now,
     };
     return jsonResponse(response);
@@ -304,16 +376,22 @@ export class MovieClaimState implements DurableObject {
     const existing = data.claims[href];
     // If already completed, treat as success (idempotent) so a retried
     // ``complete_movie`` from a network blip never raises an error.
-    if (data.completed.includes(href)) {
+    if (data.completed_committed.includes(href)) {
       completed = true;
     } else if (existing && existing.holder_id === holderId) {
       delete data.claims[href];
-      data.completed.push(href);
+      data.completed_committed.push(href);
       // P2-A — a successful complete wipes the failure / cooldown
       // record so the next re-ingestion (different shard date, or a
       // forced retry) starts from a clean slate.
       if (data.failures && data.failures[href]) {
         delete data.failures[href];
+      }
+      // Phase-1 — clear any staged entry too: an explicit commit-skipping
+      // ``complete_movie`` (legacy contract) is the operator saying "this
+      // is final, no rollback expected".
+      if (data.staged_complete && data.staged_complete[href]) {
+        delete data.staged_complete[href];
       }
       await this.persistState(data);
       completed = true;
@@ -324,6 +402,233 @@ export class MovieClaimState implements DurableObject {
     const response: CompleteMovieResponse = {
       completed,
       href,
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  /**
+   * Phase-1 — record a staged completion that survives until commit /
+   * rollback.  Mirrors :meth:`handleComplete` but writes into
+   * ``staged_complete{}`` instead of ``completed_committed[]`` so a
+   * subsequent ``rollback_staged_movies`` can erase the runner's
+   * footprint without leaving a "permanently completed" lock that
+   * blocks adhoc retries.
+   *
+   * Idempotent w.r.t. the *same* (href, session_id): a re-stage refreshes
+   * ``ts`` but does not move the entry to a different session.  A stage
+   * from a *different* session_id when an entry already exists is
+   * rejected with ``staged=false`` so a buggy caller can't silently
+   * steal another session's stage; ops can resolve the conflict via
+   * /movie_status + /rollback_staged_movies.
+   */
+  private async handleStageComplete(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<StageCompleteMovieRequest>;
+    const href = String(body.href ?? "").trim();
+    const holderId = String(body.holder_id ?? "").trim();
+    const sessionId = String(body.session_id ?? "").trim();
+    if (!href || !holderId || !sessionId) {
+      return jsonResponse(
+        { error: "missing href, holder_id, or session_id" },
+        400,
+      );
+    }
+
+    const now = Date.now();
+    const data = await this.loadState();
+    if (!data.staged_complete) data.staged_complete = {};
+
+    let staged = false;
+    let resolvedSessionId = sessionId;
+
+    // If already committed, treat as success (idempotent).  No staged
+    // entry is needed because the work is permanently durable.
+    if (data.completed_committed.includes(href)) {
+      const response: StageCompleteMovieResponse = {
+        staged: true,
+        href,
+        session_id: sessionId,
+        server_time: now,
+      };
+      return jsonResponse(response);
+    }
+
+    const existing = data.claims[href];
+    const priorStage = data.staged_complete[href];
+    if (priorStage && priorStage.session_id === sessionId) {
+      // Same-session idempotent re-stage — refresh ``ts`` so the
+      // orphan-sweep treats the most recent attempt as the heartbeat.
+      data.staged_complete[href] = {
+        session_id: sessionId,
+        ts: now,
+      };
+      // Drop the active claim if this caller still owns it — symmetric
+      // with handleComplete; lets peer sessions race the (unblocked)
+      // claim if they want to re-stage from scratch.
+      if (existing && existing.holder_id === holderId) {
+        delete data.claims[href];
+      }
+      await this.persistState(data);
+      staged = true;
+    } else if (priorStage) {
+      // Different session already staged this href.  Refuse — the
+      // existing stage is preserved; the caller observes ``staged=false``
+      // plus the winner's session_id and can decide whether to wait
+      // for the peer's commit / rollback before retrying.
+      resolvedSessionId = priorStage.session_id;
+      staged = false;
+    } else if (existing && existing.holder_id === holderId) {
+      // Fresh stage by the active holder — the canonical happy path.
+      delete data.claims[href];
+      data.staged_complete[href] = {
+        session_id: sessionId,
+        ts: now,
+      };
+      // P2-A — a successful stage also wipes the failure record so a
+      // subsequent commit lands on a clean slate.  Mirrors handleComplete.
+      if (data.failures && data.failures[href]) {
+        delete data.failures[href];
+      }
+      await this.persistState(data);
+      await this.scheduleAlarm();
+      staged = true;
+    } else {
+      // No active claim or stale holder — refuse.  ``staged=false``
+      // signals the caller to release / re-claim.
+      staged = false;
+    }
+
+    const response: StageCompleteMovieResponse = {
+      staged,
+      href,
+      session_id: resolvedSessionId,
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  /**
+   * Phase-1 — promote every staged entry whose ``session_id`` matches
+   * into ``completed_committed[]``.  Idempotent: zero matching stages
+   * is the steady state once a successful commit has run.
+   *
+   * Concurrency: a commit issued mid-run is safe because the DO
+   * serialises requests — a stage that arrives after this commit will
+   * land in ``staged_complete{}`` again with the same session_id and
+   * a follow-up commit (or stale-session sweep) will tidy it up.
+   */
+  private async handleCommitCompleted(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<CommitCompletedMoviesRequest>;
+    const sessionId = String(body.session_id ?? "").trim();
+    if (!sessionId) {
+      return jsonResponse({ error: "missing session_id" }, 400);
+    }
+
+    const now = Date.now();
+    const data = await this.loadState();
+    let promoted = 0;
+
+    if (data.staged_complete) {
+      for (const href of Object.keys(data.staged_complete)) {
+        if (data.staged_complete[href].session_id !== sessionId) continue;
+        delete data.staged_complete[href];
+        // Idempotent against ``completed_committed[]`` — a peer caller
+        // could have called legacy ``complete_movie`` for the same href
+        // already; drop the duplicate so the array stays a set in spirit.
+        if (!data.completed_committed.includes(href)) {
+          data.completed_committed.push(href);
+        }
+        promoted += 1;
+      }
+      if (promoted > 0) {
+        await this.persistState(data);
+      }
+    }
+
+    const response: CommitCompletedMoviesResponse = {
+      promoted,
+      session_id: sessionId,
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  /**
+   * Phase-1 — drop every staged entry whose ``session_id`` matches.
+   * Idempotent.  After this call returns the rolled-back session can no
+   * longer cause peer claim attempts to short-circuit on
+   * ``already_completed=true``, so an adhoc retry of the same href will
+   * actually proceed with a fresh fetch.
+   */
+  private async handleRollbackStaged(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<RollbackStagedMoviesRequest>;
+    const sessionId = String(body.session_id ?? "").trim();
+    if (!sessionId) {
+      return jsonResponse({ error: "missing session_id" }, 400);
+    }
+
+    const now = Date.now();
+    const data = await this.loadState();
+    let removed = 0;
+
+    if (data.staged_complete) {
+      for (const href of Object.keys(data.staged_complete)) {
+        if (data.staged_complete[href].session_id !== sessionId) continue;
+        delete data.staged_complete[href];
+        removed += 1;
+      }
+      if (removed > 0) {
+        await this.persistState(data);
+      }
+    }
+
+    const response: RollbackStagedMoviesResponse = {
+      removed,
+      session_id: sessionId,
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  /**
+   * Phase-1 — defence-in-depth sweep that prunes ``staged_complete{}``
+   * entries older than ``older_than_ms``.  Designed for a cron caller
+   * (StaleSessionCleanup workflow) that catches stages whose owning
+   * session crashed before either commit or rollback ran.  The session
+   * itself is NOT consulted here — operators run this with a generous
+   * cutoff (default 48h) to make sure a long-running ingestion is not
+   * mistakenly cleaned.
+   */
+  private async handleSweepOrphanStages(url: URL): Promise<Response> {
+    const rawOlderThan = url.searchParams.get("older_than_ms");
+    let olderThanMs = Number(rawOlderThan);
+    if (!Number.isFinite(olderThanMs) || olderThanMs <= 0) {
+      olderThanMs = DEFAULT_SWEEP_ORPHAN_MS;
+    }
+    if (olderThanMs < MIN_SWEEP_ORPHAN_MS) {
+      olderThanMs = MIN_SWEEP_ORPHAN_MS;
+    }
+
+    const now = Date.now();
+    const cutoff = now - olderThanMs;
+    const data = await this.loadState();
+    let removed = 0;
+
+    if (data.staged_complete) {
+      for (const href of Object.keys(data.staged_complete)) {
+        if (data.staged_complete[href].ts <= cutoff) {
+          delete data.staged_complete[href];
+          removed += 1;
+        }
+      }
+      if (removed > 0) {
+        await this.persistState(data);
+      }
+    }
+
+    const response: SweepOrphanStagesResponse = {
+      removed,
+      cutoff_ms: cutoff,
       server_time: now,
     };
     return jsonResponse(response);
@@ -413,13 +718,16 @@ export class MovieClaimState implements DurableObject {
     const data = await this.loadState();
     const existing = data.claims[href] ?? null;
     const failure = data.failures?.[href] ?? null;
+    const staged = data.staged_complete?.[href] ?? null;
     const response: MovieStatusResponse = {
       current_holder_id: existing?.holder_id ?? null,
       expires_at: existing?.expires_at ?? 0,
-      already_completed: data.completed.includes(href),
+      already_completed: data.completed_committed.includes(href),
       cooldown_until: failure?.next_attempt_at ?? 0,
       last_error_kind: failure?.last_error_kind ?? "",
       fail_count: failure?.fail_count ?? 0,
+      staged_session_id: staged?.session_id ?? "",
+      staged_at: staged?.ts ?? 0,
       server_time: now,
     };
     return jsonResponse(response);
@@ -431,12 +739,25 @@ export class MovieClaimState implements DurableObject {
 
   private async loadState(): Promise<MovieClaimData> {
     if (this.cached !== null) return this.cached;
-    const stored = (await this.state.storage.get<MovieClaimData>(STORAGE_KEY)) ?? null;
-    const data: MovieClaimData = stored ?? { claims: {}, completed: [] };
-    // P2-A — defensive backfill so on-disk data from an older deploy
-    // (no ``failures`` field) appears as "no failures" rather than
-    // crashing with ``undefined`` lookups.  Zero-cost on hot reads.
-    if (!data.failures) data.failures = {};
+    /** Read shape includes the legacy ``completed`` field so we can migrate
+     *  data persisted by pre-Phase-1 Workers without forcing a coordinated
+     *  re-deploy.  Once every active shard has been touched by a Phase-1
+     *  Worker the legacy field is dropped on first persist. */
+    const stored =
+      (await this.state.storage.get<
+        Partial<MovieClaimData> & { completed?: string[] }
+      >(STORAGE_KEY)) ?? null;
+    const data: MovieClaimData = {
+      claims: stored?.claims ?? {},
+      // Phase-1 migration: prefer ``completed_committed`` when present;
+      // fall back to legacy ``completed`` so an in-flight shard from a
+      // pre-Phase-1 deploy keeps observing already_completed=true on its
+      // historical commits.  ``[]`` for a brand-new shard.
+      completed_committed:
+        stored?.completed_committed ?? stored?.completed ?? [],
+      staged_complete: stored?.staged_complete ?? {},
+      failures: stored?.failures ?? {},
+    };
     this.cached = data;
     return this.cached;
   }

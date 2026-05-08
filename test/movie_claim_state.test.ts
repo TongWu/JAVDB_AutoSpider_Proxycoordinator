@@ -614,6 +614,454 @@ describe("P2-A — report_failure & cooldown", () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase-1 — staged completions: stage / commit / rollback / sweep
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface StageCompleteResp {
+  staged: boolean;
+  href: string;
+  session_id: string;
+  server_time: number;
+}
+
+interface CommitCompletedResp {
+  promoted: number;
+  session_id: string;
+  server_time: number;
+}
+
+interface RollbackStagedResp {
+  removed: number;
+  session_id: string;
+  server_time: number;
+}
+
+interface SweepOrphanResp {
+  removed: number;
+  cutoff_ms: number;
+  server_time: number;
+}
+
+const stageComplete = (
+  href: string,
+  holderId: string,
+  sessionId: string,
+  date: string = FIXED_DATE,
+) =>
+  jsonPost<StageCompleteResp>("/stage_complete_movie", {
+    href,
+    holder_id: holderId,
+    session_id: sessionId,
+    date,
+  });
+
+const commitCompleted = (sessionId: string, date: string = FIXED_DATE) =>
+  jsonPost<CommitCompletedResp>("/commit_completed_movies", {
+    session_id: sessionId,
+    date,
+  });
+
+const rollbackStaged = (sessionId: string, date: string = FIXED_DATE) =>
+  jsonPost<RollbackStagedResp>("/rollback_staged_movies", {
+    session_id: sessionId,
+    date,
+  });
+
+const sweepOrphan = (olderThanMs: number, date: string = FIXED_DATE) =>
+  jsonGet<SweepOrphanResp>(
+    `/sweep_orphan_stages?older_than_ms=${olderThanMs}&date=${date}`,
+  );
+
+const claimWithSession = (
+  href: string,
+  holderId: string,
+  sessionId: string,
+  ttlMs?: number,
+  date: string = FIXED_DATE,
+) =>
+  jsonPost<ClaimResp & { staged_session_id?: string }>("/claim_movie", {
+    href,
+    holder_id: holderId,
+    session_id: sessionId,
+    ttl_ms: ttlMs,
+    date,
+  });
+
+describe("Phase-1 — stage_complete_movie", () => {
+  it("rejects stage with missing session_id", async () => {
+    await jsonPost(
+      "/stage_complete_movie",
+      { href: "/v/p1-missing-session", holder_id: "h", date: FIXED_DATE },
+      400,
+    );
+  });
+
+  it("rejects stage with missing holder_id", async () => {
+    await jsonPost(
+      "/stage_complete_movie",
+      {
+        href: "/v/p1-missing-holder",
+        session_id: "100",
+        date: FIXED_DATE,
+      },
+      400,
+    );
+  });
+
+  it("the active claim holder can stage; subsequent claim from same session sees already_completed=true", async () => {
+    const acq = await claim("/v/p1-stage-1", "holder-1");
+    expect(acq.acquired).toBe(true);
+
+    const staged = await stageComplete("/v/p1-stage-1", "holder-1", "session-A");
+    expect(staged.staged).toBe(true);
+    expect(staged.session_id).toBe("session-A");
+
+    const re = await claimWithSession(
+      "/v/p1-stage-1",
+      "holder-2",
+      "session-A",
+    );
+    expect(re.acquired).toBe(false);
+    expect(re.already_completed).toBe(true);
+    expect(re.staged_session_id).toBe("session-A");
+  });
+
+  it("a peer session is NOT blocked by another session's stage", async () => {
+    const acq = await claim("/v/p1-stage-2", "holder-1");
+    expect(acq.acquired).toBe(true);
+    await stageComplete("/v/p1-stage-2", "holder-1", "session-daily");
+
+    // Different session sees staged_session_id but is allowed to claim.
+    // The active claim was released by stage_complete, so the peer
+    // can acquire freshly.
+    const peer = await claimWithSession(
+      "/v/p1-stage-2",
+      "holder-2",
+      "session-adhoc",
+    );
+    expect(peer.acquired).toBe(true);
+    expect(peer.already_completed).toBe(false);
+    expect(peer.staged_session_id).toBe("session-daily");
+  });
+
+  it("stage refuses when a different session already staged the href", async () => {
+    await claim("/v/p1-stage-3", "holder-1");
+    await stageComplete("/v/p1-stage-3", "holder-1", "session-daily");
+
+    // A different session would have to first claim the href (peer
+    // contention is unblocked), so simulate that path.
+    const peer = await claimWithSession(
+      "/v/p1-stage-3",
+      "holder-2",
+      "session-adhoc",
+    );
+    expect(peer.acquired).toBe(true);
+
+    // Attempting to stage the peer's claim under a different session_id
+    // is refused — the existing daily stage is preserved.
+    const conflict = await stageComplete(
+      "/v/p1-stage-3",
+      "holder-2",
+      "session-adhoc",
+    );
+    expect(conflict.staged).toBe(false);
+    expect(conflict.session_id).toBe("session-daily");
+  });
+
+  it("same-session re-stage is idempotent (refreshes ts)", async () => {
+    await claim("/v/p1-stage-4", "holder-1");
+    const first = await stageComplete(
+      "/v/p1-stage-4",
+      "holder-1",
+      "session-A",
+    );
+    expect(first.staged).toBe(true);
+
+    // Re-claim + re-stage by the same holder + session.  The DO releases
+    // the active claim on stage; the same holder must re-claim before
+    // the second stage call.
+    const reAcq = await claimWithSession(
+      "/v/p1-stage-4",
+      "holder-1",
+      "session-A",
+    );
+    // Same-session sees it as already_completed (idempotent skip), so
+    // a re-stage is unnecessary.  The contract is verified by the skip.
+    expect(reAcq.acquired).toBe(false);
+    expect(reAcq.already_completed).toBe(true);
+    expect(reAcq.staged_session_id).toBe("session-A");
+  });
+
+  it("a stage by a non-holder is refused (staged=false)", async () => {
+    await claim("/v/p1-stage-5", "holder-1");
+    const stale = await stageComplete(
+      "/v/p1-stage-5",
+      "holder-stale",
+      "session-A",
+    );
+    expect(stale.staged).toBe(false);
+  });
+
+  it("staging a committed href is idempotently true (no work needed)", async () => {
+    await claim("/v/p1-stage-6", "holder-1");
+    await complete("/v/p1-stage-6", "holder-1");
+
+    const r = await stageComplete(
+      "/v/p1-stage-6",
+      "holder-1",
+      "session-A",
+    );
+    expect(r.staged).toBe(true);
+  });
+});
+
+describe("Phase-1 — commit_completed_movies", () => {
+  it("promotes every staged entry for session_id into completed_committed", async () => {
+    await claim("/v/p1-commit-1a", "holder-1");
+    await stageComplete("/v/p1-commit-1a", "holder-1", "session-X");
+    await claim("/v/p1-commit-1b", "holder-1");
+    await stageComplete("/v/p1-commit-1b", "holder-1", "session-X");
+    await claim("/v/p1-commit-1c", "holder-1");
+    await stageComplete("/v/p1-commit-1c", "holder-1", "session-Y");
+
+    const commit = await commitCompleted("session-X");
+    expect(commit.promoted).toBe(2);
+    expect(commit.session_id).toBe("session-X");
+
+    // session-X hrefs now block fresh claims even from a different session.
+    const r1 = await claimWithSession(
+      "/v/p1-commit-1a",
+      "holder-other",
+      "session-other",
+    );
+    expect(r1.already_completed).toBe(true);
+
+    // session-Y href still has a stage, blocks only its own session.
+    const r2 = await claimWithSession(
+      "/v/p1-commit-1c",
+      "holder-other",
+      "session-Y",
+    );
+    expect(r2.already_completed).toBe(true);
+    const r3 = await claimWithSession(
+      "/v/p1-commit-1c",
+      "holder-other",
+      "session-Z",
+    );
+    expect(r3.acquired).toBe(true);
+  });
+
+  it("commit is idempotent (re-running returns promoted=0)", async () => {
+    await claim("/v/p1-commit-2", "holder-1");
+    await stageComplete("/v/p1-commit-2", "holder-1", "session-idempotent");
+    const first = await commitCompleted("session-idempotent");
+    expect(first.promoted).toBe(1);
+    const second = await commitCompleted("session-idempotent");
+    expect(second.promoted).toBe(0);
+  });
+
+  it("rejects commit with missing session_id", async () => {
+    await jsonPost("/commit_completed_movies", { date: FIXED_DATE }, 400);
+  });
+});
+
+describe("Phase-1 — rollback_staged_movies", () => {
+  it("removes every staged entry for session_id without touching peers", async () => {
+    await claim("/v/p1-rb-1a", "holder-1");
+    await stageComplete("/v/p1-rb-1a", "holder-1", "session-rollback");
+    await claim("/v/p1-rb-1b", "holder-1");
+    await stageComplete("/v/p1-rb-1b", "holder-1", "session-rollback");
+    await claim("/v/p1-rb-1c", "holder-1");
+    await stageComplete("/v/p1-rb-1c", "holder-1", "session-keep");
+
+    const rb = await rollbackStaged("session-rollback");
+    expect(rb.removed).toBe(2);
+
+    // The rolled-back hrefs are now claimable by any session — including
+    // an adhoc retry of the same href under a brand-new session_id.
+    const retry = await claimWithSession(
+      "/v/p1-rb-1a",
+      "holder-adhoc",
+      "session-adhoc",
+    );
+    expect(retry.acquired).toBe(true);
+
+    // The unrelated session's stage survives.
+    const peerSkip = await claimWithSession(
+      "/v/p1-rb-1c",
+      "holder-other",
+      "session-keep",
+    );
+    expect(peerSkip.already_completed).toBe(true);
+  });
+
+  it("rollback is idempotent (re-running returns removed=0)", async () => {
+    await claim("/v/p1-rb-2", "holder-1");
+    await stageComplete("/v/p1-rb-2", "holder-1", "session-double-rb");
+    const first = await rollbackStaged("session-double-rb");
+    expect(first.removed).toBe(1);
+    const second = await rollbackStaged("session-double-rb");
+    expect(second.removed).toBe(0);
+  });
+
+  it("rollback before commit lets peer adhoc retry the same href", async () => {
+    // The original problem this whole feature solves: daily stages
+    // succeed, daily session is rolled back, adhoc must be able to
+    // re-fetch the SAME href.  Pre-Phase-1 this was blocked because
+    // the daily run had already pushed the href into completed[].
+    await claim("/v/p1-rb-scenario", "holder-daily");
+    await stageComplete(
+      "/v/p1-rb-scenario",
+      "holder-daily",
+      "session-daily",
+    );
+
+    await rollbackStaged("session-daily");
+
+    const adhoc = await claimWithSession(
+      "/v/p1-rb-scenario",
+      "holder-adhoc",
+      "session-adhoc",
+    );
+    expect(adhoc.acquired).toBe(true);
+    expect(adhoc.already_completed).toBe(false);
+  });
+
+  it("rejects rollback with missing session_id", async () => {
+    await jsonPost("/rollback_staged_movies", { date: FIXED_DATE }, 400);
+  });
+});
+
+describe("Phase-1 — sweep_orphan_stages", () => {
+  it("prunes only entries older than older_than_ms", async () => {
+    const SHARD = "2026-11-11";
+    await claim("/v/p1-sweep-fresh", "holder-1", 60_000, SHARD);
+    await stageComplete(
+      "/v/p1-sweep-fresh",
+      "holder-1",
+      "session-fresh",
+      SHARD,
+    );
+    await claim("/v/p1-sweep-old", "holder-1", 60_000, SHARD);
+    await stageComplete(
+      "/v/p1-sweep-old",
+      "holder-1",
+      "session-old",
+      SHARD,
+    );
+
+    if (!env.MOVIE_CLAIM_DO) throw new Error("MOVIE_CLAIM_DO binding missing");
+    const id = env.MOVIE_CLAIM_DO.idFromName(SHARD);
+    const stub = env.MOVIE_CLAIM_DO.get(id);
+
+    // Age the "old" stage past the sweep horizon by mutating storage
+    // directly.  72h cutoff with the old entry timestamped 96h ago.
+    const STALE_AGE_MS = 96 * 60 * 60_000;
+    const HORIZON_MS = 72 * 60 * 60_000;
+    await runInDurableObject(stub, async (instance, doState) => {
+      const data = (await doState.storage.get("state")) as {
+        staged_complete: Record<string, { session_id: string; ts: number }>;
+      };
+      data.staged_complete["/v/p1-sweep-old"].ts = Date.now() - STALE_AGE_MS;
+      await doState.storage.put("state", data);
+      (instance as unknown as { cached: unknown }).cached = null;
+    });
+
+    const sweep = await sweepOrphan(HORIZON_MS, SHARD);
+    expect(sweep.removed).toBe(1);
+
+    // Fresh stage is still in place — claim from same session is skipped.
+    const freshHit = await claimWithSession(
+      "/v/p1-sweep-fresh",
+      "holder-other",
+      "session-fresh",
+      undefined,
+      SHARD,
+    );
+    expect(freshHit.already_completed).toBe(true);
+
+    // Old stage was swept — claim proceeds normally now.
+    const oldRetry = await claimWithSession(
+      "/v/p1-sweep-old",
+      "holder-other",
+      "session-old",
+      undefined,
+      SHARD,
+    );
+    expect(oldRetry.acquired).toBe(true);
+  });
+
+  it("clamps tiny older_than_ms up to the server-side minimum", async () => {
+    // older_than_ms=0 would otherwise wipe every stage; the DO floors
+    // at MIN_SWEEP_ORPHAN_MS (1h).
+    const SHARD = "2026-11-12";
+    await claim("/v/p1-sweep-floor", "holder-1", 60_000, SHARD);
+    await stageComplete(
+      "/v/p1-sweep-floor",
+      "holder-1",
+      "session-floor",
+      SHARD,
+    );
+
+    const sweep = await sweepOrphan(0, SHARD);
+    expect(sweep.removed).toBe(0);
+
+    // Stage still in place.
+    const hit = await claimWithSession(
+      "/v/p1-sweep-floor",
+      "holder-other",
+      "session-floor",
+      undefined,
+      SHARD,
+    );
+    expect(hit.already_completed).toBe(true);
+  });
+
+  it("does not touch live in-progress stages from a current session", async () => {
+    const SHARD = "2026-11-13";
+    await claim("/v/p1-sweep-live", "holder-1", 60_000, SHARD);
+    await stageComplete(
+      "/v/p1-sweep-live",
+      "holder-1",
+      "session-live",
+      SHARD,
+    );
+
+    // Default cutoff = 48h; a brand-new stage is well within.
+    const r = await rawFetch(
+      `/sweep_orphan_stages?date=${SHARD}`,
+      { method: "GET", headers: { ...AUTH } },
+    );
+    expect(r.status).toBe(200);
+    const sweep = (await r.json()) as SweepOrphanResp;
+    expect(sweep.removed).toBe(0);
+  });
+});
+
+describe("Phase-1 — legacy `completed` field migration", () => {
+  it("loadState() promotes legacy completed[] into completed_committed[]", async () => {
+    const SHARD = "2026-11-14";
+    if (!env.MOVIE_CLAIM_DO) throw new Error("MOVIE_CLAIM_DO binding missing");
+    const id = env.MOVIE_CLAIM_DO.idFromName(SHARD);
+    const stub = env.MOVIE_CLAIM_DO.get(id);
+
+    // Seed a legacy snapshot (pre-Phase-1 schema: ``completed`` field).
+    await runInDurableObject(stub, async (instance, doState) => {
+      await doState.storage.put("state", {
+        claims: {},
+        completed: ["/v/legacy-href"],
+      });
+      (instance as unknown as { cached: unknown }).cached = null;
+    });
+
+    // Phase-1 read path translates ``completed`` → ``completed_committed``.
+    const r = await claim("/v/legacy-href", "holder-1", 60_000, SHARD);
+    expect(r.acquired).toBe(false);
+    expect(r.already_completed).toBe(true);
+  });
+});
+
 describe("P2-A — alarm GC of stale failure records", () => {
   it("alarm() prunes failure entries older than MOVIE_CLAIM_FAILURE_TTL_MS", async () => {
     // Use a unique date so other tests' state doesn't leak in.

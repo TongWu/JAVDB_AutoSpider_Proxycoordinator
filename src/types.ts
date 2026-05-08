@@ -409,6 +409,14 @@ export interface ClaimMovieRequest {
   /** Optional per-claim TTL override; clamped to the DO bounds above.
    *  Most callers pass ``DEFAULT_MOVIE_CLAIM_TTL_MS``. */
   ttl_ms?: number;
+  /** Phase-1 rollback safety: when set, the DO treats a `staged_complete`
+   *  entry written by the SAME `session_id` as ``already_completed=true``
+   *  (idempotent skip) but DOES NOT block other sessions on a peer
+   *  session's staged entry — so a daily-run rollback can leave the
+   *  staged entry in place without blocking adhoc retries.  When omitted
+   *  the legacy P1-B contract still applies: only `completed_committed`
+   *  triggers ``already_completed=true``. */
+  session_id?: string;
 }
 
 export interface ClaimMovieResponse {
@@ -443,6 +451,14 @@ export interface ClaimMovieResponse {
    *  on the first ``complete_movie`` so a successful run wipes the
    *  cooldown bookkeeping. */
   fail_count?: number;
+  /** Phase-1 — session_id of the staged_complete entry blocking this
+   *  href, if any.  ``""`` (or omitted by older Workers) when no staged
+   *  entry exists.  When the request supplied a matching ``session_id``
+   *  the DO sets ``already_completed=true`` AND echoes this field so the
+   *  client can confirm the same-session idempotent path; when the
+   *  staged entry belongs to a *different* session it is non-empty but
+   *  ``already_completed`` is ``false`` and the claim proceeds normally. */
+  staged_session_id?: string;
   server_time: number;
 }
 
@@ -472,6 +488,105 @@ export interface CompleteMovieResponse {
   server_time: number;
 }
 
+// ── Phase-1 rollback safety: stage / commit / rollback / sweep ─────────────
+//
+// `complete_movie` writes directly to ``completed_committed[]`` and is
+// preserved for backward compatibility with pre-Phase-1 clients.  Phase-1
+// clients should call ``stage_complete_movie`` after a successful detail
+// fetch instead, which writes into ``staged_complete{}`` keyed by href and
+// tagged with the session_id.  The session-end CLI then promotes the
+// staged entries to ``completed_committed[]`` on commit
+// (`commit_completed_movies`) or deletes them on rollback
+// (`rollback_staged_movies`).  A safety-net cron sweeps long-orphaned
+// staged entries via `sweep_orphan_stages`.
+//
+// State machine (per shard, per href):
+//
+//        ┌──────────────┐  stage_complete   ┌──────────────────┐
+//        │  (no entry)  │────────────────▶  │  staged_complete │
+//        └──────────────┘                    └──────────────────┘
+//                                                    │  │
+//                                  commit_completed_ │  │ rollback_staged_
+//                                            movies  │  │       movies
+//                                                    ▼  ▼
+//                                          ┌──────────────────────┐
+//                                          │ completed_committed  │
+//                                          └──────────────────────┘
+
+export interface StageCompleteMovieRequest {
+  href: string;
+  /** Holder-of-record check, mirrors `complete_movie`. */
+  holder_id: string;
+  /** Session that performed the detail fetch; used by Phase-1 commit /
+   *  rollback to scope per-session promotions / deletions.  Empty string
+   *  is rejected (``400``) — the staged entry would otherwise be
+   *  un-rollbackable. */
+  session_id: string;
+}
+
+export interface StageCompleteMovieResponse {
+  /** ``true`` once the staged entry exists for this href (fresh stage OR
+   *  idempotent re-stage by the same session_id).  ``false`` for
+   *  stale-holder calls (the active claim belongs to someone else) and
+   *  for re-stages from a different session — those callers should
+   *  consult the live claim state via ``/movie_status``. */
+  staged: boolean;
+  /** Echoed for client-side dedup. */
+  href: string;
+  /** Session that owns the staged entry now (may differ from request
+   *  ``session_id`` when an earlier different-session stage is preserved). */
+  session_id: string;
+  server_time: number;
+}
+
+export interface CommitCompletedMoviesRequest {
+  /** Promote every staged entry whose ``session_id`` matches this value
+   *  into ``completed_committed[]``.  Idempotent: re-running the call
+   *  after a successful commit returns ``promoted=0`` rather than an
+   *  error. */
+  session_id: string;
+}
+
+export interface CommitCompletedMoviesResponse {
+  /** Number of staged entries that were just moved to
+   *  ``completed_committed[]``.  ``0`` is the steady state once all
+   *  entries have been committed (idempotent re-runs land here). */
+  promoted: number;
+  /** Echoed back so the caller can correlate with its local audit log. */
+  session_id: string;
+  server_time: number;
+}
+
+export interface RollbackStagedMoviesRequest {
+  /** Delete every staged entry whose ``session_id`` matches this value. */
+  session_id: string;
+}
+
+export interface RollbackStagedMoviesResponse {
+  /** Number of staged entries removed from ``staged_complete{}``. */
+  removed: number;
+  session_id: string;
+  server_time: number;
+}
+
+export interface SweepOrphanStagesResponse {
+  /** Number of staged entries pruned because their ``ts`` is older than
+   *  the supplied ``older_than_ms`` cutoff. */
+  removed: number;
+  /** Cutoff in ms epoch used for the sweep — ``server_time - older_than_ms``. */
+  cutoff_ms: number;
+  server_time: number;
+}
+
+/** Default sweep horizon when a caller passes no override (or an invalid
+ *  value).  Sized so a 24h ingestion has comfortably committed before the
+ *  sweep can prune its staged entries — anything older than 48h is
+ *  unambiguously orphaned by a crashed runner. */
+export const DEFAULT_SWEEP_ORPHAN_MS = 48 * 60 * 60_000;
+/** Lower bound applied to ``older_than_ms`` so a buggy operator with an
+ *  ``older_than_ms=0`` query string can't accidentally wipe live stages. */
+export const MIN_SWEEP_ORPHAN_MS = 60 * 60_000;
+
 export interface MovieStatusResponse {
   /** ``null`` when the href has neither an active claim nor a completion. */
   current_holder_id: string | null;
@@ -485,6 +600,15 @@ export interface MovieStatusResponse {
   last_error_kind?: string;
   /** P2-A — see {@link ClaimMovieResponse.fail_count}. */
   fail_count?: number;
+  /** Phase-1 — session_id that owns the current ``staged_complete`` entry
+   *  for this href, if any.  ``""`` when no staged entry exists.  Lets ops
+   *  inspect the staged-but-not-committed state via ``/movie_status``
+   *  without reaching for raw DO storage. */
+  staged_session_id?: string;
+  /** Phase-1 — wall-clock ms epoch when the current ``staged_complete``
+   *  entry was created.  ``0`` when no staged entry exists.  Surfaced so
+   *  ops can correlate orphan stages with the wall-clock timeline. */
+  staged_at?: number;
   server_time: number;
 }
 

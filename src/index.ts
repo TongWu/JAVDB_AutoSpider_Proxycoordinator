@@ -14,6 +14,7 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/state",
   "/login_state",
   "/movie_status",
+  "/sweep_orphan_stages",
   "/active_runners",
 ]);
 
@@ -37,9 +38,17 @@ const GET_ALLOWED_PATHS = new Set<string>([
  *
  * Cross-runner movie detail claim (MovieClaimState DO, addressed by
  * `idFromName("YYYY-MM-DD")` — per-day shard):
- * - `POST /claim_movie`    — body `{ href, holder_id, ttl_ms?, date? }` → claim or check status.
+ * - `POST /claim_movie`    — body `{ href, holder_id, ttl_ms?, session_id?, date? }` → claim or check status.
  * - `POST /release_movie`  — body `{ href, holder_id, date? }` → relinquish a held claim.
- * - `POST /complete_movie` — body `{ href, holder_id, date? }` → mark claim done.
+ * - `POST /complete_movie` — body `{ href, holder_id, date? }` → mark claim done (legacy; commits immediately).
+ * - `POST /stage_complete_movie`    — body `{ href, holder_id, session_id, date? }`
+ *                                     → Phase-1 staged completion awaiting commit / rollback.
+ * - `POST /commit_completed_movies` — body `{ session_id, date? }`
+ *                                     → promote every staged entry for *session_id* to committed.
+ * - `POST /rollback_staged_movies`  — body `{ session_id, date? }`
+ *                                     → drop every staged entry for *session_id* (no peer impact).
+ * - `GET  /sweep_orphan_stages?older_than_ms=<ms>&date=YYYY-MM-DD`
+ *                                     → cron-only safety-net prune of long-orphaned stages.
  * - `POST /report_failure` — body `{ href, holder_id?, error_kind?, cooldown_ms?, date? }`
  *                            → record a failure + bump cooldown (P2-A).
  * - `GET  /movie_status?href=...&date=YYYY-MM-DD` — ops debug.
@@ -148,6 +157,47 @@ export default {
           const body = (await request.json()) as { date?: string };
           const shard = resolveClaimShard(body?.date);
           return await forwardToMovieClaimDo(env, shard, "/do/complete_movie", "POST", body);
+        }
+        case "/stage_complete_movie": {
+          // Phase-1 — staged completion awaiting the session-end CLI's
+          // commit / rollback decision.  Same shard routing as the rest
+          // of the claim cluster so a stage written under shard X is
+          // observed by claims/commits/rollbacks targeting shard X.
+          const body = (await request.json()) as { date?: string };
+          const shard = resolveClaimShard(body?.date);
+          return await forwardToMovieClaimDo(
+            env, shard, "/do/stage_complete_movie", "POST", body,
+          );
+        }
+        case "/commit_completed_movies": {
+          // Phase-1 — invoked by ``apps.cli.commit_session`` after the
+          // pipeline marks the ReportSessions row committed.  Promotes
+          // every staged entry for ``session_id`` into completed_committed.
+          const body = (await request.json()) as { date?: string };
+          const shard = resolveClaimShard(body?.date);
+          return await forwardToMovieClaimDo(
+            env, shard, "/do/commit_completed_movies", "POST", body,
+          );
+        }
+        case "/rollback_staged_movies": {
+          // Phase-1 — invoked by ``apps.cli.rollback`` for every session
+          // it rolls back.  Erases the runner's staged footprint so an
+          // adhoc retry of the same href is not blocked by the prior
+          // run's stage.  Failures are non-fatal on the caller side.
+          const body = (await request.json()) as { date?: string };
+          const shard = resolveClaimShard(body?.date);
+          return await forwardToMovieClaimDo(
+            env, shard, "/do/rollback_staged_movies", "POST", body,
+          );
+        }
+        case "/sweep_orphan_stages": {
+          // Phase-1 — defence-in-depth cron route.  Both ``older_than_ms``
+          // and ``date`` are forwarded as query strings so the DO can
+          // enforce its own server-side bounds (no need for a body).
+          const date = url.searchParams.get("date");
+          const shard = resolveClaimShard(date);
+          const upstreamUrl = `/do/sweep_orphan_stages?${url.searchParams.toString()}`;
+          return await forwardToMovieClaimDo(env, shard, upstreamUrl, "GET", null);
         }
         case "/report_failure": {
           // P2-A — failure / cooldown / dead-letter.  Same per-day shard
