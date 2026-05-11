@@ -256,6 +256,59 @@ describe("payload validation", () => {
     await waitOnExecutionContext(ctx);
     expect(res.status).toBe(400);
   });
+
+  it("non-finite intended_sleep_ms returns 400 (B.14)", async () => {
+    // B.14 (2026-05-12): NaN / Infinity / negative / unbounded large
+    // values used to be silently coerced to 0 or clamped further inside
+    // the lease arithmetic.  Now we reject upfront so a malicious or
+    // buggy caller can't push the DO's storage near Number.MAX_VALUE.
+    // Each iteration uses a fresh proxy_id so the early-reject path
+    // never touches DO storage (the test harness asserts on
+    // isolated-storage state between tests).
+    for (const bad of ["NaN", "Infinity", "-Infinity", -1, Number.MAX_VALUE]) {
+      const req = new Request("https://test.invalid/lease", {
+        method: "POST",
+        headers: { ...AUTH, "content-type": "application/json" },
+        body: JSON.stringify({
+          proxy_id: `bad-sleep-${crypto.randomUUID()}`,
+          intended_sleep_ms: bad,
+        }),
+      });
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(req, env, ctx);
+      await waitOnExecutionContext(ctx);
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toBe("invalid_intended_sleep_ms");
+    }
+  });
+
+  it("unknown report.kind returns 400 (Q3 / sibling P0-1)", async () => {
+    // Q3 (2026-05-12): a typo'd ``rawKind`` (e.g. "succss") used to fall
+    // through to the legacy ``else`` branch and inflate cfEvents — the
+    // worker's penalty_factor would then climb spuriously and tax every
+    // peer lease for ``penaltyWindowSec`` seconds. The 400 here surfaces
+    // the typo at the caller and leaves DO state untouched.
+    const req = new Request("https://test.invalid/report", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        proxy_id: `unk-${crypto.randomUUID()}`,
+        kind: "succss",
+      }),
+    });
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(req, env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as {
+      error: string; allowed_kinds: string[];
+    };
+    expect(body.error).toBe("invalid_kind");
+    expect(body.allowed_kinds).toEqual(
+      ["ban", "cf", "cf_bypass", "failure", "success", "unban"],
+    );
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

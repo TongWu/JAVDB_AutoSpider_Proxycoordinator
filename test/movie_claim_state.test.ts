@@ -803,6 +803,42 @@ describe("Phase-1 — stage_complete_movie", () => {
     expect(stale.staged).toBe(false);
   });
 
+  it("same-session re-stage from a non-holder is refused (B.12)", async () => {
+    // B.12 (2026-05-12): the same-session idempotent re-stage path used
+    // to accept any caller as long as session_id matched, even one that
+    // never held the claim. A buggy / hostile peer could refresh the
+    // ts heartbeat of someone else's stage and indefinitely delay the
+    // orphan-sweep. Now the DO requires the caller to be the active
+    // claim holder (when a claim still exists for the href).
+    const acq = await claim("/v/p1-stage-non-holder-restage", "holder-A");
+    expect(acq.acquired).toBe(true);
+    // First stage by the rightful holder — releases the claim slot.
+    const first = await stageComplete(
+      "/v/p1-stage-non-holder-restage",
+      "holder-A",
+      "session-X",
+    );
+    expect(first.staged).toBe(true);
+
+    // A peer re-claims the href (no active claim left after the stage).
+    const peerAcq = await claim(
+      "/v/p1-stage-non-holder-restage",
+      "holder-B",
+    );
+    expect(peerAcq.acquired).toBe(true);
+
+    // Now an attacker that knows session-X (or guesses it) tries to
+    // refresh holder-A's stage as ``holder-impostor`` while holder-B
+    // is the actual claim owner.  The DO must refuse.
+    const impostor = await stageComplete(
+      "/v/p1-stage-non-holder-restage",
+      "holder-impostor",
+      "session-X",
+    );
+    expect(impostor.staged).toBe(false);
+    expect(impostor.session_id).toBe("session-X");
+  });
+
   it("staging a committed href is idempotently true (no work needed)", async () => {
     await claim("/v/p1-stage-6", "holder-1");
     await complete("/v/p1-stage-6", "holder-1");

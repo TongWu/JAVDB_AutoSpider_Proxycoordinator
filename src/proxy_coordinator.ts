@@ -144,7 +144,30 @@ export class ProxyCoordinator implements DurableObject {
 
   private async handleLease(request: Request): Promise<Response> {
     const body = (await request.json()) as LeaseRequest;
-    const intendedSleepMs = Math.max(0, Number(body.intended_sleep_ms ?? 0));
+    // B.14 (2026-05-12): explicit finite + range validation. The previous
+    // ``Math.max(0, Number(undefined ?? 0))`` form silently coerced NaN
+    // (e.g. from a JSON string) to 0 and accepted unbounded large numbers
+    // that ``MAX_LEASE_WAIT_MS`` then clamped — but the resulting
+    // ``waitMs`` arithmetic still passed through ``Number.MAX_VALUE``
+    // territory and could overflow the in-storage ``requestTimestamps``
+    // accumulator on a malicious caller. Reject upfront with 400.
+    const rawIntended = body.intended_sleep_ms;
+    let intendedSleepMs: number;
+    if (rawIntended === undefined || rawIntended === null) {
+      intendedSleepMs = 0;
+    } else {
+      const n = Number(rawIntended);
+      if (!Number.isFinite(n) || n < 0 || n > MAX_LEASE_WAIT_MS) {
+        return jsonResponse(
+          {
+            error: "invalid_intended_sleep_ms",
+            max_intended_sleep_ms: MAX_LEASE_WAIT_MS,
+          },
+          400,
+        );
+      }
+      intendedSleepMs = Math.floor(n);
+    }
     const proxyId = String(body.proxy_id ?? "");
 
     const now = Date.now();
@@ -240,6 +263,26 @@ export class ProxyCoordinator implements DurableObject {
     const proxyId = String(body.proxy_id ?? "");
     const now = Date.now();
     const rawKind = body.kind;
+
+    // Q3 / sibling-plan P0-1 (2026-05-12): reject unknown ``kind`` values
+    // upfront. The default ``else`` branch below treats anything we don't
+    // recognise as ``"cf"`` for backward compat, which silently inflated
+    // ``cfEvents`` (and thus ``penalty_factor``) whenever a Python client
+    // shipped a typo'd ``rawKind`` like ``"succss"`` or ``"failuer"``. A
+    // 400 surfaces the bug at the caller instead of letting it tax
+    // every subsequent lease for the duration of ``penaltyWindowSec``.
+    const ALLOWED_KINDS: ReadonlySet<string> = new Set([
+      "success", "failure", "cf", "ban", "unban", "cf_bypass",
+    ]);
+    if (rawKind !== undefined && rawKind !== null && !ALLOWED_KINDS.has(rawKind as string)) {
+      return jsonResponse(
+        {
+          error: "invalid_kind",
+          allowed_kinds: Array.from(ALLOWED_KINDS).sort(),
+        },
+        400,
+      );
+    }
 
     const state = await this.loadState();
     this.purgeExpired(state, now);

@@ -460,8 +460,24 @@ export class MovieClaimState implements DurableObject {
     const existing = data.claims[href];
     const priorStage = data.staged_complete[href];
     if (priorStage && priorStage.session_id === sessionId) {
-      // Same-session idempotent re-stage — refresh ``ts`` so the
-      // orphan-sweep treats the most recent attempt as the heartbeat.
+      // Same-session idempotent re-stage. B.12 (2026-05-12): require
+      // the caller to be the *active claim holder* on this href before
+      // accepting the re-stage. ``session_id`` is opaque to the DO and
+      // could be reused by a buggy / malicious peer to refresh a
+      // sibling runner's stage timestamp; tying re-stages back to the
+      // claim holder closes that gap. If there's no active claim
+      // anymore (claim TTL elapsed) we still accept — the prior stage
+      // already represents committed-intent work, refreshing ``ts``
+      // is the correct behaviour for the orphan-sweep heartbeat.
+      if (existing && existing.holder_id !== holderId) {
+        const response: StageCompleteMovieResponse = {
+          staged: false,
+          href,
+          session_id: priorStage.session_id,
+          server_time: now,
+        };
+        return jsonResponse(response);
+      }
       data.staged_complete[href] = {
         session_id: sessionId,
         ts: now,
