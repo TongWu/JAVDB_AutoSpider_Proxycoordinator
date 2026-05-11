@@ -235,8 +235,18 @@ export default {
           return jsonResponse({ error: "not found" }, 404);
       }
     } catch (err) {
+      // Do NOT echo the raw error message to the caller: DO handlers can
+      // throw with SQL fragments, file paths, or partial cookies in the
+      // exception text. Log to Workers logs (operator-only) and respond
+      // with a stable opaque ``internal_error`` so external observers
+      // can't probe internal state via crafted bad requests.
       const message = err instanceof Error ? err.message : String(err);
-      return jsonResponse({ error: message }, 500);
+      console.error("worker fetch handler error", {
+        path: url.pathname,
+        method: request.method,
+        error: message,
+      });
+      return jsonResponse({ error: "internal_error" }, 500);
     }
   },
 };

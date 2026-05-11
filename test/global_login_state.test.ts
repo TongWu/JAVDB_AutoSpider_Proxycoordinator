@@ -192,6 +192,22 @@ describe("auth", () => {
     });
     expect(res.status).toBe(401);
   });
+
+  it("returns opaque internal_error on a non-JSON body (no raw err.message leak)", async () => {
+    // The catch-all in the Worker fetch handler must NOT echo
+    // ``err.message`` back to the caller — raw JSON-parse errors can
+    // include byte offsets from the malformed input, and DO-side
+    // exceptions can carry SQL fragments. The response body must be a
+    // stable ``{"error":"internal_error"}`` shape.
+    const res = await rawFetch("/login_state/acquire_lease", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: "not-json-at-all",
+    });
+    expect(res.status).toBe(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("internal_error");
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,6 +294,33 @@ describe("publish", () => {
       body: JSON.stringify({ holder_id: "runner-B", proxy_name: "P1", cookie: "c=1" }),
     });
     expect(res.status).toBe(409);
+  });
+
+  it("rejects when publish proxy_name disagrees with the lease target", async () => {
+    // Lease acquired for P1, but the publisher claims a cookie for P2.
+    // The DO must refuse without mutating state — otherwise the singleton
+    // `proxy_name` field would point at a proxy whose cookie was never
+    // validated under this lease.
+    await acquire("runner-A", "P1", 60_000);
+    const res = await rawFetch("/login_state/publish", {
+      method: "POST",
+      headers: { ...AUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        holder_id: "runner-A", proxy_name: "P2", cookie: "c=1",
+      }),
+    });
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as {
+      error: string; lease_target_proxy_name?: string;
+    };
+    expect(body.error).toBe("proxy_name_mismatch_with_lease");
+    expect(body.lease_target_proxy_name).toBe("P1");
+    // State must remain unmodified: no cookie was ever published, so
+    // version stays 0 and proxy_name stays null.
+    const snapshot = await getState();
+    expect(snapshot.version).toBe(0);
+    expect(snapshot.proxy_name).toBeNull();
+    expect(snapshot.cookie).toBeNull();
   });
 
   it("succeeds for lease holder and bumps version monotonically", async () => {

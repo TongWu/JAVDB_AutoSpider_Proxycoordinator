@@ -151,8 +151,14 @@ export class GlobalLoginState implements DurableObject {
           return new Response("Not Found", { status: 404 });
       }
     } catch (err) {
+      // Log to Workers logs; don't echo raw err.message (may contain
+      // ciphertext fragments / SQL).
       const message = err instanceof Error ? err.message : String(err);
-      return jsonResponse({ error: message }, 500);
+      console.error("GlobalLoginState DO handler error", {
+        path: url.pathname,
+        error: message,
+      });
+      return jsonResponse({ error: "internal_error" }, 500);
     }
   }
 
@@ -349,6 +355,21 @@ export class GlobalLoginState implements DurableObject {
       // Reject the publish so a runner whose lease just expired can't
       // overwrite a freshly-published cookie from the new lease holder.
       return jsonResponse({ error: "lease_required" }, 409);
+    }
+    if (data.lease.target_proxy_name !== proxyName) {
+      // The lease was acquired for ``target_proxy_name`` (the proxy a
+      // runner promised to re-login through); a publish that mutates the
+      // shared ``proxy_name`` to a *different* proxy would silently
+      // corrupt the singleton view because every other runner now thinks
+      // the active session belongs to a proxy whose cookie was never
+      // verified through this lease. Reject without writing state.
+      return jsonResponse(
+        {
+          error: "proxy_name_mismatch_with_lease",
+          lease_target_proxy_name: data.lease.target_proxy_name,
+        },
+        409,
+      );
     }
 
     const ciphertext = await this.encrypt(cookie);

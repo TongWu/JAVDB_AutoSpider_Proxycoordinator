@@ -88,7 +88,11 @@ export class RunnerRegistry implements DurableObject {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return jsonResponse({ error: message }, 500);
+      console.error("RunnerRegistry DO handler error", {
+        path: url.pathname,
+        error: message,
+      });
+      return jsonResponse({ error: "internal_error" }, 500);
     }
   }
 
@@ -280,8 +284,13 @@ export class RunnerRegistry implements DurableObject {
   }
 
   private async persistState(data: RegistryData): Promise<void> {
-    this.cached = data;
+    // Write storage first; only flip the in-memory cache after a successful
+    // put. The reverse order leaks unpersisted runner records into ``cached``
+    // when ``put`` throws — registry queries would then report runners that
+    // a fresh DO instance after eviction could never see, throwing off the
+    // movie_claim_recommended decision in the singleton ``RunnerRegistry``.
     await this.state.storage.put(STORAGE_KEY, data);
+    this.cached = data;
   }
 
   /** Idempotent helper to arm the GC alarm (mirrors `MovieClaimState`). */

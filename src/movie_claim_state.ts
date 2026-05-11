@@ -170,7 +170,11 @@ export class MovieClaimState implements DurableObject {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return jsonResponse({ error: message }, 500);
+      console.error("MovieClaimState DO handler error", {
+        path: url.pathname,
+        error: message,
+      });
+      return jsonResponse({ error: "internal_error" }, 500);
     }
   }
 
@@ -763,8 +767,14 @@ export class MovieClaimState implements DurableObject {
   }
 
   private async persistState(data: MovieClaimData): Promise<void> {
-    this.cached = data;
+    // Write storage first, then update the in-memory cache. The reverse
+    // ordering leaks unpersisted state into ``cached`` if ``put`` throws:
+    // subsequent requests on the same DO instance would observe a
+    // snapshot the next instance reload could never see, which is
+    // particularly bad for the claim / stage flow where peers rely on
+    // shard-wide observability.
     await this.state.storage.put(STORAGE_KEY, data);
+    this.cached = data;
   }
 
   /** Idempotent helper to arm the GC alarm.  Re-checking the existing alarm

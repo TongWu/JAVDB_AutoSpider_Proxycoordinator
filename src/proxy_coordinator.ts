@@ -127,8 +127,15 @@ export class ProxyCoordinator implements DurableObject {
           return new Response("Not Found", { status: 404 });
       }
     } catch (err) {
+      // Log the raw exception to Workers logs only — never echo it to
+      // the caller. DO internals can throw with SQL / storage paths
+      // that an external observer should not see.
       const message = err instanceof Error ? err.message : String(err);
-      return new Response(JSON.stringify({ error: message }), {
+      console.error("ProxyCoordinator DO handler error", {
+        path: url.pathname,
+        error: message,
+      });
+      return new Response(JSON.stringify({ error: "internal_error" }), {
         status: 500,
         headers: { "content-type": "application/json" },
       });
@@ -385,8 +392,14 @@ export class ProxyCoordinator implements DurableObject {
   }
 
   private async persistState(state: CoordinatorState): Promise<void> {
-    this.cached = state;
+    // Write to storage BEFORE updating the in-memory cache: if the put
+    // throws (DO storage transient failure, quota, eviction race), the
+    // cache must keep showing the previous-committed snapshot rather than
+    // a phantom view of writes that never durably landed. Subsequent
+    // requests would otherwise short-circuit on the dirty cache and
+    // believe state was persisted when storage holds the older value.
     await this.state.storage.put("state", state);
+    this.cached = state;
   }
 
   /**
