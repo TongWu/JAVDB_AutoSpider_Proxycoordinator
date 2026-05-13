@@ -3,6 +3,12 @@ main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Public hostname on the wu.engineer zone (Custom Domain — Wrangler provisions
+# DNS + edge TLS on deploy; zone must live in this Cloudflare account).
+[[routes]]
+pattern = "proxy-coordinator.wu.engineer"
+custom_domain = true
+
 # SQLite-backed Durable Object classes.  Required on the Workers Free plan
 # (only SQLite-backed DOs are available there; KV-backed DOs require Paid).
 [[durable_objects.bindings]]
