@@ -3,6 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Wrangler infers `workers_dev = false` whenever `[[routes]]` is present unless
+# you set this explicitly — keep the `*.workers.dev` URL active in parallel.
+workers_dev = true
+
 # Public hostname on the wu.engineer zone (Custom Domain — Wrangler provisions
 # DNS + edge TLS on deploy; zone must live in this Cloudflare account).
 [[routes]]
