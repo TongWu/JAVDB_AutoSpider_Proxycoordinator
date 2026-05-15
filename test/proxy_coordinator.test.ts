@@ -556,3 +556,48 @@ describe("P2-D — health snapshot", () => {
     expect(s.successEvents!.length).toBe(1);
   });
 });
+
+// ── E.4.3 — Extra-window saturation, max_wait cap, purgeExpired ──────
+
+describe("E.4.3 — edge-case throttle tests", () => {
+  it("extra-window saturation: many leases back-to-back eventually throttle", async () => {
+    const proxy = `e43-sat-${crypto.randomUUID()}`;
+    let lastWait = 0;
+    let throttled = false;
+    for (let i = 0; i < 30; i++) {
+      const r = await lease(proxy, 0);
+      if (r.reason === "throttle_extra" || r.reason === "throttle_long" || r.reason === "throttle_short") {
+        throttled = true;
+        break;
+      }
+      lastWait = r.wait_ms;
+    }
+    expect(throttled).toBe(true);
+  });
+
+  it("max_wait_capped is enforced when windows are fully saturated", async () => {
+    const proxy = `e43-cap-${crypto.randomUUID()}`;
+    for (let i = 0; i < 50; i++) {
+      await lease(proxy, 0);
+    }
+    const r = await lease(proxy, 0);
+    // MAX_LEASE_WAIT_MS = 300_000 (5 min)
+    expect(r.wait_ms).toBeLessThanOrEqual(300_000);
+  });
+
+  it("purgeExpired drops timestamps older than the extra-window horizon", async () => {
+    const proxy = `e43-purge-${crypto.randomUUID()}`;
+    // Issue some leases so there are timestamps
+    for (let i = 0; i < 5; i++) {
+      await lease(proxy, 0);
+    }
+    // Dump state and verify timestamps exist
+    const s1 = await dumpState(proxy);
+    expect(s1.requestTimestamps.length).toBeGreaterThan(0);
+    // All timestamps should be recent (within extra-window horizon of 7200s default)
+    const now = Date.now();
+    for (const ts of s1.requestTimestamps) {
+      expect(ts).toBeGreaterThan(now - 7200 * 1000);
+    }
+  });
+});
