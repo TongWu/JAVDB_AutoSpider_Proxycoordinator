@@ -814,6 +814,11 @@ export interface RegisterRunnerResponse {
    *  Workers without the v4 migration, in which case clients fall back
    *  to env-var defaults. */
   config?: ConfigSnapshot;
+  /** W5.4 — operator-pushed active signals (throttle_global, ban_proxy,
+   *  pause_all, resume). Empty list when no signals are active. Clients
+   *  reconcile against this set on every register / heartbeat; semantics
+   *  are state, not events. Omitted on pre-W5.4 Workers. */
+  active_signals?: Signal[];
   server_time: number;
 }
 
@@ -841,6 +846,8 @@ export interface HeartbeatResponse {
    *  long-running runners pick up operator PATCHes within one heartbeat
    *  interval. Optional for forward-compat (see {@link RegisterRunnerResponse.config}). */
   config?: ConfigSnapshot;
+  /** W5.4 — see {@link RegisterRunnerResponse.active_signals}. */
+  active_signals?: Signal[];
   server_time: number;
 }
 
@@ -861,6 +868,82 @@ export interface ActiveRunnersResponse {
    *  by ops dashboards without keeping idle runners alive). */
   active_runners: RunnerInfo[];
   pool_hash_summary: Array<{ hash: string; count: number }>;
+  server_time: number;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W5.4 — Active degradation / circuit-breaker signals
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Signal kinds the operator can push. Closed set so the Python client
+ * can pattern-match exhaustively; new kinds require coordinated client +
+ * Worker deploys.
+ *
+ * - ``throttle_global`` — multiply every runner's local sleep / throttle
+ *   delays by ``factor`` (>=1.0). Use during cohort-wide cool-down.
+ * - ``ban_proxy`` — operator-pushed ban; runners locally drop the named
+ *   proxy from their pool for ``ttl_ms``. Independent from the per-proxy
+ *   Worker-side ban already in ProxyCoordinator.
+ * - ``pause_all`` — runners stop dispatching new tasks for ``ttl_ms``;
+ *   in-flight requests run to completion.
+ * - ``resume`` — operator override that clears every other active signal
+ *   in one go.
+ */
+export type SignalKind =
+  | "throttle_global"
+  | "ban_proxy"
+  | "pause_all"
+  | "resume";
+
+/**
+ * One operator-pushed signal. Time-bounded via ``expires_at_ms``; the GC
+ * alarm prunes expired entries (and the heartbeat handler filters them
+ * out defensively on the read path). Idempotent on ``id`` so a retry of
+ * ``POST /signal`` doesn't multiply effects.
+ */
+export interface Signal {
+  /** Stable identifier the operator can later cancel. Uppercase
+   *  hex 8-char default; the client may supply a custom string for
+   *  ops correlation. */
+  id: string;
+  kind: SignalKind;
+  /** Wall-clock ms when the signal stops taking effect. ``0`` means
+   *  "permanent until explicitly cancelled" — only allowed on ``resume``
+   *  (which terminates immediately anyway since it acts on the read
+   *  path). All other kinds MUST carry a positive value. */
+  expires_at_ms: number;
+  /** Wall-clock ms when the signal was first pushed. Surfaced to ops for
+   *  age tracking but otherwise unused on the read path. */
+  created_at_ms: number;
+  /** Operator note for ops dashboards. Free-form, capped server-side. */
+  reason?: string;
+  // ── kind-specific payload ─────────────────────────────────────────
+  /** ``throttle_global`` only — multiplier applied to local throttles. */
+  factor?: number;
+  /** ``ban_proxy`` only — name of the proxy to drop. */
+  proxy_id?: string;
+}
+
+/** Body of ``POST /signal``. */
+export interface PostSignalRequest {
+  kind: SignalKind;
+  /** TTL in ms before the signal auto-expires. Required for non-resume kinds. */
+  ttl_ms?: number;
+  /** Operator note (max 200 chars; trimmed server-side). */
+  reason?: string;
+  /** Required for ``throttle_global``; must be >= 1.0. */
+  factor?: number;
+  /** Required for ``ban_proxy``; non-empty. */
+  proxy_id?: string;
+  /** Optional client-supplied ID for ops correlation. If omitted, the
+   *  server generates one. Same ID on retry → idempotent replace. */
+  id?: string;
+}
+
+/** Response of ``POST /signal`` and ``GET /signals``. */
+export interface SignalsResponse {
+  active_signals: Signal[];
   server_time: number;
 }
 

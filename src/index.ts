@@ -118,6 +118,7 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/sweep_orphan_stages",
   "/active_runners",
   "/config",
+  "/signals",
 ]);
 
 /** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
@@ -336,6 +337,13 @@ export default {
         }
         case "/active_runners":
           return await forwardToRunnerRegistryDo(env, "/do/active_runners", "GET", null);
+        // W5.4 — operator-pushed active signals (live in RunnerRegistry DO)
+        case "/signal": {
+          const body = await request.json();
+          return await forwardToRunnerRegistryDo(env, "/do/signal", "POST", body);
+        }
+        case "/signals":
+          return await forwardToRunnerRegistryDo(env, "/do/signals", "GET", null);
         // W5.3 — dynamic config singleton (ConfigState DO)
         case "/config": {
           if (request.method === "PATCH") {

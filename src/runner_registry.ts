@@ -5,11 +5,14 @@ import {
   Env,
   HeartbeatRequest,
   HeartbeatResponse,
+  PostSignalRequest,
   RUNNER_FIELD_MAX_LEN,
   RUNNER_REGISTRY_ALARM_INTERVAL_MS,
   RegisterRunnerRequest,
   RegisterRunnerResponse,
   RunnerInfo,
+  Signal,
+  SignalsResponse,
   UnregisterRunnerRequest,
   UnregisterRunnerResponse,
 } from "./types";
@@ -52,6 +55,16 @@ interface RegistryData {
    * is "who is alive RIGHT NOW", not "who was ever alive".
    */
   runners: Record<string, RunnerInfo>;
+  /**
+   * W5.4 — operator-pushed signals (throttle_global, ban_proxy, pause_all,
+   * resume). Idempotent on ``id``. The same GC alarm that prunes stale
+   * runners also expires signals whose ``expires_at_ms`` is in the past;
+   * the read path defensively filters expired entries too.
+   *
+   * Optional in storage so a registry upgraded from a pre-W5.4 deploy
+   * doesn't crash on first load — treat missing as an empty list.
+   */
+  signals?: Signal[];
 }
 
 const STORAGE_KEY = "state";
@@ -83,6 +96,11 @@ export class RunnerRegistry implements DurableObject {
           return await this.handleUnregister(request);
         case "/do/active_runners":
           return await this.handleActive();
+        // W5.4 — operator signal management
+        case "/do/signal":
+          return await this.handlePostSignal(request);
+        case "/do/signals":
+          return await this.handleListSignals();
         default:
           return new Response("Not Found", { status: 404 });
       }
@@ -114,10 +132,20 @@ export class RunnerRegistry implements DurableObject {
         purged += 1;
       }
     }
-    if (purged > 0) {
+    // W5.4 — also prune expired operator signals on every alarm tick so
+    // long-lived deployments don't accumulate stale signals.
+    const sigBefore = (data.signals ?? []).length;
+    pruneExpiredSignals(data, now);
+    const sigPurged = sigBefore - (data.signals ?? []).length;
+    if (purged > 0 || sigPurged > 0) {
       await this.persistState(data);
     }
-    if (Object.keys(data.runners).length > 0) {
+    // Re-arm when EITHER runners or signals remain — both are
+    // time-bounded state worth GC'ing.
+    if (
+      Object.keys(data.runners).length > 0 ||
+      (data.signals ?? []).length > 0
+    ) {
       await this.scheduleAlarm();
     } else {
       this.alarmScheduled = false;
@@ -177,12 +205,14 @@ export class RunnerRegistry implements DurableObject {
     const activeRunners = snapshotRunners(data.runners);
     const summary = summarizePoolHashes(data.runners);
     const minRunners = loadMovieClaimMinRunners(this.env);
+    pruneExpiredSignals(data, now);
     const response: RegisterRunnerResponse = {
       registered: wasFresh,
       active_runners: activeRunners,
       pool_hash_summary: summary,
       movie_claim_recommended: activeRunners.length >= minRunners,
       movie_claim_min_runners: minRunners,
+      active_signals: data.signals ?? [],
       server_time: now,
     };
     return jsonResponse(response);
@@ -207,11 +237,13 @@ export class RunnerRegistry implements DurableObject {
       // will reconcile on the register response).
       const recommended =
         Object.keys(data.runners).length >= minRunners;
+      pruneExpiredSignals(data, now);
       const response: HeartbeatResponse = {
         alive: false,
         movie_claim_recommended: recommended,
         movie_claim_min_runners: minRunners,
         active_runners_count: Object.keys(data.runners).length,
+        active_signals: data.signals ?? [],
         server_time: now,
       };
       return jsonResponse(response);
@@ -228,11 +260,13 @@ export class RunnerRegistry implements DurableObject {
     // loop feeds into `_apply_movie_claim_recommendation` on every tick.
     const activeRunners = snapshotRunners(data.runners);
     const recommended = activeRunners.length >= minRunners;
+    pruneExpiredSignals(data, now);
     const response: HeartbeatResponse = {
       alive: true,
       movie_claim_recommended: recommended,
       movie_claim_min_runners: minRunners,
       active_runners_count: activeRunners.length,
+      active_signals: data.signals ?? [],
       server_time: now,
     };
     return jsonResponse(response);
@@ -271,6 +305,77 @@ export class RunnerRegistry implements DurableObject {
     const response: ActiveRunnersResponse = {
       active_runners: snapshotRunners(data.runners),
       pool_hash_summary: summarizePoolHashes(data.runners),
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // W5.4 — operator signal management
+  // ─────────────────────────────────────────────────────────────────────────
+
+  private async handlePostSignal(request: Request): Promise<Response> {
+    let body: PostSignalRequest;
+    try {
+      body = (await request.json()) as PostSignalRequest;
+    } catch {
+      return jsonResponse({ error: "invalid_json" }, 400);
+    }
+
+    const validation = validatePostSignal(body);
+    if (validation.error !== undefined || validation.signal === undefined) {
+      return jsonResponse(
+        { error: validation.error ?? "invalid_signal" },
+        400,
+      );
+    }
+    const validated: Signal = validation.signal;
+
+    const now = Date.now();
+    const data = await this.loadState();
+    pruneExpiredSignals(data, now);
+
+    if (validated.kind === "resume") {
+      // ``resume`` is operator-override: drop every other active signal
+      // in one go. The signal itself is not stored — its effect is the
+      // clear-all. Heartbeat readers see an empty list right after.
+      if (data.signals !== undefined && data.signals.length > 0) {
+        data.signals = [];
+        await this.persistState(data);
+      }
+      const response: SignalsResponse = {
+        active_signals: [],
+        server_time: now,
+      };
+      return jsonResponse(response);
+    }
+
+    // Idempotent replace on id (operator retry after a transient failure
+    // must not multiply effects).
+    const existing = data.signals ?? [];
+    const without = existing.filter((s) => s.id !== validated.id);
+    without.push(validated);
+    data.signals = without;
+    await this.persistState(data);
+    await this.scheduleAlarm();
+
+    const response: SignalsResponse = {
+      active_signals: data.signals,
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  private async handleListSignals(): Promise<Response> {
+    const now = Date.now();
+    const data = await this.loadState();
+    const before = (data.signals ?? []).length;
+    pruneExpiredSignals(data, now);
+    if ((data.signals ?? []).length < before) {
+      await this.persistState(data);
+    }
+    const response: SignalsResponse = {
+      active_signals: data.signals ?? [],
       server_time: now,
     };
     return jsonResponse(response);
@@ -397,4 +502,123 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5.4 — signal helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SIGNAL_REASON_MAX_LEN = 200;
+const SIGNAL_PROXY_ID_MAX_LEN = 256;
+const SIGNAL_MIN_FACTOR = 1.0;
+const SIGNAL_MAX_FACTOR = 100.0;
+const SIGNAL_MIN_TTL_MS = 1_000;
+const SIGNAL_MAX_TTL_MS = 24 * 60 * 60 * 1000; // 24 h ceiling
+
+interface SignalValidation {
+  signal?: Signal;
+  error?: string;
+}
+
+/** Validate a ``POST /signal`` body and return a fully-formed
+ *  {@link Signal} ready to persist, or an error string. Pure function so
+ *  unit tests can exercise the rules without DO state. */
+function validatePostSignal(body: PostSignalRequest): SignalValidation {
+  if (body === null || typeof body !== "object") {
+    return { error: "missing body" };
+  }
+  const kind = body.kind;
+  if (
+    kind !== "throttle_global" &&
+    kind !== "ban_proxy" &&
+    kind !== "pause_all" &&
+    kind !== "resume"
+  ) {
+    return { error: "unknown signal kind" };
+  }
+
+  // ``resume`` short-circuits — it's a clear-all command, no payload to
+  // validate beyond the kind itself.
+  const now = Date.now();
+  if (kind === "resume") {
+    return {
+      signal: {
+        id: typeof body.id === "string" && body.id ? body.id : generateSignalId(),
+        kind: "resume",
+        // ``expires_at_ms = 0`` flags "no time bound" for resume; the
+        // signal is consumed immediately by handlePostSignal.
+        expires_at_ms: 0,
+        created_at_ms: now,
+        reason: clipReason(body.reason),
+      },
+    };
+  }
+
+  // Non-resume kinds require a positive TTL.
+  const ttlMs = Number(body.ttl_ms);
+  if (!Number.isFinite(ttlMs) || ttlMs < SIGNAL_MIN_TTL_MS) {
+    return { error: `ttl_ms must be >= ${SIGNAL_MIN_TTL_MS}` };
+  }
+  const clampedTtl = Math.min(ttlMs, SIGNAL_MAX_TTL_MS);
+
+  const signal: Signal = {
+    id: typeof body.id === "string" && body.id ? body.id : generateSignalId(),
+    kind,
+    expires_at_ms: now + clampedTtl,
+    created_at_ms: now,
+    reason: clipReason(body.reason),
+  };
+
+  if (kind === "throttle_global") {
+    const factor = Number(body.factor);
+    if (
+      !Number.isFinite(factor) ||
+      factor < SIGNAL_MIN_FACTOR ||
+      factor > SIGNAL_MAX_FACTOR
+    ) {
+      return {
+        error: `factor must be in [${SIGNAL_MIN_FACTOR}, ${SIGNAL_MAX_FACTOR}]`,
+      };
+    }
+    signal.factor = factor;
+  } else if (kind === "ban_proxy") {
+    const proxyId = typeof body.proxy_id === "string" ? body.proxy_id.trim() : "";
+    if (!proxyId) {
+      return { error: "proxy_id required for ban_proxy" };
+    }
+    if (proxyId.length > SIGNAL_PROXY_ID_MAX_LEN) {
+      return { error: "proxy_id too long" };
+    }
+    signal.proxy_id = proxyId;
+  }
+  // ``pause_all`` needs no kind-specific payload.
+
+  return { signal };
+}
+
+/** Drop signals whose ``expires_at_ms`` is in the past (treating 0 as
+ *  "never expires" since only the operator-resume path uses it, and
+ *  resume signals never enter storage). */
+function pruneExpiredSignals(data: RegistryData, now: number): void {
+  if (data.signals === undefined || data.signals.length === 0) return;
+  data.signals = data.signals.filter(
+    (s) => s.expires_at_ms === 0 || s.expires_at_ms > now,
+  );
+}
+
+function clipReason(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const s = String(raw).trim();
+  if (s === "") return undefined;
+  return s.length > SIGNAL_REASON_MAX_LEN
+    ? s.slice(0, SIGNAL_REASON_MAX_LEN)
+    : s;
+}
+
+/** Generate an 8-hex-char signal id. Operators can also supply their own
+ *  via ``POST /signal { id }`` for ops correlation. */
+function generateSignalId(): string {
+  // Workers runtime ships ``crypto.randomUUID()``; use the first 8
+  // hex chars after stripping dashes for compactness.
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 }
