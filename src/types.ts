@@ -51,6 +51,12 @@ export interface Env {
   /** Number of href-based sub-shards within each per-day MovieClaim shard.
    *  Defaults to 4; set to "1" to disable sub-sharding (e.g. in tests). */
   NUM_CLAIM_SHARDS?: string;
+  /** W5.6 — maximum authorised requests per minute per Bearer token.
+   *  Defaults to "1000". Set to "0" or any non-positive value to disable
+   *  the rate limit (e.g. in tests). Best-effort: state lives in the
+   *  Worker isolate and resets on cold start, but burst abuse from a
+   *  single token within a single isolate is still blocked. */
+  WORKER_RATE_LIMIT_PER_MIN?: string;
 }
 
 /** Default ban duration when the client doesn't pass `ttl_ms`. 3 days = 259_200_000 ms. */

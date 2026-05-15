@@ -6,6 +6,106 @@ export { MovieClaimState } from "./movie_claim_state";
 export { RunnerRegistry } from "./runner_registry";
 
 /**
+ * W5.6 — Worker-level token-bucket rate limit.
+ *
+ * Best-effort defence against burst abuse from a single auth token within
+ * one Worker isolate. Limits to `WORKER_RATE_LIMIT_PER_MIN` (default 1000)
+ * requests per minute per token. Tokens refill linearly over the window;
+ * a depleted bucket returns HTTP 429.
+ *
+ * Trade-offs:
+ *
+ * * Isolate-local: every Worker isolate runs an independent bucket. A
+ *   single token spread across many isolates can still exceed the limit
+ *   globally — but the Worker invocation model is sticky enough that a
+ *   given runner usually pins to one isolate for the lifetime of its
+ *   keep-alive HTTP connection.
+ * * Cold-start reset: buckets do not persist. Acceptable for abuse
+ *   protection (the operator can deploy a new wheel to reset) but not
+ *   for SLO enforcement.
+ *
+ * Disable by setting `WORKER_RATE_LIMIT_PER_MIN=0` in `wrangler.toml`
+ * `[vars]` (also the convention used by tests).
+ */
+const DEFAULT_RATE_LIMIT_PER_MIN = 1000;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+interface BucketState {
+  /** Tokens currently available in this bucket. */
+  tokens: number;
+  /** Wall-clock ms of the last token refill. */
+  lastRefillMs: number;
+}
+
+/**
+ * Module-scope (per-isolate) bucket store keyed by Bearer token. Workers do
+ * not share JS state across isolates, so this is intentionally lightweight
+ * — no eviction logic; the map grows by token count which is bounded by
+ * the operator's deploy.
+ */
+const rateLimitBuckets = new Map<string, BucketState>();
+
+/**
+ * Decide whether *token* may make another request right now. Refills the
+ * bucket linearly: a bucket sized at `capacity` per `RATE_LIMIT_WINDOW_MS`
+ * gains `capacity / windowMs` tokens per millisecond elapsed since the
+ * previous decision.
+ */
+function rateLimitAllow(token: string, capacity: number, nowMs: number): boolean {
+  if (capacity <= 0) return true; // disabled
+  let bucket = rateLimitBuckets.get(token);
+  if (bucket === undefined) {
+    bucket = { tokens: capacity, lastRefillMs: nowMs };
+    rateLimitBuckets.set(token, bucket);
+  } else {
+    const elapsed = Math.max(0, nowMs - bucket.lastRefillMs);
+    if (elapsed > 0) {
+      const refill = (elapsed * capacity) / RATE_LIMIT_WINDOW_MS;
+      bucket.tokens = Math.min(capacity, bucket.tokens + refill);
+      bucket.lastRefillMs = nowMs;
+    }
+  }
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1;
+    return true;
+  }
+  return false;
+}
+
+/** Test-only — reset the per-isolate bucket store. */
+export function _resetRateLimitBucketsForTesting(): void {
+  rateLimitBuckets.clear();
+}
+
+/** Test-only — expose the pure rate-limit decision with controllable nowMs. */
+export function _rateLimitAllowForTesting(
+  token: string,
+  capacity: number,
+  nowMs: number,
+): boolean {
+  return rateLimitAllow(token, capacity, nowMs);
+}
+
+/** Test-only — forcibly seed a bucket state (e.g. drained, just-refilled). */
+export function _seedRateLimitBucketForTesting(
+  token: string,
+  tokens: number,
+  lastRefillMs: number,
+): void {
+  rateLimitBuckets.set(token, { tokens, lastRefillMs });
+}
+
+function resolveRateLimitCapacity(env: Env): number {
+  const raw = env.WORKER_RATE_LIMIT_PER_MIN;
+  if (raw === undefined || raw === null || raw === "") {
+    return DEFAULT_RATE_LIMIT_PER_MIN;
+  }
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return DEFAULT_RATE_LIMIT_PER_MIN;
+  return n > 0 ? n : 0;
+}
+
+/**
  * Endpoints that accept GET (every other request must be POST).  Kept as a
  * `Set` so adding new read-only routes is a one-line edit instead of touching
  * the conditional in two places.
@@ -79,6 +179,16 @@ export default {
 
     if (!checkAuth(request, env)) {
       return jsonResponse({ error: "unauthorized" }, 401);
+    }
+
+    // W5.6 — token-bucket rate limit, keyed by Bearer token. Runs AFTER
+    // checkAuth so unauthenticated probes can't poison legitimate tokens'
+    // buckets, and BEFORE the route switch so a depleted bucket short-
+    // circuits even cheap routes.
+    const bearerToken = extractBearerToken(request);
+    const capacity = resolveRateLimitCapacity(env);
+    if (bearerToken && !rateLimitAllow(bearerToken, capacity, Date.now())) {
+      return jsonResponse({ error: "rate_limited" }, 429);
     }
 
     if (request.method !== "POST" && !GET_ALLOWED_PATHS.has(url.pathname)) {
@@ -244,6 +354,17 @@ function checkAuth(request: Request, env: Env): boolean {
   if (!header.toLowerCase().startsWith("bearer ")) return false;
   const provided = header.slice("bearer ".length).trim();
   return constantTimeEqual(provided, token);
+}
+
+/**
+ * Return the raw Bearer token from the request, or the empty string if
+ * the header is absent / malformed. Used by W5.6 rate limiting to key
+ * buckets by token without coupling to `checkAuth`'s validation logic.
+ */
+function extractBearerToken(request: Request): string {
+  const header = request.headers.get("authorization") ?? "";
+  if (!header.toLowerCase().startsWith("bearer ")) return "";
+  return header.slice("bearer ".length).trim();
 }
 
 function constantTimeEqual(a: string, b: string): boolean {

@@ -139,6 +139,14 @@ MOVIE_CLAIM_MIN_RUNNERS = "2"
 LOGIN_COOLDOWN_THRESHOLD = "5"
 LOGIN_COOLDOWN_WINDOW_SEC = "3600"
 LOGIN_COOLDOWN_DURATION_MS = "1800000"
+# W5.6 — Worker-level token-bucket rate limit. Caps authorised requests
+# per minute per Bearer token to guard against burst abuse from a single
+# runner. State is per-Worker-isolate and resets on cold start; not a
+# strict SLO but enough to catch runaway clients. Default 1000/min ≈
+# 16.7 req/s, well above the spider's typical sustained rate (one
+# detail-page lease every 10 s × 5 workers = 0.5 req/s).
+# Set to "0" to disable (e.g. in load tests).
+WORKER_RATE_LIMIT_PER_MIN = "1000"
 
 # Secrets (set via `wrangler secret put`):
 #   PROXY_COORDINATOR_TOKEN — bearer token required on every /lease, /report
