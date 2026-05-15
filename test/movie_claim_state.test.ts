@@ -1098,6 +1098,44 @@ describe("Phase-1 — legacy `completed` field migration", () => {
   });
 });
 
+describe("D.3 — completed_committed Record migration", () => {
+  it("loadState() migrates a Phase-1 string[] completed_committed into Record<string, true>", async () => {
+    const SHARD = "2026-11-15";
+    if (!env.MOVIE_CLAIM_DO) throw new Error("MOVIE_CLAIM_DO binding missing");
+    const id = env.MOVIE_CLAIM_DO.idFromName(SHARD);
+    const stub = env.MOVIE_CLAIM_DO.get(id);
+
+    // Seed a Phase-1 snapshot where completed_committed was a string[].
+    await runInDurableObject(stub, async (instance, doState) => {
+      await doState.storage.put("state", {
+        claims: {},
+        completed_committed: ["/v/d3-href-1", "/v/d3-href-2"],
+      });
+      (instance as unknown as { cached: unknown }).cached = null;
+    });
+
+    // D.3 migration converts the array to a Record — both hrefs must be seen as committed.
+    const r1 = await claim("/v/d3-href-1", "holder-1", 60_000, SHARD);
+    expect(r1.acquired).toBe(false);
+    expect(r1.already_completed).toBe(true);
+
+    const r2 = await claim("/v/d3-href-2", "holder-1", 60_000, SHARD);
+    expect(r2.acquired).toBe(false);
+    expect(r2.already_completed).toBe(true);
+  });
+
+  it("a fresh shard uses an empty Record (not an array)", async () => {
+    const SHARD = "2026-11-16";
+    await claim("/v/d3-fresh", "holder-1", 60_000, SHARD);
+    await complete("/v/d3-fresh", "holder-1", SHARD);
+
+    // Verify that a subsequent commit attempt still observes already_completed.
+    const r = await claim("/v/d3-fresh", "holder-2", 60_000, SHARD);
+    expect(r.acquired).toBe(false);
+    expect(r.already_completed).toBe(true);
+  });
+});
+
 describe("P2-A — alarm GC of stale failure records", () => {
   it("alarm() prunes failure entries older than MOVIE_CLAIM_FAILURE_TTL_MS", async () => {
     // Use a unique date so other tests' state doesn't leak in.

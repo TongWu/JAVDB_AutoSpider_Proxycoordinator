@@ -102,14 +102,13 @@ interface MovieClaimData {
   claims: Record<string, MovieClaim>;
   /**
    * Hrefs that have already finished this shard *and* whose owning
-   * session is committed.  Stored as a plain array (not a Set) to
-   * round-trip cleanly through DO storage; we de-dupe via
-   * {@link Array.includes} at the few mutation points so repeated
-   * completes are idempotent.  Phase-1 renamed this field from
-   * ``completed`` — :func:`loadState` migrates the legacy field on
-   * read so deployed shards stay readable.
+   * session is committed.  Stored as a plain object (``Record<href,
+   * true>``) for O(1) membership tests.  D.3 renamed the field's
+   * runtime shape from ``string[]``; :func:`loadState` migrates both
+   * the legacy ``completed`` field (pre-Phase-1) and the old
+   * ``string[]`` form (Phase-1 pre-D.3) on first read.
    */
-  completed_committed: string[];
+  completed_committed: Record<string, true>;
   /** Phase-1 — staged completions waiting on a commit / rollback decision.
    *  Keyed by href; the value tracks the owning session_id and the wall-
    *  clock timestamp.  ``undefined`` (legacy) when this shard predates
@@ -249,7 +248,7 @@ export class MovieClaimState implements DurableObject {
 
     // Already committed inside this shard → never re-claim, surface to caller
     // so they can short-circuit + mark their local history.
-    if (data.completed_committed.includes(href)) {
+    if (href in data.completed_committed) {
       const response: ClaimMovieResponse = {
         acquired: false,
         current_holder_id: "",
@@ -380,11 +379,11 @@ export class MovieClaimState implements DurableObject {
     const existing = data.claims[href];
     // If already completed, treat as success (idempotent) so a retried
     // ``complete_movie`` from a network blip never raises an error.
-    if (data.completed_committed.includes(href)) {
+    if (href in data.completed_committed) {
       completed = true;
     } else if (existing && existing.holder_id === holderId) {
       delete data.claims[href];
-      data.completed_committed.push(href);
+      data.completed_committed[href] = true;
       // P2-A — a successful complete wipes the failure / cooldown
       // record so the next re-ingestion (different shard date, or a
       // forced retry) starts from a clean slate.
@@ -447,7 +446,7 @@ export class MovieClaimState implements DurableObject {
 
     // If already committed, treat as success (idempotent).  No staged
     // entry is needed because the work is permanently durable.
-    if (data.completed_committed.includes(href)) {
+    if (href in data.completed_committed) {
       const response: StageCompleteMovieResponse = {
         staged: true,
         href,
@@ -552,12 +551,10 @@ export class MovieClaimState implements DurableObject {
       for (const href of Object.keys(data.staged_complete)) {
         if (data.staged_complete[href].session_id !== sessionId) continue;
         delete data.staged_complete[href];
-        // Idempotent against ``completed_committed[]`` — a peer caller
+        // Idempotent against ``completed_committed`` — a peer caller
         // could have called legacy ``complete_movie`` for the same href
-        // already; drop the duplicate so the array stays a set in spirit.
-        if (!data.completed_committed.includes(href)) {
-          data.completed_committed.push(href);
-        }
+        // already; the Record shape makes this a no-op set write.
+        data.completed_committed[href] = true;
         promoted += 1;
       }
       if (promoted > 0) {
@@ -742,7 +739,7 @@ export class MovieClaimState implements DurableObject {
     const response: MovieStatusResponse = {
       current_holder_id: existing?.holder_id ?? null,
       expires_at: existing?.expires_at ?? 0,
-      already_completed: data.completed_committed.includes(href),
+      already_completed: href in data.completed_committed,
       cooldown_until: failure?.next_attempt_at ?? 0,
       last_error_kind: failure?.last_error_kind ?? "",
       fail_count: failure?.fail_count ?? 0,
@@ -769,12 +766,20 @@ export class MovieClaimState implements DurableObject {
       >(STORAGE_KEY)) ?? null;
     const data: MovieClaimData = {
       claims: stored?.claims ?? {},
-      // Phase-1 migration: prefer ``completed_committed`` when present;
-      // fall back to legacy ``completed`` so an in-flight shard from a
-      // pre-Phase-1 deploy keeps observing already_completed=true on its
-      // historical commits.  ``[]`` for a brand-new shard.
-      completed_committed:
-        stored?.completed_committed ?? stored?.completed ?? [],
+      // Three-tier migration for completed_committed:
+      //   D.3+ shape  : Record<string, true>  → use as-is
+      //   Phase-1 shape: string[]             → Object.fromEntries
+      //   Pre-Phase-1  : stored?.completed[]  → Object.fromEntries
+      completed_committed: (() => {
+        const cc = stored?.completed_committed as unknown;
+        if (Array.isArray(cc))
+          return Object.fromEntries((cc as string[]).map((h) => [h, true as true]));
+        if (cc && typeof cc === "object") return cc as Record<string, true>;
+        const leg = stored?.completed;
+        if (Array.isArray(leg))
+          return Object.fromEntries(leg.map((h) => [h, true as true]));
+        return {} as Record<string, true>;
+      })(),
       staged_complete: stored?.staged_complete ?? {},
       failures: stored?.failures ?? {},
     };
