@@ -48,6 +48,9 @@ export interface Env {
    *  crossed.  Defaults to 30 min so a flapping login pool gets a clear
    *  back-off without blocking the day's ingestion. */
   LOGIN_COOLDOWN_DURATION_MS?: string;
+  /** Number of href-based sub-shards within each per-day MovieClaim shard.
+   *  Defaults to 4; set to "1" to disable sub-sharding (e.g. in tests). */
+  NUM_CLAIM_SHARDS?: string;
 }
 
 /** Default ban duration when the client doesn't pass `ttl_ms`. 3 days = 259_200_000 ms. */
@@ -814,6 +817,9 @@ export interface HeartbeatResponse {
   movie_claim_recommended?: boolean;
   /** Mirror of {@link RegisterRunnerResponse.movie_claim_min_runners}. */
   movie_claim_min_runners?: number;
+  /** Number of active runners after this heartbeat (post-prune snapshot).
+   *  Clients use this to scale local throttle windows in degraded mode. */
+  active_runners_count?: number;
   server_time: number;
 }
 

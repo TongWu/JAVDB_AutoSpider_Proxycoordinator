@@ -211,6 +211,7 @@ export class RunnerRegistry implements DurableObject {
         alive: false,
         movie_claim_recommended: recommended,
         movie_claim_min_runners: minRunners,
+        active_runners_count: Object.keys(data.runners).length,
         server_time: now,
       };
       return jsonResponse(response);
@@ -231,6 +232,7 @@ export class RunnerRegistry implements DurableObject {
       alive: true,
       movie_claim_recommended: recommended,
       movie_claim_min_runners: minRunners,
+      active_runners_count: activeRunners.length,
       server_time: now,
     };
     return jsonResponse(response);
@@ -261,9 +263,11 @@ export class RunnerRegistry implements DurableObject {
   private async handleActive(): Promise<Response> {
     const now = Date.now();
     const data = await this.loadState();
+    const countBefore = Object.keys(data.runners).length;
     pruneStale(data, this.env, now);
-    // Only persist if the prune actually evicted anyone, to avoid
-    // touching SQLite on every read.
+    if (Object.keys(data.runners).length < countBefore) {
+      await this.persistState(data);
+    }
     const response: ActiveRunnersResponse = {
       active_runners: snapshotRunners(data.runners),
       pool_hash_summary: summarizePoolHashes(data.runners),

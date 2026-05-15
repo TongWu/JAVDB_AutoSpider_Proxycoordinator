@@ -142,77 +142,55 @@ export default {
             env, "/do/login_state/record_attempt", "POST", body,
           );
         }
-        // ── P1-B: per-day movie claim shard ────────────────────────────
+        // ── P1-B: per-day movie claim shard (W2.2: sub-sharded by href) ─
         case "/claim_movie": {
           const body = (await request.json()) as { href?: string; date?: string };
-          const shard = resolveClaimShard(body?.date);
+          const shard = resolveClaimShardForHref(env, body?.date, String(body?.href ?? ""));
           return await forwardToMovieClaimDo(env, shard, "/do/claim_movie", "POST", body);
         }
         case "/release_movie": {
-          const body = (await request.json()) as { date?: string };
-          const shard = resolveClaimShard(body?.date);
+          const body = (await request.json()) as { href?: string; date?: string };
+          const shard = resolveClaimShardForHref(env, body?.date, String(body?.href ?? ""));
           return await forwardToMovieClaimDo(env, shard, "/do/release_movie", "POST", body);
         }
         case "/complete_movie": {
-          const body = (await request.json()) as { date?: string };
-          const shard = resolveClaimShard(body?.date);
+          const body = (await request.json()) as { href?: string; date?: string };
+          const shard = resolveClaimShardForHref(env, body?.date, String(body?.href ?? ""));
           return await forwardToMovieClaimDo(env, shard, "/do/complete_movie", "POST", body);
         }
         case "/stage_complete_movie": {
-          // Phase-1 — staged completion awaiting the session-end CLI's
-          // commit / rollback decision.  Same shard routing as the rest
-          // of the claim cluster so a stage written under shard X is
-          // observed by claims/commits/rollbacks targeting shard X.
-          const body = (await request.json()) as { date?: string };
-          const shard = resolveClaimShard(body?.date);
+          const body = (await request.json()) as { href?: string; date?: string };
+          const shard = resolveClaimShardForHref(env, body?.date, String(body?.href ?? ""));
           return await forwardToMovieClaimDo(
             env, shard, "/do/stage_complete_movie", "POST", body,
           );
         }
         case "/commit_completed_movies": {
-          // Phase-1 — invoked by ``apps.cli.commit_session`` after the
-          // pipeline marks the ReportSessions row committed.  Promotes
-          // every staged entry for ``session_id`` into completed_committed.
           const body = (await request.json()) as { date?: string };
-          const shard = resolveClaimShard(body?.date);
-          return await forwardToMovieClaimDo(
-            env, shard, "/do/commit_completed_movies", "POST", body,
+          return await fanOutToAllClaimShards(
+            env, body?.date, "/do/commit_completed_movies", "POST", body,
           );
         }
         case "/rollback_staged_movies": {
-          // Phase-1 — invoked by ``apps.cli.rollback`` for every session
-          // it rolls back.  Erases the runner's staged footprint so an
-          // adhoc retry of the same href is not blocked by the prior
-          // run's stage.  Failures are non-fatal on the caller side.
           const body = (await request.json()) as { date?: string };
-          const shard = resolveClaimShard(body?.date);
-          return await forwardToMovieClaimDo(
-            env, shard, "/do/rollback_staged_movies", "POST", body,
+          return await fanOutToAllClaimShards(
+            env, body?.date, "/do/rollback_staged_movies", "POST", body,
           );
         }
         case "/sweep_orphan_stages": {
-          // Phase-1 — defence-in-depth cron route.  Both ``older_than_ms``
-          // and ``date`` are forwarded as query strings so the DO can
-          // enforce its own server-side bounds (no need for a body).
           const date = url.searchParams.get("date");
-          const shard = resolveClaimShard(date);
-          const upstreamUrl = `/do/sweep_orphan_stages?${url.searchParams.toString()}`;
-          return await forwardToMovieClaimDo(env, shard, upstreamUrl, "GET", null);
+          const upstreamPath = `/do/sweep_orphan_stages?${url.searchParams.toString()}`;
+          return await fanOutToAllClaimShards(env, date, upstreamPath, "GET", null);
         }
         case "/report_failure": {
-          // P2-A — failure / cooldown / dead-letter.  Same per-day shard
-          // routing as the rest of the MovieClaim cluster so a failure is
-          // observed by every claim attempt within the same shard.
-          const body = (await request.json()) as { date?: string };
-          const shard = resolveClaimShard(body?.date);
+          const body = (await request.json()) as { href?: string; date?: string };
+          const shard = resolveClaimShardForHref(env, body?.date, String(body?.href ?? ""));
           return await forwardToMovieClaimDo(env, shard, "/do/report_failure", "POST", body);
         }
         case "/movie_status": {
-          // Dual-purpose endpoint: callers may pass `date` either as a query
-          // arg (preferred) or rely on the server's "today" default.  href is
-          // forwarded via the same query string so the DO can deserialise.
           const date = url.searchParams.get("date");
-          const shard = resolveClaimShard(date);
+          const href = url.searchParams.get("href") ?? "";
+          const shard = resolveClaimShardForHref(env, date, href);
           const upstreamUrl = `/do/movie_status?${url.searchParams.toString()}`;
           return await forwardToMovieClaimDo(env, shard, upstreamUrl, "GET", null);
         }
@@ -269,9 +247,9 @@ function checkAuth(request: Request, env: Env): boolean {
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
+  const maxLen = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < maxLen; i++) {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
@@ -449,6 +427,72 @@ function resolveClaimShard(rawDate?: string | null): string {
       ? rawDate.trim()
       : currentSingaporeDate();
   return cleaned;
+}
+
+const DEFAULT_NUM_CLAIM_SHARDS = 4;
+
+function getNumClaimShards(env: Env): number {
+  const n = parseInt(env.NUM_CLAIM_SHARDS || "", 10);
+  return Number.isFinite(n) && n >= 1 ? n : DEFAULT_NUM_CLAIM_SHARDS;
+}
+
+function hrefShardIndex(href: string, numShards: number): number {
+  let h = 0;
+  for (let i = 0; i < href.length; i++) {
+    h = ((h << 5) - h + href.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h) % numShards;
+}
+
+function resolveClaimShardForHref(
+  env: Env,
+  rawDate: string | undefined | null,
+  href: string,
+): string {
+  const n = getNumClaimShards(env);
+  if (n <= 1) return resolveClaimShard(rawDate);
+  return `${resolveClaimShard(rawDate)}-${hrefShardIndex(href, n)}`;
+}
+
+async function fanOutToAllClaimShards(
+  env: Env,
+  rawDate: string | undefined | null,
+  path: string,
+  method: "GET" | "POST",
+  body: unknown,
+): Promise<Response> {
+  const n = getNumClaimShards(env);
+  const baseShard = resolveClaimShard(rawDate);
+  const shardIds =
+    n <= 1
+      ? [baseShard]
+      : [baseShard, ...Array.from({ length: n }, (_, i) => `${baseShard}-${i}`)];
+  const responses = await Promise.all(
+    shardIds.map((id) =>
+      forwardToMovieClaimDo(env, id, path, method, body),
+    ),
+  );
+  for (const r of responses) {
+    if (r.status >= 400) return r;
+  }
+  const dataArr = await Promise.all(
+    responses.map((r) => r.json() as Promise<Record<string, unknown>>),
+  );
+  const merged: Record<string, unknown> = {};
+  let maxServerTime = 0;
+  for (const data of dataArr) {
+    for (const [key, val] of Object.entries(data)) {
+      if (key === "server_time") {
+        maxServerTime = Math.max(maxServerTime, Number(val) || 0);
+      } else if (typeof val === "number") {
+        merged[key] = ((merged[key] as number) || 0) + val;
+      } else if (!(key in merged)) {
+        merged[key] = val;
+      }
+    }
+  }
+  merged.server_time = maxServerTime;
+  return jsonResponse(merged);
 }
 
 function currentSingaporeDate(): string {

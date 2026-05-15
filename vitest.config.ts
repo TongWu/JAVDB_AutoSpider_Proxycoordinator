@@ -8,6 +8,7 @@ export default defineWorkersConfig({
         miniflare: {
           bindings: {
             PROXY_COORDINATOR_TOKEN: "test-token",
+            NUM_CLAIM_SHARDS: "1",
           },
         },
       },

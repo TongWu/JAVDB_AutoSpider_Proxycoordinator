@@ -184,21 +184,22 @@ export class MovieClaimState implements DurableObject {
    * waiting for the next request.
    */
   async alarm(): Promise<void> {
+    this.alarmScheduled = false;
     const data = await this.loadState();
     const now = Date.now();
     let purged = 0;
+    const BATCH_LIMIT = 500;
+    let limitHit = false;
     for (const href of Object.keys(data.claims)) {
+      if (purged >= BATCH_LIMIT) { limitHit = true; break; }
       if (data.claims[href].expires_at <= now) {
         delete data.claims[href];
         purged += 1;
       }
     }
-    // P2-A — also age out failure records whose last failure is older
-    // than `MOVIE_CLAIM_FAILURE_TTL_MS`.  This is cheap (handful of
-    // entries per shard) and keeps the shard's footprint bounded even
-    // if a workflow run lasts > 24h (e.g. a stuck cron).
-    if (data.failures) {
+    if (!limitHit && data.failures) {
       for (const href of Object.keys(data.failures)) {
+        if (purged >= BATCH_LIMIT) { limitHit = true; break; }
         if (data.failures[href].last_failure_at <= now - MOVIE_CLAIM_FAILURE_TTL_MS) {
           delete data.failures[href];
           purged += 1;
@@ -208,22 +209,17 @@ export class MovieClaimState implements DurableObject {
     if (purged > 0) {
       await this.persistState(data);
     }
-    // Re-arm only when the shard still has live state to track; an idle
-    // shard stops costing alarm invocations until the next claim arrives.
-    // Phase-1: ``staged_complete`` is treated as live state — an alarm
-    // is the safety net that catches a stage written without its
-    // matching commit / rollback (e.g. coordinator-side outage during
-    // session shutdown).  We don't auto-prune stages here (the cron
-    // route is the policy choice) but keeping the alarm armed lets a
-    // future operator-driven sweep find the shard.
+    if (limitHit) {
+      await this.state.storage.setAlarm(now + 60_000);
+      this.alarmScheduled = true;
+      return;
+    }
     const hasLiveState =
       Object.keys(data.claims).length > 0 ||
       (data.failures !== undefined && Object.keys(data.failures).length > 0) ||
       (data.staged_complete !== undefined && Object.keys(data.staged_complete).length > 0);
     if (hasLiveState) {
       await this.scheduleAlarm();
-    } else {
-      this.alarmScheduled = false;
     }
   }
 
@@ -466,8 +462,10 @@ export class MovieClaimState implements DurableObject {
       // sibling runner's stage timestamp; tying re-stages back to the
       // claim holder closes that gap. If there's no active claim
       // anymore (claim TTL elapsed) we still accept — the prior stage
-      // already represents committed-intent work, refreshing ``ts``
-      // is the correct behaviour for the orphan-sweep heartbeat.
+      // already represents committed-intent work.  However, ``ts`` is
+      // only refreshed when the caller still holds an active claim;
+      // without one the original ``ts`` is preserved so orphan-sweep
+      // can eventually catch truly abandoned stages (W2.7).
       if (existing && existing.holder_id !== holderId) {
         const response: StageCompleteMovieResponse = {
           staged: false,
@@ -479,7 +477,7 @@ export class MovieClaimState implements DurableObject {
       }
       data.staged_complete[href] = {
         session_id: sessionId,
-        ts: now,
+        ts: existing ? now : priorStage.ts,
       };
       // Drop the active claim if this caller still owns it — symmetric
       // with handleComplete; lets peer sessions race the (unblocked)
