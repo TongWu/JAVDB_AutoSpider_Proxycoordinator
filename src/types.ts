@@ -9,6 +9,11 @@ export interface Env {
    *  Same `undefined`-allowed contract as `MOVIE_CLAIM_DO`: callers fall
    *  open to "registry not configured" without breaking the runner. */
   RUNNER_REGISTRY_DO?: DurableObjectNamespace;
+  /** W5.3 — singleton config DO (see `src/config_state.ts`). Holds a
+   *  versioned snapshot of operator-tunable values that runners pull on
+   *  each heartbeat. `undefined` allowed so an older Worker without the
+   *  v4 migration still serves config-less responses. */
+  CONFIG_STATE_DO?: DurableObjectNamespace;
   LEASE_ANALYTICS?: AnalyticsEngineDataset;
   PROXY_COORDINATOR_TOKEN: string;
   SHORT_WINDOW_SEC?: string;
@@ -803,6 +808,12 @@ export interface RegisterRunnerResponse {
    *  Python side).  Sourced from {@link Env.MOVIE_CLAIM_MIN_RUNNERS},
    *  defaulting to {@link DEFAULT_MOVIE_CLAIM_MIN_RUNNERS}. */
   movie_claim_min_runners?: number;
+  /** W5.3 — dynamic config snapshot embedded on every register response
+   *  so a freshly-joined runner sees the current config without making
+   *  a second round-trip. Optional for forward-compat: omitted by older
+   *  Workers without the v4 migration, in which case clients fall back
+   *  to env-var defaults. */
+  config?: ConfigSnapshot;
   server_time: number;
 }
 
@@ -826,6 +837,10 @@ export interface HeartbeatResponse {
   /** Number of active runners after this heartbeat (post-prune snapshot).
    *  Clients use this to scale local throttle windows in degraded mode. */
   active_runners_count?: number;
+  /** W5.3 — dynamic config snapshot embedded on every heartbeat so
+   *  long-running runners pick up operator PATCHes within one heartbeat
+   *  interval. Optional for forward-compat (see {@link RegisterRunnerResponse.config}). */
+  config?: ConfigSnapshot;
   server_time: number;
 }
 
@@ -846,5 +861,68 @@ export interface ActiveRunnersResponse {
    *  by ops dashboards without keeping idle runners alive). */
   active_runners: RunnerInfo[];
   pool_hash_summary: Array<{ hash: string; count: number }>;
+  server_time: number;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W5.3 — ConfigState DO: runtime-tunable values
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Set of operator-tunable keys that the ConfigState DO accepts. Restricted
+ * to a small, explicit allowlist so a misconfigured PATCH cannot inject
+ * arbitrary keys into the snapshot returned on every heartbeat.
+ *
+ * All values are stored / transported as strings to mirror the
+ * `wrangler.toml [vars]` convention. Worker / client interpretation
+ * (parseInt, parseFloat, etc.) lives at the consumption site.
+ */
+export const CONFIG_ALLOWED_KEYS = [
+  "short_window_sec",
+  "short_max",
+  "long_window_sec",
+  "long_max",
+  "extra_window_sec",
+  "extra_max",
+  "penalty_window_sec",
+  "jitter_max_ms",
+  "ban_ttl_ms",
+  "movie_claim_ttl_ms",
+  "runner_stale_ttl_ms",
+  "movie_claim_min_runners",
+  "login_cooldown_threshold",
+  "login_cooldown_window_sec",
+  "login_cooldown_duration_ms",
+  "heartbeat_interval_sec",
+] as const;
+
+export type ConfigKey = typeof CONFIG_ALLOWED_KEYS[number];
+
+/**
+ * A versioned snapshot of the dynamic config. ``version`` increments
+ * monotonically on every successful PATCH; clients use it to detect
+ * config changes between heartbeats without diffing the full payload.
+ *
+ * ``values`` may omit keys the operator has never explicitly set —
+ * Worker / client code should fall back to env-var defaults for missing
+ * keys (`wrangler.toml [vars]` retains the role of "factory defaults").
+ */
+export interface ConfigSnapshot {
+  version: number;
+  /** Wall-clock ms of the most recent PATCH that produced this snapshot. */
+  updated_at: number;
+  /** Partial map of operator-set overrides. Unset keys fall back to envs. */
+  values: Partial<Record<ConfigKey, string>>;
+}
+
+/** Body of ``PATCH /config``. */
+export interface ConfigPatchRequest {
+  /** Map of allowed keys to new string values. Unknown keys are rejected
+   *  with HTTP 400. Pass an empty string to clear an override. */
+  values: Partial<Record<ConfigKey, string>>;
+}
+
+/** Response of ``GET /config`` and ``PATCH /config``. */
+export interface ConfigResponse extends ConfigSnapshot {
   server_time: number;
 }

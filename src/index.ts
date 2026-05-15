@@ -1,9 +1,10 @@
-import { Env, LeaseRequest, ReportRequest } from "./types";
+import { ConfigSnapshot, Env, LeaseRequest, ReportRequest } from "./types";
 
 export { ProxyCoordinator } from "./proxy_coordinator";
 export { GlobalLoginState } from "./global_login_state";
 export { MovieClaimState } from "./movie_claim_state";
 export { RunnerRegistry } from "./runner_registry";
+export { ConfigState } from "./config_state";
 
 /**
  * W5.6 — Worker-level token-bucket rate limit.
@@ -116,6 +117,12 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/movie_status",
   "/sweep_orphan_stages",
   "/active_runners",
+  "/config",
+]);
+
+/** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
+const PATCH_ALLOWED_PATHS = new Set<string>([
+  "/config",
 ]);
 
 /**
@@ -191,7 +198,11 @@ export default {
       return jsonResponse({ error: "rate_limited" }, 429);
     }
 
-    if (request.method !== "POST" && !GET_ALLOWED_PATHS.has(url.pathname)) {
+    if (
+      request.method !== "POST" &&
+      !GET_ALLOWED_PATHS.has(url.pathname) &&
+      !(request.method === "PATCH" && PATCH_ALLOWED_PATHS.has(url.pathname))
+    ) {
       return jsonResponse({ error: "method not allowed" }, 405);
     }
 
@@ -307,11 +318,17 @@ export default {
         // ── P2-E: runner registry singleton ───────────────────────────
         case "/register": {
           const body = await request.json();
-          return await forwardToRunnerRegistryDo(env, "/do/register", "POST", body);
+          const resp = await forwardToRunnerRegistryDo(
+            env, "/do/register", "POST", body,
+          );
+          return await embedConfigSnapshot(env, resp);
         }
         case "/heartbeat": {
           const body = await request.json();
-          return await forwardToRunnerRegistryDo(env, "/do/heartbeat", "POST", body);
+          const resp = await forwardToRunnerRegistryDo(
+            env, "/do/heartbeat", "POST", body,
+          );
+          return await embedConfigSnapshot(env, resp);
         }
         case "/unregister": {
           const body = await request.json();
@@ -319,6 +336,14 @@ export default {
         }
         case "/active_runners":
           return await forwardToRunnerRegistryDo(env, "/do/active_runners", "GET", null);
+        // W5.3 — dynamic config singleton (ConfigState DO)
+        case "/config": {
+          if (request.method === "PATCH") {
+            const body = await request.json();
+            return await forwardToConfigStateDo(env, "/do/patch", "POST", body);
+          }
+          return await forwardToConfigStateDo(env, "/do/config", "GET", null);
+        }
         default:
           return jsonResponse({ error: "not found" }, 404);
       }
@@ -540,6 +565,89 @@ async function forwardToRunnerRegistryDo(
     status: upstream.status,
     headers: upstream.headers,
   });
+}
+
+/**
+ * W5.3 — proxy a request to the singleton ConfigState DO.
+ *
+ * Returns 503 when the binding is missing (v4 migration not yet applied),
+ * mirroring the runner-registry fallback path: clients treat 503 as
+ * "config DO unavailable, use env-var defaults" and continue.
+ */
+async function forwardToConfigStateDo(
+  env: Env,
+  path: string,
+  method: "GET" | "POST",
+  body: unknown,
+): Promise<Response> {
+  if (!env.CONFIG_STATE_DO) {
+    return jsonResponse(
+      { error: "config_state binding not configured (apply v4 migration)" },
+      503,
+    );
+  }
+  const id = env.CONFIG_STATE_DO.idFromName("global-config");
+  const stub = env.CONFIG_STATE_DO.get(id);
+  const init: RequestInit =
+    method === "GET"
+      ? { method: "GET" }
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body ?? {}),
+        };
+  const upstream = await stub.fetch(`https://do${path}`, init);
+  const text = await upstream.text();
+  return new Response(text, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
+}
+
+/**
+ * W5.3 — embed the current ConfigState snapshot into a register / heartbeat
+ * response so runners pull config without a separate round-trip.
+ *
+ * Fail-open: if the config DO is unavailable or returns a malformed
+ * snapshot, the original response passes through unchanged (clients fall
+ * back to env-var defaults). The registry response is the runner's
+ * critical path — a config DO outage MUST NOT break heartbeating.
+ */
+async function embedConfigSnapshot(env: Env, resp: Response): Promise<Response> {
+  if (!env.CONFIG_STATE_DO) return resp;
+  // Only embed on 2xx responses; 4xx/5xx from the registry already encode
+  // a different failure mode and the client should not see a mixed payload.
+  if (resp.status >= 300) return resp;
+  // Parse the registry payload first so we can fail-open if it isn't JSON.
+  let registryBody: Record<string, unknown>;
+  try {
+    registryBody = (await resp.json()) as Record<string, unknown>;
+  } catch {
+    return resp;
+  }
+  try {
+    const id = env.CONFIG_STATE_DO.idFromName("global-config");
+    const stub = env.CONFIG_STATE_DO.get(id);
+    const configResp = await stub.fetch(
+      "https://do/do/config", { method: "GET" },
+    );
+    if (configResp.status === 200) {
+      const snap = (await configResp.json()) as ConfigSnapshot & {
+        server_time?: number;
+      };
+      // Strip server_time before embedding — the registry's own
+      // server_time is authoritative for the merged response.
+      const { server_time: _unused, ...config } = snap;
+      void _unused;
+      registryBody.config = config;
+    }
+  } catch (err) {
+    // Swallow any error: heartbeat must succeed even if config DO is down.
+    console.warn("embedConfigSnapshot failed; serving registry-only payload", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return jsonResponse(registryBody, resp.status);
 }
 
 function resolveClaimShard(rawDate?: string | null): string {
