@@ -29,18 +29,28 @@ ${commonDashboardStyles()}
     background: rgba(11, 15, 21, 0.85); backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--border);
   }
-  .topbar .brand { display:flex; align-items:center; gap:10px; }
-  .topbar .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .2s, box-shadow .2s; }
-  .topbar .brand.live .dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: pulse 2s infinite; }
-  .topbar .brand.err .dot { background: var(--bad); box-shadow: 0 0 10px var(--bad); }
+  .topbar .brand { display:flex; align-items:center; gap:8px; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
   .topbar .title { font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text); }
   .topbar .sub { font-size: 11px; color: var(--muted); }
   .topbar .spacer { flex: 1; }
   .topbar .meta { display:flex; align-items:center; gap:18px; font-size: 12px; color: var(--muted); }
   .topbar .meta code { color: var(--text); }
+  /* User feedback: move the live-pulse dot next to the "live" status
+     label instead of the brand title — keeps the brand area static
+     and pairs the colour state with the word that explains it. */
+  .topbar .state-indicator { display:inline-flex; align-items:center; gap:6px; }
+  .topbar .state-indicator .dot { width:8px; height:8px; border-radius:50%; background: var(--muted); transition: background .2s, box-shadow .2s; }
+  .topbar .state-indicator.live .dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: pulse 2s infinite; }
+  .topbar .state-indicator.err .dot { background: var(--bad); box-shadow: 0 0 10px var(--bad); }
   .topbar a.logout { color: var(--muted); text-decoration: none; font-size: 12px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; transition: color .15s, border-color .15s; }
   .topbar a.logout:hover { color: var(--text); border-color: var(--muted); }
+  .topbar button.lang-toggle {
+    color: var(--muted); background: transparent; font-size: 12px; padding: 5px 10px;
+    border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+    transition: color .15s, border-color .15s; font-family: inherit;
+  }
+  .topbar button.lang-toggle:hover { color: var(--text); border-color: var(--muted); }
   main { max-width: 1440px; margin: 0 auto; padding: 28px 24px 56px; }
 
   /* Hero stats row */
@@ -192,13 +202,17 @@ ${commonDashboardStyles()}
 </style></head>
 <body>
 <div class="topbar">
-  <div class="brand" id="brand"><span class="dot"></span><span class="title">Proxy Coordinator</span><span class="sub">/ ops</span></div>
+  <div class="brand" id="brand"><span class="title" data-i18n="Proxy Coordinator">Proxy Coordinator</span><span class="sub" data-i18n="/ ops">/ ops</span></div>
   <div class="spacer"></div>
   <div class="meta">
-    <span>last update <code id="ts">—</code></span>
-    <span id="state">connecting…</span>
+    <span><span data-i18n="last update">last update</span> <code id="ts">—</code></span>
+    <span class="state-indicator" id="state-indicator">
+      <span class="dot"></span>
+      <span id="state" data-i18n="connecting…">connecting…</span>
+    </span>
+    <button id="lang-toggle" class="lang-toggle" type="button" aria-label="Switch language">中文</button>
     <form method="POST" action="/dashboard/logout" style="margin:0">
-      <button type="submit" style="all:unset"><a class="logout" href="/dashboard/logout" onclick="this.closest('form').submit(); return false;">Sign out</a></button>
+      <button type="submit" style="all:unset"><a class="logout" href="/dashboard/logout" onclick="this.closest('form').submit(); return false;" data-i18n="Sign out">Sign out</a></button>
     </form>
   </div>
 </div>
@@ -208,69 +222,69 @@ ${commonDashboardStyles()}
   <div id="banners"></div>
   <div class="stats" id="stats"></div>
   <div class="charts">
-    <div class="panel chart-panel" id="chart-runners"><header>Active runners trend</header><div class="chart-body"></div></div>
-    <div class="panel chart-panel" id="chart-queue"><header>Queue depth</header><div class="chart-body"></div></div>
-    <div class="panel chart-panel" id="chart-cf-bypass"><header>CF-bypass / banned ratio</header><div class="chart-body"></div></div>
-    <div class="panel chart-panel" id="chart-latency"><header>Per-proxy latency (ms)</header><div class="chart-body"></div></div>
-    <div class="panel chart-panel" id="chart-health"><header>Per-proxy health score</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-runners"><header data-i18n="Active runners trend">Active runners trend</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-queue"><header data-i18n="Queue depth">Queue depth</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-cf-bypass"><header data-i18n="CF-bypass / banned ratio">CF-bypass / banned ratio</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-latency"><header data-i18n="Per-proxy latency (ms)">Per-proxy latency (ms)</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-health"><header data-i18n="Per-proxy health score">Per-proxy health score</header><div class="chart-body"></div></div>
   </div>
   <div class="grid">
     <div class="panel">
       <header>
-        <span>Active runners <span class="badge" id="runner-count">0</span></span>
-        <button class="panel-history-btn" data-drawer="runners">History →</button>
+        <span><span data-i18n="Active runners">Active runners</span> <span class="badge" id="runner-count">0</span></span>
+        <button class="panel-history-btn" data-drawer="runners" data-i18n="History →">History →</button>
       </header>
       <div class="body" id="runners"></div>
     </div>
     <div class="panel">
       <header>
-        <span>Active signals <span class="badge" id="signal-count">0</span></span>
-        <button class="panel-history-btn" data-drawer="signals">History →</button>
+        <span><span data-i18n="Active signals">Active signals</span> <span class="badge" id="signal-count">0</span></span>
+        <button class="panel-history-btn" data-drawer="signals" data-i18n="History →">History →</button>
       </header>
       <div class="body" id="signals"></div>
     </div>
     <div class="panel">
       <header>
-        <span>Login state <span class="badge" id="login-badge">—</span></span>
-        <button class="panel-history-btn" data-drawer="login">History →</button>
+        <span><span data-i18n="Login state">Login state</span> <span class="badge" id="login-badge">—</span></span>
+        <button class="panel-history-btn" data-drawer="login" data-i18n="History →">History →</button>
       </header>
       <div class="body" id="login-state-body"></div>
     </div>
     <div class="panel full">
       <header>
-        <span>Sessions <span class="badge" id="session-count">0</span></span>
-        <span style="font-size:10px;color:var(--muted)">runner-reported lifecycle (ADR-008)</span>
+        <span><span data-i18n="Sessions">Sessions</span> <span class="badge" id="session-count">0</span></span>
+        <span style="font-size:10px;color:var(--muted)" data-i18n="runner-reported lifecycle (ADR-008)">runner-reported lifecycle (ADR-008)</span>
       </header>
       <div class="body" id="sessions"></div>
     </div>
     <div class="panel full">
       <header>
-        <span>Ops controls</span>
-        <span style="font-size:10px;color:var(--muted)">Phase-1 ADR-008 · mutation buttons</span>
+        <span data-i18n="Ops controls">Ops controls</span>
+        <span style="font-size:10px;color:var(--muted)" data-i18n="Phase-1 ADR-008 · mutation buttons">Phase-1 ADR-008 · mutation buttons</span>
       </header>
       <div class="body" id="ops-controls" style="padding:14px 16px"></div>
     </div>
     <div class="panel">
       <header>
-        <span>Today's Claims <span class="badge" id="movie-claim-badge">—</span></span>
-        <span style="font-size:10px;color:var(--muted)">MovieClaim DO · Phase-3</span>
+        <span><span data-i18n="Today's Claims">Today's Claims</span> <span class="badge" id="movie-claim-badge">—</span></span>
+        <span style="font-size:10px;color:var(--muted)" data-i18n="MovieClaim DO · Phase-3">MovieClaim DO · Phase-3</span>
       </header>
       <div class="body" id="movie-claim-stats" style="padding:14px 16px"></div>
     </div>
     <div class="panel">
       <header>
-        <span>Work queue <span class="badge" id="work-queue-badge">—</span></span>
-        <span style="font-size:10px;color:var(--muted)">WorkDistributor · Phase-3</span>
+        <span><span data-i18n="Work queue">Work queue</span> <span class="badge" id="work-queue-badge">—</span></span>
+        <span style="font-size:10px;color:var(--muted)" data-i18n="WorkDistributor · Phase-3">WorkDistributor · Phase-3</span>
       </header>
       <div class="body" id="work-stats" style="padding:14px 16px"></div>
     </div>
     <div class="panel full">
       <header>
-        Per-proxy state <span class="badge" id="proxy-count">0</span>
+        <span><span data-i18n="Per-proxy state">Per-proxy state</span> <span class="badge" id="proxy-count">0</span></span>
         <span style="margin-left:12px;font-size:10px;color:var(--muted)">
-          <button data-chip-action="all" class="chip-btn">all</button>
-          <button data-chip-action="none" class="chip-btn">none</button>
-          <button data-chip-action="invert" class="chip-btn">invert</button>
+          <button data-chip-action="all" class="chip-btn" data-i18n="all">all</button>
+          <button data-chip-action="none" class="chip-btn" data-i18n="none">none</button>
+          <button data-chip-action="invert" class="chip-btn" data-i18n="invert">invert</button>
         </span>
       </header>
       <div class="body">
@@ -280,8 +294,8 @@ ${commonDashboardStyles()}
     </div>
     <div class="panel full">
       <header>
-        <span>Config snapshot</span>
-        <button class="panel-history-btn" data-drawer="config">History →</button>
+        <span data-i18n="Config snapshot">Config snapshot</span>
+        <button class="panel-history-btn" data-drawer="config" data-i18n="History →">History →</button>
       </header>
       <div class="body" id="config"></div>
     </div>
@@ -311,6 +325,184 @@ ${commonDashboardStyles()}
 (function(){
   var $ = function(id){ return document.getElementById(id); };
   var brand = $("brand");
+  var stateIndicator = $("state-indicator");
+
+  // ── i18n: EN <-> ZH dictionary + T(s) lookup helper ─────────────────
+  // The dictionary uses English source strings as keys so render
+  // functions can keep their natural-reading literals — wrapping a
+  // user-visible label in T("...") makes it translatable without
+  // hoisting it to a token registry. Missing keys fall back to the
+  // English source. Persisted choice lives in localStorage so a tab
+  // reload retains the operator's preference.
+  var LANG_KEY = "dashboard.lang";
+  var LANG = (function(){
+    try { return localStorage.getItem(LANG_KEY) === "zh" ? "zh" : "en"; }
+    catch(e) { return "en"; }
+  })();
+  var I18N_ZH = {
+    // topbar
+    "Proxy Coordinator": "代理协调器",
+    "/ ops": "/ 运维",
+    "last update": "最近更新",
+    "live": "运行中",
+    "polling…": "轮询中…",
+    "connecting…": "连接中…",
+    "error: ": "错误：",
+    "Sign out": "退出登录",
+    // hero stats
+    "Live runners": "活跃 Runner",
+    "Active signals": "活跃信号",
+    "Proxies tracked": "代理总数",
+    "Healthy proxies": "健康代理",
+    // chart panel headers
+    "Active runners trend": "Runner 数趋势",
+    "Queue depth": "队列深度",
+    "CF-bypass / banned ratio": "CF-bypass / 封禁占比",
+    "Per-proxy latency (ms)": "各代理延迟 (ms)",
+    "Per-proxy health score": "各代理健康分",
+    // grid panel headers
+    "Active runners": "活跃 Runner",
+    "Login state": "登录状态",
+    "Sessions": "会话",
+    "Ops controls": "运维操作",
+    "Today's Claims": "今日 Claim",
+    "Work queue": "任务队列",
+    "Per-proxy state": "各代理状态",
+    "Config snapshot": "配置快照",
+    "History →": "历史 →",
+    "runner-reported lifecycle (ADR-008)": "Runner 上报的生命周期 (ADR-008)",
+    "Phase-1 ADR-008 · mutation buttons": "Phase-1 ADR-008 · 可操作按钮",
+    "MovieClaim DO · Phase-3": "MovieClaim DO · Phase-3",
+    "WorkDistributor · Phase-3": "WorkDistributor · Phase-3",
+    // chip filter buttons
+    "all": "全部",
+    "none": "无",
+    "invert": "反选",
+    // generic
+    "no data": "暂无数据",
+    "registry unavailable": "registry 不可用",
+    "No live runners": "无活跃 runner",
+    "Cohort healthy — no operator signals": "集群健康 —— 无运维信号",
+    "config-state DO unavailable": "config-state DO 不可用",
+    // session panel
+    "ACTIVE": "进行中",
+    "RECENT FAILURES": "近期失败",
+    "RECENT COMMITTED": "近期成功",
+    "active": "进行中",
+    "failed (24h)": "失败 (24h)",
+    "No runner sessions reported yet. Requires Python client v1.1+ (ADR-008).": "暂无 runner 上报会话。需要 Python 客户端 v1.1+（ADR-008）。",
+    "No proxies seen yet — the first runner register (with proxy_pool payload) will populate this list automatically.": "暂无代理记录 —— 首次 runner 注册（含 proxy_pool）会自动填充列表。",
+    "All proxies hidden by chip filter. Click 'all' above to show them.": "所有代理被筛选隐藏。点击上方 'all' 显示。",
+    // table headers
+    "Holder": "Holder",
+    "Workflow": "Workflow",
+    "Uptime": "运行时长",
+    "Last heartbeat": "最近心跳",
+    "Pool hash": "池 Hash",
+    "Kind": "类型",
+    "Payload": "负载",
+    "Expires": "过期时间",
+    "Proxy": "代理",
+    "Status": "状态",
+    "Health": "健康分",
+    "Latency": "延迟",
+    "Wins / Losses": "成功/失败",
+    "Wait": "等待",
+    "Ops": "操作",
+    "Session": "Session",
+    "Write mode": "写入模式",
+    "Failure reason": "失败原因",
+    "When": "时间",
+    // login state
+    "version": "版本",
+    "lease": "lease",
+    "last verified": "上次验证",
+    "proxy": "代理",
+    "lease held": "lease 已持有",
+    "cookie ready": "cookie 就绪",
+    "no cookie": "无 cookie",
+    "Force re-login": "强制重新登录",
+    "login_state unavailable. Click History → for past activity.": "login_state 不可用。点击 History → 查看历史。",
+    "Cookie value is never displayed. Click History → for attempt audit log.": "Cookie 值不会显示。点击 History → 查看尝试审计日志。",
+    // ops controls
+    "Pause pipeline · 1h": "暂停流水线 · 1h",
+    "Resume now": "立即恢复",
+    "Test alert webhook": "测试告警 webhook",
+    "No active pause": "未暂停",
+    "RUNTIME SIGNALS": "运行时信号",
+    "Throttle global ×2": "全局限流 ×2",
+    "Pause all runners": "暂停所有 Runner",
+    "Resume (clear signals)": "恢复（清除信号）",
+    "global throttle active": "全局限流生效",
+    "pause_all active": "pause_all 生效",
+    "Paused until": "暂停至",
+    "until": "至",
+    "left": "剩余",
+    "Signals affect every runner within one heartbeat (~60s). Use Resume to clear all active signals at once.": "信号会在一次心跳内（约 60 秒）影响所有 runner。点击 Resume 一键清除所有活跃信号。",
+    "Aggregated across all sub-shards for today's date (Asia/Singapore).": "跨当日所有 sub-shard 聚合（Asia/Singapore 时区）。",
+    // alerts banner
+    "SESSION FAILED": "会话失败",
+    "BAN SPIKE": "封禁激增",
+    "LOGIN COOLDOWN": "登录冷却",
+    "TEST": "测试",
+    "Ack": "确认",
+    "PIPELINE PAUSED": "流水线已暂停",
+    // movie claim
+    "Active claims (in-flight)": "进行中 Claim",
+    "Staged (awaiting commit)": "Staged（待 commit）",
+    "Committed (today)": "已 commit（今日）",
+    "Failed hrefs": "失败 href",
+    "In cooldown": "冷却中",
+    "Dead-lettered": "Dead-letter",
+    "MovieClaim DO unavailable (binding missing or v3 migration not applied).": "MovieClaim DO 不可用（binding 缺失或 v3 迁移未应用）。",
+    // work queue
+    "Total queue size": "队列总数",
+    "Visible (claimable)": "可领取",
+    "Leased (in-flight)": "已领取 (in-flight)",
+    "Oldest item age": "最久未消费",
+    "WorkDistributor DO unavailable (binding missing or v5 migration not applied).": "WorkDistributor DO 不可用（binding 缺失或 v5 迁移未应用）。",
+    "items": "条",
+    "empty": "空",
+    "banned": "已封禁",
+    "live (status)": "正常",
+    "cf-bypass": "cf-bypass",
+    "error": "错误",
+    "Ban": "封禁",
+    "Unban": "解封",
+    "edit": "编辑",
+  };
+  function T(s){
+    if(LANG === "zh" && Object.prototype.hasOwnProperty.call(I18N_ZH, s)){
+      return I18N_ZH[s];
+    }
+    return s;
+  }
+  function applyStaticI18n(){
+    document.querySelectorAll("[data-i18n]").forEach(function(el){
+      var key = el.getAttribute("data-i18n");
+      if(!key) return;
+      var translated = T(key);
+      if(translated !== el.textContent){
+        el.textContent = translated;
+      }
+    });
+  }
+  function updateLangToggleLabel(){
+    var btn = $("lang-toggle");
+    if(btn) btn.textContent = LANG === "zh" ? "EN" : "中文";
+  }
+  function toggleLang(){
+    LANG = LANG === "zh" ? "en" : "zh";
+    try { localStorage.setItem(LANG_KEY, LANG); } catch(e) {}
+    applyStaticI18n();
+    updateLangToggleLabel();
+    // refresh() is a function declaration further down the IIFE — JS
+    // hoisting makes it callable here. Re-running refresh re-runs every
+    // render function, all of which interpolate T()-wrapped literals,
+    // so the dynamic panels pick up the new language without waiting
+    // for the next 5s polling tick.
+    try { refresh(); } catch(e) {}
+  }
 
   // ── Phase 3: browser-local time formatting with tz abbreviation ─────
   var _tzFormatter = new Intl.DateTimeFormat([], {
@@ -413,10 +605,10 @@ ${commonDashboardStyles()}
     var healthyProxies = proxies.filter(function(p){ return !p.banned && !p.error; }).length;
     var signalCls = signals.length === 0 ? "" : (signals.some(function(s){ return s.kind === "pause_all"; }) ? "bad" : "warn");
     var html = "";
-    html += statTile("Live runners", runners.length, runners.length > 0 ? "ok" : "");
-    html += statTile("Active signals", signals.length, signalCls);
-    html += statTile("Proxies tracked", proxies.length, "");
-    html += statTile("Healthy proxies", healthyProxies + " / " + proxies.length, healthyProxies === proxies.length && proxies.length > 0 ? "ok" : (healthyProxies === 0 && proxies.length > 0 ? "bad" : ""));
+    html += statTile(T("Live runners"), runners.length, runners.length > 0 ? "ok" : "");
+    html += statTile(T("Active signals"), signals.length, signalCls);
+    html += statTile(T("Proxies tracked"), proxies.length, "");
+    html += statTile(T("Healthy proxies"), healthyProxies + " / " + proxies.length, healthyProxies === proxies.length && proxies.length > 0 ? "ok" : (healthyProxies === 0 && proxies.length > 0 ? "bad" : ""));
     $("stats").innerHTML = html;
   }
 
@@ -441,11 +633,11 @@ ${commonDashboardStyles()}
   }
 
   function renderRunners(data, nowMs){
-    if(!data.runners || !data.runners.active_runners){ $("runners").innerHTML = '<div class="empty">registry unavailable</div>'; $("runner-count").textContent = "0"; return; }
+    if(!data.runners || !data.runners.active_runners){ $("runners").innerHTML = '<div class="empty">' + T("registry unavailable") + '</div>'; $("runner-count").textContent = "0"; return; }
     var rows = data.runners.active_runners;
     $("runner-count").textContent = String(rows.length);
-    if(rows.length === 0){ $("runners").innerHTML = '<div class="empty">No live runners</div>'; return; }
-    var html = '<table><tr><th>Holder</th><th>Workflow</th><th>Uptime</th><th>Last heartbeat</th><th>Pool hash</th></tr>';
+    if(rows.length === 0){ $("runners").innerHTML = '<div class="empty">' + T("No live runners") + '</div>'; return; }
+    var html = '<table><tr><th>' + T("Holder") + '</th><th>' + T("Workflow") + '</th><th>' + T("Uptime") + '</th><th>' + T("Last heartbeat") + '</th><th>' + T("Pool hash") + '</th></tr>';
     rows.forEach(function(r){
       var lastAge = nowMs - r.last_heartbeat;
       var lastCls = lastAge > 120000 ? "warn" : (lastAge > 300000 ? "bad" : "ok");
@@ -465,11 +657,11 @@ ${commonDashboardStyles()}
   }
 
   function renderSignals(data, nowMs){
-    if(!data.signals || !data.signals.active_signals){ $("signals").innerHTML = '<div class="empty">registry unavailable</div>'; $("signal-count").textContent = "0"; return; }
+    if(!data.signals || !data.signals.active_signals){ $("signals").innerHTML = '<div class="empty">' + T("registry unavailable") + '</div>'; $("signal-count").textContent = "0"; return; }
     var rows = data.signals.active_signals;
     $("signal-count").textContent = String(rows.length);
-    if(rows.length === 0){ $("signals").innerHTML = '<div class="empty">Cohort healthy — no operator signals</div>'; return; }
-    var html = '<table><tr><th>Kind</th><th>Payload</th><th>Expires</th></tr>';
+    if(rows.length === 0){ $("signals").innerHTML = '<div class="empty">' + T("Cohort healthy — no operator signals") + '</div>'; return; }
+    var html = '<table><tr><th>' + T("Kind") + '</th><th>' + T("Payload") + '</th><th>' + T("Expires") + '</th></tr>';
     rows.forEach(function(s){
       var cls = s.kind === "pause_all" ? "bad" : "warn";
       var payload = "—";
@@ -484,7 +676,7 @@ ${commonDashboardStyles()}
   }
 
   function renderConfig(data){
-    if(!data.config || !data.config.merged){ $("config").innerHTML = '<div class="empty">config-state DO unavailable</div>'; return; }
+    if(!data.config || !data.config.merged){ $("config").innerHTML = '<div class="empty">' + T("config-state DO unavailable") + '</div>'; return; }
     var entries = Object.entries(data.config.merged);
     if(entries.length === 0){
       $("config").innerHTML = '<div class="hint">No config keys returned. Check that <code>CONFIG_STATE_DO</code> is bound.</div>';
@@ -515,25 +707,25 @@ ${commonDashboardStyles()}
     var allRows = data.proxies || [];
     if (allRows.length === 0) {
       $("proxy-count").textContent = "0";
-      $("proxies").innerHTML = '<div class="hint">No proxies seen yet — the first runner register (with proxy_pool payload) will populate this list automatically.</div>';
+      $("proxies").innerHTML = '<div class="hint">' + T("No proxies seen yet — the first runner register (with proxy_pool payload) will populate this list automatically.") + '</div>';
       return;
     }
     var rows = allRows.filter(function(p){ return !proxyFilter.has(p.proxy_id); });
     $("proxy-count").textContent = rows.length + " / " + allRows.length;
     if (rows.length === 0) {
-      $("proxies").innerHTML = '<div class="hint">All proxies hidden by chip filter. Click <strong>all</strong> above to show them.</div>';
+      $("proxies").innerHTML = '<div class="hint">' + T("All proxies hidden by chip filter. Click 'all' above to show them.") + '</div>';
       return;
     }
-    var html = '<table><tr><th>Proxy</th><th>Status</th><th>Health</th><th>Latency</th><th>Wins / Losses</th><th>Wait</th><th>Ops</th></tr>';
+    var html = '<table><tr><th>' + T("Proxy") + '</th><th>' + T("Status") + '</th><th>' + T("Health") + '</th><th>' + T("Latency") + '</th><th>' + T("Wins / Losses") + '</th><th>' + T("Wait") + '</th><th>' + T("Ops") + '</th></tr>';
     rows.forEach(function(p){
       if(p.error){
-        html += '<tr data-proxy-row="' + esc(p.proxy_id) + '" style="cursor:pointer"><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="6"><span class="pill bad">error: '+esc(p.error)+'</span></td></tr>';
+        html += '<tr data-proxy-row="' + esc(p.proxy_id) + '" style="cursor:pointer"><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="6"><span class="pill bad">' + T("error") + ': '+esc(p.error)+'</span></td></tr>';
         return;
       }
       var statusPill;
-      if(p.banned) statusPill = '<span class="pill bad">banned</span>';
-      else if(p.requires_cf_bypass) statusPill = '<span class="pill warn">cf-bypass</span>';
-      else statusPill = '<span class="pill ok">live</span>';
+      if(p.banned) statusPill = '<span class="pill bad">' + T("banned") + '</span>';
+      else if(p.requires_cf_bypass) statusPill = '<span class="pill warn">' + T("cf-bypass") + '</span>';
+      else statusPill = '<span class="pill ok">' + T("live (status)") + '</span>';
       var h = p.health || {};
       var score = typeof h.score === "number" ? h.score : 0.5;
       var scoreBar = '<span class="score-bar"><span class="track"><span class="fill" style="width:'+(score*100).toFixed(0)+'%"></span></span><span>'+(score*100).toFixed(0)+'</span></span>';
@@ -543,8 +735,8 @@ ${commonDashboardStyles()}
       var waitMs = p.nextAvailableAt ? Math.max(0, p.nextAvailableAt - Date.now()) : 0;
       // Phase-1 ADR-008 — Ban / Unban buttons (no Python consumer needed)
       var opsHtml = p.banned
-        ? '<button class="op-btn" data-unban-proxy="' + esc(p.proxy_id) + '">Unban</button>'
-        : '<button class="op-btn op-btn-danger" data-ban-proxy="' + esc(p.proxy_id) + '">Ban</button>';
+        ? '<button class="op-btn" data-unban-proxy="' + esc(p.proxy_id) + '">' + T("Unban") + '</button>'
+        : '<button class="op-btn op-btn-danger" data-ban-proxy="' + esc(p.proxy_id) + '">' + T("Ban") + '</button>';
       html += '<tr data-proxy-row="' + esc(p.proxy_id) + '"><td><code>'+esc(p.proxy_id)+'</code></td>'
         + '<td>'+statusPill+'</td>'
         + '<td>'+scoreBar+'</td>'
@@ -565,23 +757,23 @@ ${commonDashboardStyles()}
       .then(function(r){ return r.status === 200 ? r.json() : null; })
       .then(function(s){
         if(!s){
-          body.innerHTML = '<div class="hint">login_state unavailable. Click <strong>History →</strong> for past activity.</div>';
+          body.innerHTML = '<div class="hint">' + T("login_state unavailable. Click History → for past activity.") + '</div>';
           $("login-badge").textContent = "—";
           return;
         }
         var pill = s.has_active_lease
-          ? '<span class="pill warn">lease held</span>'
-          : (s.cookie ? '<span class="pill ok">cookie ready</span>' : '<span class="pill bad">no cookie</span>');
+          ? '<span class="pill warn">' + T("lease held") + '</span>'
+          : (s.cookie ? '<span class="pill ok">' + T("cookie ready") + '</span>' : '<span class="pill bad">' + T("no cookie") + '</span>');
         $("login-badge").textContent = "v" + (s.version || 0);
         var html = '<div style="padding:14px 16px">'
           + '<div style="display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:12.5px">'
-          + '<div class="muted">version</div><div><code>' + esc(String(s.version || 0)) + '</code></div>'
-          + '<div class="muted">lease</div><div>' + pill + '</div>'
-          + '<div class="muted">last verified</div><div>' + (s.last_verified_at ? fmtTs(s.last_verified_at) : '—') + '</div>'
-          + '<div class="muted">proxy</div><div>' + esc(s.proxy_name || '—') + '</div>'
+          + '<div class="muted">' + T("version") + '</div><div><code>' + esc(String(s.version || 0)) + '</code></div>'
+          + '<div class="muted">' + T("lease") + '</div><div>' + pill + '</div>'
+          + '<div class="muted">' + T("last verified") + '</div><div>' + (s.last_verified_at ? fmtTs(s.last_verified_at) : '—') + '</div>'
+          + '<div class="muted">' + T("proxy") + '</div><div>' + esc(s.proxy_name || '—') + '</div>'
           + '</div>'
-          + '<div style="margin-top:14px"><button class="op-btn op-btn-danger" data-op="force-relogin">Force re-login</button></div>'
-          + '<div class="hint" style="padding:8px 0 0">Cookie value is never displayed. Click <strong>History →</strong> for attempt audit log.</div>'
+          + '<div style="margin-top:14px"><button class="op-btn op-btn-danger" data-op="force-relogin">' + T("Force re-login") + '</button></div>'
+          + '<div class="hint" style="padding:8px 0 0">' + T("Cookie value is never displayed. Click History → for attempt audit log.") + '</div>'
           + '</div>';
         body.innerHTML = html;
       });
@@ -596,15 +788,15 @@ ${commonDashboardStyles()}
     if(unacked.length === 0){ holder.innerHTML = ""; return; }
     var html = '';
     unacked.slice(0, 5).forEach(function(a){
-      var kindLabel = a.kind === 'session_failed' ? 'SESSION FAILED'
-        : a.kind === 'ban_spike' ? 'BAN SPIKE'
-        : a.kind === 'login_cooldown' ? 'LOGIN COOLDOWN'
-        : a.kind === 'manual_test' ? 'TEST'
+      var kindLabel = a.kind === 'session_failed' ? T('SESSION FAILED')
+        : a.kind === 'ban_spike' ? T('BAN SPIKE')
+        : a.kind === 'login_cooldown' ? T('LOGIN COOLDOWN')
+        : a.kind === 'manual_test' ? T('TEST')
         : String(a.kind || '').toUpperCase();
       html += '<div class="banner" style="margin-bottom:10px">'
         + '<strong>[' + esc(kindLabel) + ']</strong> ' + esc(a.summary || '')
         + ' <span class="muted" style="margin-left:6px">' + esc(fmtTs(a.ts)) + '</span>'
-        + ' <button class="op-btn" style="float:right;margin-top:-3px" data-ack-alert="' + esc(a.id) + '">Ack</button>'
+        + ' <button class="op-btn" style="float:right;margin-top:-3px" data-ack-alert="' + esc(a.id) + '">' + T('Ack') + '</button>'
         + '</div>';
     });
     if(unacked.length > 5){
@@ -625,10 +817,10 @@ ${commonDashboardStyles()}
     var reason = values.pipeline_pause_reason || '';
     var until = fmtTs(pausedUntil);
     var rel = fmtDur(pausedUntil - Date.now());
-    holder.innerHTML = '<div class="banner" style="margin-bottom:10px"><strong>PIPELINE PAUSED</strong> · until '
-      + esc(until) + ' (' + esc(rel) + ' left)'
+    holder.innerHTML = '<div class="banner" style="margin-bottom:10px"><strong>' + T('PIPELINE PAUSED') + '</strong> · ' + T('until') + ' '
+      + esc(until) + ' (' + esc(rel) + ' ' + T('left') + ')'
       + (reason ? ' · <em>' + esc(reason) + '</em>' : '')
-      + ' · <button class="op-btn" data-op="resume-pipeline">Resume now</button>'
+      + ' · <button class="op-btn" data-op="resume-pipeline">' + T('Resume now') + '</button>'
       + '</div>';
   }
 
@@ -637,14 +829,14 @@ ${commonDashboardStyles()}
     var active = s.active || [];
     var failed = s.recent_failed || [];
     var committed = s.recent_committed || [];
-    $("session-count").textContent = active.length + " active · " + failed.length + " failed (24h)";
+    $("session-count").textContent = active.length + " " + T("active") + " · " + failed.length + " " + T("failed (24h)");
     if(active.length === 0 && failed.length === 0 && committed.length === 0){
-      $("sessions").innerHTML = '<div class="empty">No runner sessions reported yet. Requires Python client v1.1+ (ADR-008).</div>';
+      $("sessions").innerHTML = '<div class="empty">' + T("No runner sessions reported yet. Requires Python client v1.1+ (ADR-008).") + '</div>';
       return;
     }
     function rowsHtml(rows, cls){
       if(rows.length === 0) return '';
-      var html = '<table><tr><th>Session</th><th>Status</th><th>Write mode</th><th>Workflow</th><th>Failure reason</th><th>When</th></tr>';
+      var html = '<table><tr><th>' + T("Session") + '</th><th>' + T("Status") + '</th><th>' + T("Write mode") + '</th><th>' + T("Workflow") + '</th><th>' + T("Failure reason") + '</th><th>' + T("When") + '</th></tr>';
       rows.forEach(function(sess){
         var pillCls = sess.status === 'failed' ? 'bad'
           : sess.status === 'committed' ? 'ok'
@@ -664,13 +856,13 @@ ${commonDashboardStyles()}
     }
     var html = '';
     if(active.length > 0){
-      html += '<div style="padding:8px 16px 0;font-size:11px;color:var(--muted)">ACTIVE</div>' + rowsHtml(active);
+      html += '<div style="padding:8px 16px 0;font-size:11px;color:var(--muted)">' + T("ACTIVE") + '</div>' + rowsHtml(active);
     }
     if(failed.length > 0){
-      html += '<div style="padding:14px 16px 0;font-size:11px;color:var(--bad)">RECENT FAILURES</div>' + rowsHtml(failed);
+      html += '<div style="padding:14px 16px 0;font-size:11px;color:var(--bad)">' + T("RECENT FAILURES") + '</div>' + rowsHtml(failed);
     }
     if(committed.length > 0){
-      html += '<div style="padding:14px 16px 0;font-size:11px;color:var(--muted)">RECENT COMMITTED</div>' + rowsHtml(committed.slice(0, 10));
+      html += '<div style="padding:14px 16px 0;font-size:11px;color:var(--muted)">' + T("RECENT COMMITTED") + '</div>' + rowsHtml(committed.slice(0, 10));
     }
     void nowMs;
     $("sessions").innerHTML = html;
@@ -689,40 +881,40 @@ ${commonDashboardStyles()}
     var hasAnySig = sigs.length > 0;
     var html = ''
       + '<div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center">'
-      + '<button class="op-btn" data-op="pause-pipeline" data-hours="1">Pause pipeline · 1h</button>'
+      + '<button class="op-btn" data-op="pause-pipeline" data-hours="1">' + T("Pause pipeline · 1h") + '</button>'
       + '<button class="op-btn" data-op="pause-pipeline" data-hours="3">3h</button>'
       + '<button class="op-btn" data-op="pause-pipeline" data-hours="6">6h</button>'
       + '<button class="op-btn" data-op="pause-pipeline" data-hours="24">24h</button>'
       + (pausedActive
-          ? '<button class="op-btn op-btn-danger" data-op="resume-pipeline">Resume now</button>'
+          ? '<button class="op-btn op-btn-danger" data-op="resume-pipeline">' + T("Resume now") + '</button>'
           : '')
       + '<span class="muted" style="font-size:11px">'
       + (pausedActive
-          ? 'Paused until ' + esc(fmtTs(pausedUntil)) + ' (' + esc(fmtDur(pausedUntil - Date.now())) + ' left)'
-          : 'No active pause')
+          ? T("Paused until") + ' ' + esc(fmtTs(pausedUntil)) + ' (' + esc(fmtDur(pausedUntil - Date.now())) + ' ' + T("left") + ')'
+          : T("No active pause"))
       + '</span>'
       + '<span style="flex:1"></span>'
-      + '<button class="op-btn" data-op="test-alert">Test alert webhook</button>'
+      + '<button class="op-btn" data-op="test-alert">' + T("Test alert webhook") + '</button>'
       + '</div>'
       // ── Phase-2: Global throttle / Pause-all / Resume — wired to /signal ──
       + '<div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">'
-      + '<span style="font-size:10px;color:var(--muted);margin-right:4px">RUNTIME SIGNALS</span>'
-      + '<button class="op-btn" data-op="throttle-global" data-factor="2">Throttle global ×2</button>'
+      + '<span style="font-size:10px;color:var(--muted);margin-right:4px">' + T("RUNTIME SIGNALS") + '</span>'
+      + '<button class="op-btn" data-op="throttle-global" data-factor="2">' + T("Throttle global ×2") + '</button>'
       + '<button class="op-btn" data-op="throttle-global" data-factor="4">×4</button>'
-      + '<button class="op-btn op-btn-danger" data-op="pause-all">Pause all runners</button>'
+      + '<button class="op-btn op-btn-danger" data-op="pause-all">' + T("Pause all runners") + '</button>'
       + (hasAnySig
-          ? '<button class="op-btn" data-op="resume-signals">Resume (clear signals)</button>'
+          ? '<button class="op-btn" data-op="resume-signals">' + T("Resume (clear signals)") + '</button>'
           : '')
       + (hasGlobalThrottle || hasPauseAll
           ? '<span class="pill warn" style="font-size:11px">'
-            + (hasGlobalThrottle ? 'global throttle active' : '')
+            + (hasGlobalThrottle ? T("global throttle active") : '')
             + (hasGlobalThrottle && hasPauseAll ? ' · ' : '')
-            + (hasPauseAll ? 'pause_all active' : '')
+            + (hasPauseAll ? T("pause_all active") : '')
             + '</span>'
           : '')
       + '</div>'
       + '<div class="hint" style="padding:8px 0 0;font-size:11px">'
-      + 'Signals affect every runner within one heartbeat (~60s). Use Resume to clear all active signals at once.'
+      + T("Signals affect every runner within one heartbeat (~60s). Use Resume to clear all active signals at once.")
       + '</div>';
     $("ops-controls").innerHTML = html;
   }
@@ -742,7 +934,7 @@ ${commonDashboardStyles()}
     var holder = $("movie-claim-stats");
     var badge = $("movie-claim-badge");
     if(!s){
-      holder.innerHTML = '<div class="hint">MovieClaim DO unavailable (binding missing or v3 migration not applied).</div>';
+      holder.innerHTML = '<div class="hint">' + T("MovieClaim DO unavailable (binding missing or v3 migration not applied).") + '</div>';
       badge.textContent = "—";
       return;
     }
@@ -754,14 +946,14 @@ ${commonDashboardStyles()}
     var deadLetter = Number(s.dead_lettered_count || 0);
     badge.textContent = committed + " ✓";
     holder.innerHTML = ''
-      + statRow("Active claims (in-flight)", activeClaims, activeClaims > 0 ? "warn" : null)
-      + statRow("Staged (awaiting commit)", staged)
-      + statRow("Committed (today)", committed, committed > 0 ? "ok" : null)
-      + statRow("Failed hrefs", failures, failures > 0 ? "warn" : null)
-      + statRow("In cooldown", cooldown, cooldown > 0 ? "warn" : null)
-      + statRow("Dead-lettered", deadLetter, deadLetter > 0 ? "bad" : null)
+      + statRow(T("Active claims (in-flight)"), activeClaims, activeClaims > 0 ? "warn" : null)
+      + statRow(T("Staged (awaiting commit)"), staged)
+      + statRow(T("Committed (today)"), committed, committed > 0 ? "ok" : null)
+      + statRow(T("Failed hrefs"), failures, failures > 0 ? "warn" : null)
+      + statRow(T("In cooldown"), cooldown, cooldown > 0 ? "warn" : null)
+      + statRow(T("Dead-lettered"), deadLetter, deadLetter > 0 ? "bad" : null)
       + '<div class="hint" style="padding:8px 0 0;font-size:11px">'
-      + "Aggregated across all sub-shards for today's date (Asia/Singapore)."
+      + T("Aggregated across all sub-shards for today's date (Asia/Singapore).")
       + '</div>';
   }
 
@@ -770,7 +962,7 @@ ${commonDashboardStyles()}
     var holder = $("work-stats");
     var badge = $("work-queue-badge");
     if(!s){
-      holder.innerHTML = '<div class="hint">WorkDistributor DO unavailable (binding missing or v5 migration not applied).</div>';
+      holder.innerHTML = '<div class="hint">' + T("WorkDistributor DO unavailable (binding missing or v5 migration not applied).") + '</div>';
       badge.textContent = "—";
       return;
     }
@@ -781,13 +973,13 @@ ${commonDashboardStyles()}
     var oldestAge = (oldestMs && Number.isFinite(oldestMs))
       ? fmtAge(Number(oldestMs), Date.now())
       : "—";
-    badge.textContent = queueSize > 0 ? (queueSize + " items") : "empty";
+    badge.textContent = queueSize > 0 ? (queueSize + " " + T("items")) : T("empty");
     var leaseCls = leased > 0 ? "warn" : null;
     holder.innerHTML = ''
-      + statRow("Total queue size", queueSize, queueSize > 0 ? "warn" : null)
-      + statRow("Visible (claimable)", visible)
-      + statRow("Leased (in-flight)", leased, leaseCls)
-      + statRow("Oldest item age", oldestAge,
+      + statRow(T("Total queue size"), queueSize, queueSize > 0 ? "warn" : null)
+      + statRow(T("Visible (claimable)"), visible)
+      + statRow(T("Leased (in-flight)"), leased, leaseCls)
+      + statRow(T("Oldest item age"), oldestAge,
                 (oldestMs && (Date.now() - Number(oldestMs)) > 1800_000) ? "bad" : null)
       + '<div class="hint" style="padding:8px 0 0;font-size:11px">'
       + 'Spider currently dispatches via MovieClaim DO; this queue is staged for opt-in switchover.'
@@ -954,8 +1146,14 @@ ${commonDashboardStyles()}
   });
 
   function setBrandLive(live){
-    brand.classList.toggle("live", !!live);
-    brand.classList.toggle("err", !live);
+    // Kept the function name for caller-compat; the actual indicator
+    // moved from .brand to #state-indicator so the colour pairs with
+    // the "live" / "polling…" / "error: ..." text instead of the
+    // brand title. Brand stays neutral.
+    if(stateIndicator){
+      stateIndicator.classList.toggle("live", !!live);
+      stateIndicator.classList.toggle("err", !live);
+    }
   }
 
   // ── Phase 3: charts ─────────────────────────────────────────────────
@@ -1494,7 +1692,7 @@ ${commonDashboardStyles()}
   var data_last_snapshot = null;
 
   function refresh(){
-    $("state").textContent = "polling…";
+    $("state").textContent = T("polling…");
     return Promise.all([
       fetch("/ops/snapshot", { credentials: "same-origin" }).then(function(r){
         if(r.status === 401){ window.location.href = "/"; throw new Error("auth"); }
@@ -1531,14 +1729,14 @@ ${commonDashboardStyles()}
       renderChartHealth(snapshots);
 
       setBrandLive(true);
-      $("state").textContent = "live";
+      $("state").textContent = T("live");
       // Topbar ts already uses innerHTML with tooltip from Task 4 — preserve.
       var tsAbs = fmtTs(nowMs);
       var tsRel = fmtAge(nowMs, Date.now()) + " ago";
       $("ts").innerHTML = '<span title="' + esc(tsRel) + '">' + esc(tsAbs) + '</span>';
     }).catch(function(err){
       setBrandLive(false);
-      $("state").textContent = "error: " + err.message;
+      $("state").textContent = T("error: ") + err.message;
     });
   }
 
@@ -1586,6 +1784,12 @@ ${commonDashboardStyles()}
       scheduleNext(); // re-arm at 30s cadence
     }
   });
+
+  // ── i18n: wire toggle button + apply current language on first paint
+  applyStaticI18n();
+  updateLangToggleLabel();
+  var langBtn = $("lang-toggle");
+  if(langBtn) langBtn.addEventListener("click", toggleLang);
 
   // Initial fetch + start loop.
   refresh().finally(scheduleNext);

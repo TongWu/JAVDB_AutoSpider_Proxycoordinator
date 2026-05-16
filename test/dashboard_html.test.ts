@@ -484,6 +484,91 @@ describe("Phase-3 — inline JS parses without syntax errors", () => {
   });
 });
 
+describe("UX — live dot moved next to status indicator", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("brand no longer renders the live-pulse dot", () => {
+    // The old structure put the dot inside .brand. Now .brand has no
+    // <span class="dot"></span> — only title + sub spans.
+    expect(html).not.toMatch(/<div class="brand"[^>]*>\s*<span class="dot"/);
+  });
+
+  it("state indicator wraps a dot + the #state label", () => {
+    expect(html).toMatch(/<span class="state-indicator" id="state-indicator">[\s\S]*?<span class="dot"><\/span>[\s\S]*?<span id="state"/);
+  });
+
+  it("setBrandLive toggles classes on #state-indicator, not on .brand", () => {
+    // The function name is preserved for caller compat but the body
+    // mutates stateIndicator now.
+    expect(html).toContain("stateIndicator.classList.toggle(\"live\"");
+    expect(html).toContain("stateIndicator.classList.toggle(\"err\"");
+    expect(html).not.toContain("brand.classList.toggle(\"live\"");
+  });
+
+  it("CSS rules target .state-indicator.live and .state-indicator.err", () => {
+    expect(html).toContain(".topbar .state-indicator.live .dot");
+    expect(html).toContain(".topbar .state-indicator.err .dot");
+  });
+});
+
+describe("UX — EN/中 language toggle", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("renders a #lang-toggle button in the topbar", () => {
+    expect(html).toContain('id="lang-toggle"');
+    expect(html).toContain('class="lang-toggle"');
+  });
+
+  it("declares the I18N_ZH dictionary with required keys", () => {
+    expect(html).toContain("I18N_ZH");
+    // Must include the topbar / hero stat / panel header keys we
+    // promised to translate.
+    expect(html).toContain('"Proxy Coordinator": "代理协调器"');
+    expect(html).toContain('"live": "运行中"');
+    expect(html).toContain('"Live runners": "活跃 Runner"');
+    expect(html).toContain('"Today\'s Claims": "今日 Claim"');
+    expect(html).toContain('"Work queue": "任务队列"');
+  });
+
+  it("defines T(), applyStaticI18n(), updateLangToggleLabel(), toggleLang()", () => {
+    expect(html).toContain("function T(s)");
+    expect(html).toContain("function applyStaticI18n()");
+    expect(html).toContain("function updateLangToggleLabel()");
+    expect(html).toContain("function toggleLang()");
+  });
+
+  it("static labels are tagged with data-i18n", () => {
+    expect(html).toContain('data-i18n="Proxy Coordinator"');
+    expect(html).toContain('data-i18n="Sign out"');
+    expect(html).toContain('data-i18n="connecting…"');
+    expect(html).toContain('data-i18n="Active runners trend"');
+    expect(html).toContain('data-i18n="Today\'s Claims"');
+    expect(html).toContain('data-i18n="Config snapshot"');
+  });
+
+  it("language choice is persisted to localStorage", () => {
+    expect(html).toContain("localStorage.setItem(LANG_KEY, LANG)");
+    expect(html).toContain('dashboard.lang');
+  });
+
+  it("toggling language re-renders via refresh()", () => {
+    // toggleLang body should trigger refresh() so dynamic panels pick
+    // up the new language without waiting for the next polling tick.
+    expect(html).toMatch(/function toggleLang\(\)[\s\S]*?refresh\(\)/);
+  });
+
+  it("status text setters route through T() for live/polling/error", () => {
+    expect(html).toContain('$("state").textContent = T("polling…")');
+    expect(html).toContain('$("state").textContent = T("live")');
+    expect(html).toContain('$("state").textContent = T("error: ")');
+  });
+
+  it("stat-tile labels call T() instead of hard-coded English", () => {
+    expect(html).toContain('statTile(T("Live runners")');
+    expect(html).toContain('statTile(T("Healthy proxies")');
+  });
+});
+
 describe("Phase-3 — responsive CSS + chart sizing", () => {
   const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
 
