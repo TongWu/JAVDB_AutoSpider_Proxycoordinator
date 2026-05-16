@@ -1,0 +1,357 @@
+/**
+ * Phase 3 — Server-rendered HTML for the operator dashboard.
+ *
+ * Lifted out of index.ts to keep that file focused on routing. All
+ * interactive behaviour lives in the inline <script> tag rendered here.
+ *
+ * Architecture (full picture lands by end of Phase 3):
+ *   - Visibility-aware polling (5s visible / 30s hidden / pause after 30 min hidden)
+ *   - Browser-local time formatting with timezone abbreviation
+ *   - localStorage-persisted filter + time-range state
+ *   - uPlot charts (vendored, see uplot_vendor.ts)
+ *
+ * See docs/ai/adr/ADR-003 for the data-pipeline design that feeds this UI.
+ */
+
+export function renderDashboardHtml(url: URL): string {
+  const proxyIdsRaw = url.searchParams.get("proxy_ids") ?? "";
+  const proxyIdsJs = JSON.stringify(proxyIdsRaw);
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<title>Dashboard · Proxy Coordinator</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>${commonDashboardStyles()}
+  body { padding-top: 56px; }
+  .topbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 56px; z-index: 10;
+    display: flex; align-items: center; padding: 0 24px;
+    background: rgba(11, 15, 21, 0.85); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar .brand { display:flex; align-items:center; gap:10px; }
+  .topbar .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .2s, box-shadow .2s; }
+  .topbar .brand.live .dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: pulse 2s infinite; }
+  .topbar .brand.err .dot { background: var(--bad); box-shadow: 0 0 10px var(--bad); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .topbar .title { font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text); }
+  .topbar .sub { font-size: 11px; color: var(--muted); }
+  .topbar .spacer { flex: 1; }
+  .topbar .meta { display:flex; align-items:center; gap:18px; font-size: 12px; color: var(--muted); }
+  .topbar .meta code { color: var(--text); }
+  .topbar a.logout { color: var(--muted); text-decoration: none; font-size: 12px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; transition: color .15s, border-color .15s; }
+  .topbar a.logout:hover { color: var(--text); border-color: var(--muted); }
+  main { max-width: 1440px; margin: 0 auto; padding: 28px 24px 56px; }
+
+  /* Hero stats row */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
+  .stat-card {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .stat-card .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin-bottom: 6px; }
+  .stat-card .value { font-size: 32px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; line-height: 1.1; }
+  .stat-card .delta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .stat-card.warn .value { color: var(--warn); }
+  .stat-card.bad .value { color: var(--bad); }
+  .stat-card.ok .value { color: var(--ok); }
+
+  /* Section grid */
+  .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 20px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, 1fr); } }
+  .panel {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .panel header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+  }
+  .panel header .badge { font-size: 10px; background: var(--input-bg); color: var(--text); padding: 2px 7px; border-radius: 4px; letter-spacing: 0; text-transform: none; }
+  .panel .body { padding: 0; }
+  .panel.full { grid-column: 1 / -1; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { padding: 9px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  th { font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); background: rgba(0,0,0,0.15); }
+  td code { background: var(--input-bg); padding: 2px 6px; border-radius: 3px; color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+  td .muted { color: var(--muted); }
+  td .pill { display: inline-block; padding: 2px 7px; font-size: 11px; border-radius: 999px; font-weight: 500; }
+  td .pill.ok { background: rgba(74, 222, 128, 0.12); color: var(--ok); }
+  td .pill.warn { background: rgba(251, 191, 36, 0.12); color: var(--warn); }
+  td .pill.bad { background: rgba(248, 113, 113, 0.12); color: var(--bad); }
+  td .pill.muted { background: var(--input-bg); color: var(--muted); }
+
+  .score-bar { display: inline-flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
+  .score-bar .track { width: 80px; height: 4px; border-radius: 2px; background: var(--input-bg); overflow: hidden; }
+  .score-bar .fill { display: block; height: 100%; background: linear-gradient(90deg, var(--ok), var(--accent)); border-radius: 2px; }
+
+  .empty { padding: 22px 16px; color: var(--muted); font-style: italic; font-size: 12.5px; text-align: center; }
+  .hint { padding: 14px 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .hint code { background: var(--input-bg); padding: 1px 5px; border-radius: 3px; color: var(--text); }
+
+  .banner {
+    margin: 0 0 22px; padding: 12px 16px;
+    background: linear-gradient(90deg, rgba(248, 113, 113, 0.10), rgba(248, 113, 113, 0.02));
+    border: 1px solid rgba(248, 113, 113, 0.30); border-radius: 8px;
+    color: var(--bad); font-size: 12.5px;
+  }
+  .banner strong { color: var(--text); margin-right: 6px; }
+  .banner.warn { background: linear-gradient(90deg, rgba(251, 191, 36, 0.10), rgba(251, 191, 36, 0.02)); border-color: rgba(251, 191, 36, 0.30); color: var(--warn); }
+
+  details { padding: 0 16px; }
+  details summary { padding: 12px 0; cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); list-style: none; user-select: none; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: "▸"; margin-right: 6px; display: inline-block; transition: transform .15s; }
+  details[open] summary::before { transform: rotate(90deg); }
+  details .config-grid { padding: 0 0 16px; display: grid; grid-template-columns: minmax(220px, auto) 1fr; gap: 4px 16px; font-size: 12.5px; }
+  details .config-grid .k { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  details .config-grid .v { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style></head>
+<body>
+<div class="topbar">
+  <div class="brand" id="brand"><span class="dot"></span><span class="title">Proxy Coordinator</span><span class="sub">/ ops</span></div>
+  <div class="spacer"></div>
+  <div class="meta">
+    <span>last update <code id="ts">—</code></span>
+    <span id="state">connecting…</span>
+    <form method="POST" action="/dashboard/logout" style="margin:0">
+      <button type="submit" style="all:unset"><a class="logout" href="/dashboard/logout" onclick="this.closest('form').submit(); return false;">Sign out</a></button>
+    </form>
+  </div>
+</div>
+<main>
+  <div id="banners"></div>
+  <div class="stats" id="stats"></div>
+  <div class="grid">
+    <div class="panel">
+      <header>Active runners <span class="badge" id="runner-count">0</span></header>
+      <div class="body" id="runners"></div>
+    </div>
+    <div class="panel">
+      <header>Active signals <span class="badge" id="signal-count">0</span></header>
+      <div class="body" id="signals"></div>
+    </div>
+    <div class="panel full">
+      <header>Per-proxy state <span class="badge" id="proxy-count">0</span></header>
+      <div class="body" id="proxies"></div>
+    </div>
+    <div class="panel full">
+      <header>Config snapshot</header>
+      <div class="body" id="config"></div>
+    </div>
+  </div>
+</main>
+<script>
+(function(){
+  var PROXY_IDS = ${proxyIdsJs};
+  var REFRESH_MS = 30000;
+  var $ = function(id){ return document.getElementById(id); };
+  var brand = $("brand");
+
+  function fmtTs(ms){ if(!ms) return "—"; var d = new Date(ms); return d.toISOString().replace("T"," ").slice(11,19) + "Z"; }
+  function fmtAge(ms, nowMs){ if(!ms) return "—"; var s = Math.max(0,(nowMs-ms)/1000); if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
+  function fmtDur(ms){ if(ms<=0) return "—"; var s = ms/1000; if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c]; }); }
+
+  function statTile(label, value, cls){
+    return '<div class="stat-card '+(cls||"")+'"><div class="label">'+label+'</div><div class="value">'+esc(String(value))+'</div></div>';
+  }
+
+  function renderStats(data, nowMs){
+    var runners = (data.runners && data.runners.active_runners) || [];
+    var signals = (data.signals && data.signals.active_signals) || [];
+    var proxies = data.proxies || [];
+    var healthyProxies = proxies.filter(function(p){ return !p.banned && !p.error; }).length;
+    var signalCls = signals.length === 0 ? "" : (signals.some(function(s){ return s.kind === "pause_all"; }) ? "bad" : "warn");
+    var html = "";
+    html += statTile("Live runners", runners.length, runners.length > 0 ? "ok" : "");
+    html += statTile("Active signals", signals.length, signalCls);
+    html += statTile("Proxies tracked", proxies.length, "");
+    html += statTile("Healthy proxies", healthyProxies + " / " + proxies.length, healthyProxies === proxies.length && proxies.length > 0 ? "ok" : (healthyProxies === 0 && proxies.length > 0 ? "bad" : ""));
+    $("stats").innerHTML = html;
+  }
+
+  function renderBanners(data){
+    var signals = (data.signals && data.signals.active_signals) || [];
+    if(signals.length === 0){ $("banners").innerHTML = ""; return; }
+    var nowMs = data.server_time || Date.now();
+    var html = "";
+    signals.forEach(function(s){
+      var cls = s.kind === "pause_all" ? "" : "warn";
+      var payload = "";
+      if(s.kind === "throttle_global") payload = "global throttle × " + s.factor;
+      else if(s.kind === "ban_proxy") payload = "ban proxy " + esc(s.proxy_id || "?");
+      else if(s.kind === "pause_all") payload = "PAUSE ALL RUNNERS";
+      else payload = esc(s.kind);
+      var ttl = fmtDur((s.expires_at_ms || 0) - nowMs);
+      html += '<div class="banner '+cls+'"><strong>'+payload+'</strong>· expires in '+ttl;
+      if(s.reason) html += ' · <em>'+esc(s.reason)+'</em>';
+      html += ' · <code>'+esc(s.id)+'</code></div>';
+    });
+    $("banners").innerHTML = html;
+  }
+
+  function renderRunners(data, nowMs){
+    if(!data.runners || !data.runners.active_runners){ $("runners").innerHTML = '<div class="empty">registry unavailable</div>'; $("runner-count").textContent = "0"; return; }
+    var rows = data.runners.active_runners;
+    $("runner-count").textContent = String(rows.length);
+    if(rows.length === 0){ $("runners").innerHTML = '<div class="empty">No live runners</div>'; return; }
+    var html = '<table><tr><th>Holder</th><th>Workflow</th><th>Uptime</th><th>Last heartbeat</th><th>Pool hash</th></tr>';
+    rows.forEach(function(r){
+      var lastAge = nowMs - r.last_heartbeat;
+      var lastCls = lastAge > 120000 ? "warn" : (lastAge > 300000 ? "bad" : "ok");
+      var lastPill = '<span class="pill '+lastCls+'">'+fmtAge(r.last_heartbeat, nowMs)+' ago</span>';
+      html += '<tr><td><code>'+esc(r.holder_id)+'</code></td>'
+        + '<td class="muted">'+esc(r.workflow_name || "—")+'</td>'
+        + '<td class="muted">'+fmtAge(r.started_at, nowMs)+'</td>'
+        + '<td>'+lastPill+'</td>'
+        + '<td><code>'+esc((r.proxy_pool_hash || "").slice(0,10) || "—")+'</code></td></tr>';
+    });
+    html += '</table>';
+    $("runners").innerHTML = html;
+  }
+
+  function renderSignals(data, nowMs){
+    if(!data.signals || !data.signals.active_signals){ $("signals").innerHTML = '<div class="empty">registry unavailable</div>'; $("signal-count").textContent = "0"; return; }
+    var rows = data.signals.active_signals;
+    $("signal-count").textContent = String(rows.length);
+    if(rows.length === 0){ $("signals").innerHTML = '<div class="empty">Cohort healthy — no operator signals</div>'; return; }
+    var html = '<table><tr><th>Kind</th><th>Payload</th><th>Expires</th></tr>';
+    rows.forEach(function(s){
+      var cls = s.kind === "pause_all" ? "bad" : "warn";
+      var payload = "—";
+      if(s.kind === "throttle_global") payload = '× '+esc(s.factor);
+      else if(s.kind === "ban_proxy") payload = '<code>'+esc(s.proxy_id || "?")+'</code>';
+      var ttl = fmtDur((s.expires_at_ms || 0) - nowMs);
+      html += '<tr><td><span class="pill '+cls+'">'+esc(s.kind)+'</span></td><td>'+payload+'</td><td class="muted">in '+ttl+'</td></tr>';
+    });
+    html += '</table>';
+    $("signals").innerHTML = html;
+  }
+
+  function renderConfig(data){
+    if(!data.config){ $("config").innerHTML = '<div class="empty">config-state DO unavailable</div>'; return; }
+    var entries = Object.entries(data.config.values || {});
+    if(entries.length === 0){
+      $("config").innerHTML = '<div class="hint">No operator overrides — all values use env-var defaults from <code>wrangler.toml</code>. Snapshot version <code>'+esc(String(data.config.version||0))+'</code>.</div>';
+      return;
+    }
+    var html = '<details open><summary>'+entries.length+' override(s) · version <code style="text-transform:none;letter-spacing:0">'+esc(String(data.config.version||0))+'</code></summary><div class="config-grid">';
+    entries.forEach(function(kv){
+      html += '<div class="k">'+esc(kv[0])+'</div><div class="v">'+esc(kv[1])+'</div>';
+    });
+    html += '</div></details>';
+    $("config").innerHTML = html;
+  }
+
+  function renderProxies(data){
+    var rows = data.proxies || [];
+    $("proxy-count").textContent = String(rows.length);
+    if(rows.length === 0){
+      $("proxies").innerHTML = '<div class="hint">No proxies queried. Append <code>?proxy_ids=Proxy-1,Proxy-2</code> to this URL to enumerate per-proxy throttle state.</div>';
+      return;
+    }
+    var html = '<table><tr><th>Proxy</th><th>Status</th><th>Health</th><th>Latency</th><th>Wins / Losses</th><th>Wait</th></tr>';
+    rows.forEach(function(p){
+      if(p.error){
+        html += '<tr><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="5"><span class="pill bad">error: '+esc(p.error)+'</span></td></tr>';
+        return;
+      }
+      var statusPill;
+      if(p.banned) statusPill = '<span class="pill bad">banned</span>';
+      else if(p.requires_cf_bypass) statusPill = '<span class="pill warn">cf-bypass</span>';
+      else statusPill = '<span class="pill ok">live</span>';
+      var h = p.health || {};
+      var score = typeof h.score === "number" ? h.score : 0.5;
+      var scoreBar = '<span class="score-bar"><span class="track"><span class="fill" style="width:'+(score*100).toFixed(0)+'%"></span></span><span>'+(score*100).toFixed(0)+'</span></span>';
+      var latency = typeof h.latency_ema_ms === "number" ? h.latency_ema_ms.toFixed(0)+" ms" : "—";
+      var wins = typeof h.success_count === "number" ? h.success_count : 0;
+      var losses = typeof h.failure_count === "number" ? h.failure_count : 0;
+      var waitMs = p.nextAvailableAt ? Math.max(0, p.nextAvailableAt - Date.now()) : 0;
+      html += '<tr><td><code>'+esc(p.proxy_id)+'</code></td>'
+        + '<td>'+statusPill+'</td>'
+        + '<td>'+scoreBar+'</td>'
+        + '<td class="muted">'+esc(latency)+'</td>'
+        + '<td class="muted">'+wins+' / '+losses+'</td>'
+        + '<td class="muted">'+(waitMs > 0 ? waitMs+"ms" : "—")+'</td></tr>';
+    });
+    html += '</table>';
+    $("proxies").innerHTML = html;
+  }
+
+  function setBrandLive(live){
+    brand.classList.toggle("live", !!live);
+    brand.classList.toggle("err", !live);
+  }
+
+  function refresh(){
+    var url = "/ops/snapshot";
+    if(PROXY_IDS) url += "?proxy_ids="+encodeURIComponent(PROXY_IDS);
+    $("state").textContent = "polling…";
+    fetch(url, { credentials: "same-origin" }).then(function(r){
+      if(r.status === 401){ window.location.href = "/"; throw new Error("auth"); }
+      if(r.status !== 200) throw new Error("HTTP "+r.status);
+      return r.json();
+    }).then(function(data){
+      var nowMs = data.server_time || Date.now();
+      renderStats(data, nowMs);
+      renderBanners(data);
+      renderRunners(data, nowMs);
+      renderSignals(data, nowMs);
+      renderConfig(data);
+      renderProxies(data);
+      setBrandLive(true);
+      $("state").textContent = "live";
+      $("ts").textContent = fmtTs(nowMs);
+    }).catch(function(err){
+      setBrandLive(false);
+      $("state").textContent = "error: " + err.message;
+    });
+  }
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body></html>`;
+}
+
+/** CSS shared between login form + dashboard SPA. Single source of
+ *  truth for the color palette + base typography. */
+export function commonDashboardStyles(): string {
+  return `
+  :root {
+    --bg: #0a0e14;
+    --card-bg: #131820;
+    --input-bg: #1c2230;
+    --border: #1f2730;
+    --text: #d4d7e0;
+    --muted: #6e7681;
+    --accent: #38bdf8;
+    --accent-dim: #0ea5e9;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Inter", sans-serif;
+    margin: 0; background: var(--bg); color: var(--text);
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  `;
+}
+
+/** Server-side HTML escape used in the login form's error message slot.
+ *  The dashboard's client-side ``esc()`` covers the live-poll path. */
+export function escapeHtmlForServer(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
