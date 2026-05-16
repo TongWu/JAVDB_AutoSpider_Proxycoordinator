@@ -944,7 +944,7 @@ ${commonDashboardStyles()}
       }).then(function(r){
         if(r.status >= 400){
           r.text().then(function(body){
-            alert("PATCH /config failed: HTTP " + r.status + "\n" + body);
+            alert("PATCH /config failed: HTTP " + r.status + "\\n" + body);
           });
         }
         refresh();

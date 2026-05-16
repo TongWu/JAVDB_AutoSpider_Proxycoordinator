@@ -461,19 +461,24 @@ describe("Phase-3 — inline JS parses without syntax errors", () => {
   const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
 
   it("every <script>...</script> block compiles as a function body", () => {
-    // Catches bugs like ``'today\\'s'`` inside a TS template literal,
-    // where the TS layer eats the backslash and emits ``'today's'`` to
-    // the browser — terminating the JS string mid-word. The Workers
-    // runtime can't ``eval`` here, but ``new Function`` only PARSES the
-    // body; SyntaxErrors propagate without executing the script.
+    // Catches bugs like ``'today\\'s'`` (TS eats the backslash so the
+    // browser receives a broken JS string) or ``"\\n"`` literally
+    // expanded to a newline inside a single-line JS string. The
+    // Workers runtime can't ``eval`` here, but ``new Function`` only
+    // PARSES the body; SyntaxErrors propagate without executing the
+    // script.
     const scriptRe = /<script>([\s\S]*?)<\/script>/g;
     let m: RegExpExecArray | null;
     while ((m = scriptRe.exec(html)) !== null) {
       const body = m[1];
-      // Skip the vendored uPlot blob — it's framework-shaped (IIFE
-      // self-installs onto globalThis) and isn't authored by us, so a
-      // false positive here would be noise.
-      if (body.includes("uPlot") && body.length > 5000) continue;
+      // Skip ONLY the actual vendored uPlot library. The dashboard JS
+      // itself also references ``uPlot`` heavily (``new uPlot(...)``,
+      // chart options) so a substring check would silently skip the
+      // very script this test exists to validate. The vendor blob
+      // starts with the upstream banner — match that prefix exactly.
+      if (body.trimStart().startsWith("/*! https://github.com/leeoniya/uPlot")) {
+        continue;
+      }
       expect(() => new Function(body)).not.toThrow();
     }
   });
