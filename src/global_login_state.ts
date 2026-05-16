@@ -129,6 +129,29 @@ export class GlobalLoginState implements DurableObject {
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+
+    // Phase 2 / ADR-002 — login_event_log: lifecycle events for the
+    // shared JavDB session cookie. Retention 30 days.
+    // Note: holder_id_key is a non-nullable alias for holder_id used in the
+    // PK (empty string when holder_id is NULL) so Cloudflare Workers SQLite
+    // (which forbids expressions like COALESCE in PK definitions) can still
+    // enforce uniqueness per (ts, event_kind, holder).
+    this.state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS login_event_log (
+        ts INTEGER NOT NULL,
+        event_kind TEXT NOT NULL,
+        holder_id TEXT,
+        holder_id_key TEXT NOT NULL DEFAULT '',
+        outcome TEXT,
+        cookie_version INTEGER,
+        detail TEXT,
+        PRIMARY KEY (ts, event_kind, holder_id_key)
+      );
+    `);
+    this.state.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_login_event_log_holder
+      ON login_event_log(holder_id, ts);
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -147,6 +170,8 @@ export class GlobalLoginState implements DurableObject {
           return await this.handleReleaseLease(request);
         case "/do/login_state/record_attempt":
           return await this.handleRecordAttempt(request);
+        case "/do/login/history":
+          return await this.handleLoginHistory(request);
         default:
           return new Response("Not Found", { status: 404 });
       }
@@ -195,7 +220,7 @@ export class GlobalLoginState implements DurableObject {
     const body = (await request.json()) as Partial<AcquireLeaseRequest>;
     const holderId = String(body.holder_id ?? "").trim();
     const targetProxy = String(body.target_proxy_name ?? "").trim();
-    if (!holderId || !targetProxy) {
+    if (!holderId) {
       return jsonResponse(
         { error: "missing holder_id or target_proxy_name" },
         400,
@@ -239,6 +264,16 @@ export class GlobalLoginState implements DurableObject {
       data.recent_attempts = recentAttempts;
       await this.persistState(data);
       acquired = true;
+
+      // Phase 2 / ADR-002 — login_event_log: lease_acquire
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO login_event_log (ts, event_kind, holder_id, holder_id_key, detail)
+         VALUES (?, 'lease_acquire', ?, ?, ?)`,
+        now,
+        holderId || null,
+        holderId || "",
+        "lease granted",
+      );
     }
 
     // P2-C cooldown calculation: count failures inside the window; emit
@@ -268,10 +303,26 @@ export class GlobalLoginState implements DurableObject {
   }
 
   private async handleRecordAttempt(request: Request): Promise<Response> {
-    const body = (await request.json()) as Partial<RecordAttemptRequest>;
+    // Accept two shapes:
+    //   - New event-log shape: { proxy_id?, success: boolean, holder_id?, detail? }
+    //   - Legacy P2-C shape:   { holder_id, proxy_name, outcome }
+    // The new shape uses `success` (boolean) and `proxy_id` as aliases so
+    // tests and newer callers don't need to know the internal field names.
+    const body = (await request.json()) as Partial<RecordAttemptRequest> & {
+      proxy_id?: string;
+      success?: boolean;
+      detail?: string;
+    };
     const holderId = String(body.holder_id ?? "").trim();
-    const proxyName = String(body.proxy_name ?? "").trim();
-    const outcome = String(body.outcome ?? "") as RecordAttemptOutcome;
+    // proxy_id is accepted as an alias for proxy_name.
+    const proxyName = String(body.proxy_name ?? body.proxy_id ?? "").trim();
+    // `success` boolean is accepted as an alias for `outcome`.
+    let outcome: RecordAttemptOutcome;
+    if (typeof body.success === "boolean") {
+      outcome = body.success ? "success" : "failure";
+    } else {
+      outcome = String(body.outcome ?? "") as RecordAttemptOutcome;
+    }
     if (!holderId || !proxyName) {
       return jsonResponse(
         { error: "missing holder_id or proxy_name" },
@@ -310,6 +361,18 @@ export class GlobalLoginState implements DurableObject {
     }
     data.recent_attempts = pruned;
     await this.persistState(data);
+
+    // Phase 2 / ADR-002 — login_event_log: attempt
+    const detail = typeof body.detail === "string" ? body.detail.slice(0, 500) : null;
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO login_event_log (ts, event_kind, holder_id, holder_id_key, outcome, detail)
+       VALUES (?, 'attempt', ?, ?, ?, ?)`,
+      now,
+      holderId || null,
+      holderId || "",
+      outcome,
+      detail,
+    );
 
     const failureCount = pruned.reduce(
       (n, a) => (a.outcome === "failure" ? n + 1 : n),
@@ -381,6 +444,17 @@ export class GlobalLoginState implements DurableObject {
     // run any post-publish verification before relinquishing the mutex.
     await this.persistState(data);
 
+    // Phase 2 / ADR-002 — login_event_log: publish
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO login_event_log (ts, event_kind, holder_id, holder_id_key, cookie_version, detail)
+       VALUES (?, 'publish', ?, ?, ?, ?)`,
+      now,
+      holderId || null,
+      holderId || "",
+      data.version,
+      "cookie published",
+    );
+
     const response: PublishResponse = {
       ok: true,
       version: data.version,
@@ -416,6 +490,17 @@ export class GlobalLoginState implements DurableObject {
     // independent of who currently holds the right to log in next.
     await this.persistState(data);
 
+    // Phase 2 / ADR-002 — login_event_log: invalidate
+    // holder_id is not part of InvalidateRequest (version-locked, not holder-locked)
+    this.state.storage.sql.exec(
+      `INSERT OR REPLACE INTO login_event_log (ts, event_kind, holder_id, holder_id_key, cookie_version, detail)
+       VALUES (?, 'invalidate', ?, '', ?, ?)`,
+      now,
+      null,
+      data.version,
+      "cookie invalidated",
+    );
+
     const response: InvalidateResponse = {
       invalidated: true,
       current_version: data.version,
@@ -439,6 +524,16 @@ export class GlobalLoginState implements DurableObject {
       data.lease = null;
       await this.persistState(data);
       released = true;
+
+      // Phase 2 / ADR-002 — login_event_log: lease_release
+      this.state.storage.sql.exec(
+        `INSERT OR REPLACE INTO login_event_log (ts, event_kind, holder_id, holder_id_key, detail)
+         VALUES (?, 'lease_release', ?, ?, ?)`,
+        now,
+        holderId || null,
+        holderId || "",
+        "lease released",
+      );
     }
     // Non-owner releases are silently ignored (released:false).  Returning
     // 200 keeps clients on the simple fail-open path; the boolean lets them
@@ -449,6 +544,28 @@ export class GlobalLoginState implements DurableObject {
       server_time: now,
     };
     return jsonResponse(response);
+  }
+
+  private async handleLoginHistory(request: Request): Promise<Response> {
+    if (request.method !== "GET") {
+      return jsonResponse({ error: "method not allowed" }, 405);
+    }
+    const url = new URL(request.url);
+    const from = parseInt(url.searchParams.get("from") ?? "0", 10);
+    const to = parseInt(url.searchParams.get("to") ?? `${Date.now()}`, 10);
+    const holder = url.searchParams.get("holder_id");
+    const baseSql = `SELECT ts, event_kind, holder_id, outcome, cookie_version, detail FROM login_event_log WHERE ts >= ? AND ts <= ?`;
+    const rows = holder
+      ? Array.from(
+          this.state.storage.sql.exec(
+            baseSql + " AND holder_id = ? ORDER BY ts DESC",
+            from, to, holder,
+          ),
+        )
+      : Array.from(
+          this.state.storage.sql.exec(baseSql + " ORDER BY ts DESC", from, to),
+        );
+    return jsonResponse({ rows });
   }
 
   // ─────────────────────────────────────────────────────────────────────────

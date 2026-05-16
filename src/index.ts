@@ -116,6 +116,7 @@ function resolveRateLimitCapacity(env: Env): number {
 const GET_ALLOWED_PATHS = new Set<string>([
   "/state",
   "/login_state",
+  "/login/history",
   "/movie_status",
   "/sweep_orphan_stages",
   "/active_runners",
@@ -457,6 +458,14 @@ export default {
             "GET",
             null,
           );
+        // Phase 2 / ADR-002 — login event log history (GlobalLoginState DO)
+        case "/login/history":
+          return await forwardToGlobalLoginStateDo(
+            env,
+            "/do/login/history?" + url.searchParams.toString(),
+            "GET",
+            null,
+          );
         // W5.7 / ADR-003 — MetricsState DO
         case "/metrics/record": {
           const body = await request.json();
@@ -532,6 +541,7 @@ const COOKIE_AUTH_PATHS = new Set<string>([
   "/recommend_proxy",
   "/signals/history",
   "/runners/history",
+  "/login/history",
   "/dashboard/logout",
 ]);
 
