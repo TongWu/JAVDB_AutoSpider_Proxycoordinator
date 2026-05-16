@@ -207,3 +207,35 @@ describe("Phase 4 — drawer shell", () => {
     expect(html).toContain("RANGE_MS");
   });
 });
+
+describe("Phase 4 — signals drill-down", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("Signals panel header has a History button", () => {
+    // Heuristic: between the "Active signals" header text and its closing </header>,
+    // there is a button with data-drawer="signals".
+    expect(html).toMatch(/Active signals[\s\S]*?data-drawer="signals"/);
+  });
+
+  it("signalsDrawerRenderer is defined", () => {
+    expect(html).toContain("function signalsDrawerRenderer(");
+  });
+
+  it("signalsDrawerRenderer fetches /signals/history with from/to from selected range", () => {
+    expect(html).toContain("/signals/history?from=");
+  });
+
+  it("renderSignalsGantt is defined and uses SVG bars per signal", () => {
+    expect(html).toContain("function renderSignalsGantt(");
+    expect(html).toMatch(/<rect /);
+  });
+
+  it("renders an event table after the Gantt chart", () => {
+    // The renderer concatenates the Gantt SVG with a chronological event table.
+    expect(html).toMatch(/<th>Time<\/th>[\s\S]*?<th>Event<\/th>/);
+  });
+
+  it("openDrawer is invoked with the signals title and signalsDrawerRenderer", () => {
+    expect(html).toMatch(/openDrawer\(['"]Signals history['"],\s*signalsDrawerRenderer/);
+  });
+});

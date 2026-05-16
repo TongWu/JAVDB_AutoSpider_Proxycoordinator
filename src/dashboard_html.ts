@@ -110,6 +110,9 @@ ${commonDashboardStyles()}
   details .config-grid { padding: 0 0 16px; display: grid; grid-template-columns: minmax(220px, auto) 1fr; gap: 4px 16px; font-size: 12.5px; }
   details .config-grid .k { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   details .config-grid .v { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .panel-history-btn { background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 8px; font-size: 10px; cursor: pointer; letter-spacing: normal; text-transform: none; }
+  .panel-history-btn:hover { color: var(--text); border-color: var(--muted); }
   .chip-btn { background: var(--input-bg); color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px; cursor: pointer; font-size: 10px; }
   .chip-btn:hover { color: var(--text); }
   .chip { display: inline-block; padding: 2px 10px; margin: 2px; font-size: 11px; border-radius: 999px; cursor: pointer; background: var(--input-bg); color: var(--muted); border: 1px solid var(--border); user-select: none; transition: all .12s; }
@@ -177,7 +180,10 @@ ${commonDashboardStyles()}
       <div class="body" id="runners"></div>
     </div>
     <div class="panel">
-      <header>Active signals <span class="badge" id="signal-count">0</span></header>
+      <header>
+        <span>Active signals <span class="badge" id="signal-count">0</span></span>
+        <button class="panel-history-btn" data-drawer="signals">History →</button>
+      </header>
       <div class="body" id="signals"></div>
     </div>
     <div class="panel full">
@@ -274,6 +280,14 @@ ${commonDashboardStyles()}
     $("proxy-chips").innerHTML = html;
   }
   document.addEventListener("click", function(e){
+    // Phase 4: panel "History →" button → open drawer
+    var hBtn = e.target.closest && e.target.closest("[data-drawer]");
+    if (hBtn) {
+      var which = hBtn.getAttribute("data-drawer");
+      if (which === "signals") openDrawer("Signals history", signalsDrawerRenderer, {});
+      // Tasks 3-6 will add more "which === ..." branches here.
+      return;
+    }
     var chip = e.target.closest && e.target.closest(".chip");
     if (chip) {
       var id = chip.getAttribute("data-proxy-id");
@@ -673,6 +687,81 @@ ${commonDashboardStyles()}
       renderDrawer();
     });
   });
+
+  // ── Phase 4: signals drill-down ─────────────────────────────────────
+  function signalsDrawerRenderer(rangeMs, _ctx){
+    var body = $("drawer-body");
+    body.innerHTML = '<div class="empty">loading…</div>';
+    var to = Date.now();
+    var from = rangeMs > 0 ? to - rangeMs : to - 60000;  // Now → last 60s for tightness
+
+    fetch("/signals/history?from=" + from + "&to=" + to, { credentials: "same-origin" })
+      .then(function(r){ if(r.status !== 200) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function(data){
+        var rows = data.rows || [];
+        if (rows.length === 0){ body.innerHTML = '<div class="empty">No signal events in this window.</div>'; return; }
+
+        // Build Gantt: group by signal_id, find create + matching expire/revoke timestamps.
+        var bySignalId = new Map();
+        rows.forEach(function(r){
+          if (!bySignalId.has(r.signal_id)) bySignalId.set(r.signal_id, []);
+          bySignalId.get(r.signal_id).push(r);
+        });
+
+        var svg = renderSignalsGantt(bySignalId, from, to);
+        var tableRows = rows.map(function(r){
+          var payload = "";
+          try { payload = r.payload_json ? JSON.stringify(JSON.parse(r.payload_json)) : ""; } catch (e) { payload = r.payload_json || ""; }
+          var pillCls = r.event_kind === "create" ? "warn" : "muted";
+          return '<tr><td class="muted">' + esc(fmtTs(r.ts)) + '</td>'
+            + '<td><span class="pill ' + pillCls + '">' + esc(r.event_kind) + '</span></td>'
+            + '<td><code>' + esc(r.signal_kind) + '</code></td>'
+            + '<td><code>' + esc(r.signal_id) + '</code></td>'
+            + '<td class="muted" style="font-size:11px">' + esc(payload) + '</td></tr>';
+        }).join("");
+
+        body.innerHTML = '<div style="margin-bottom:16px">' + svg + '</div>'
+          + '<table><tr><th>Time</th><th>Event</th><th>Kind</th><th>Signal ID</th><th>Payload</th></tr>' + tableRows + '</table>';
+      })
+      .catch(function(err){ body.innerHTML = '<div class="empty">error: ' + esc(err.message) + '</div>'; });
+  }
+
+  function renderSignalsGantt(bySignalId, fromMs, toMs){
+    // SVG Gantt: horizontal time axis, one row per signal_id, bar from create to expire/revoke.
+    var ROW_H = 22, PAD_TOP = 26, PAD_LEFT = 110, RIGHT_PAD = 12;
+    var ids = Array.from(bySignalId.keys());
+    if (ids.length === 0) return '';
+    var width = 600;
+    var height = PAD_TOP + ids.length * ROW_H + 20;
+    var inner = width - PAD_LEFT - RIGHT_PAD;
+    function x(ts){ return PAD_LEFT + (ts - fromMs) / Math.max(1, toMs - fromMs) * inner; }
+
+    var bars = ids.map(function(id, i){
+      var evts = bySignalId.get(id).sort(function(a, b){ return a.ts - b.ts; });
+      var createEv = evts.find(function(e){ return e.event_kind === "create"; });
+      var endEv = evts.find(function(e){ return e.event_kind === "auto_expire" || e.event_kind === "explicit_revoke"; });
+      if (!createEv) return '';
+      var x0 = x(createEv.ts);
+      var x1 = endEv ? x(endEv.ts) : x(toMs);
+      var y = PAD_TOP + i * ROW_H + 4;
+      var col = createEv.signal_kind === "pause_all" ? "#f87171"
+              : createEv.signal_kind === "throttle_global" ? "#fbbf24"
+              : createEv.signal_kind === "ban_proxy" ? "#a78bfa"
+              : "#38bdf8";
+      return '<rect x="' + x0 + '" y="' + y + '" width="' + Math.max(1, x1 - x0) + '" height="14" fill="' + col + '" opacity="0.7" />'
+        + '<text x="' + (PAD_LEFT - 6) + '" y="' + (y + 11) + '" text-anchor="end" font-size="10" fill="#6e7681">' + esc(String(id).slice(0, 12)) + '</text>';
+    }).join("");
+
+    // Time axis: 4 ticks across.
+    var ticks = "";
+    for (var t = 0; t <= 4; t++){
+      var tickTs = fromMs + (toMs - fromMs) * (t/4);
+      var tx = PAD_LEFT + inner * (t/4);
+      ticks += '<line x1="' + tx + '" y1="' + (PAD_TOP - 4) + '" x2="' + tx + '" y2="' + (height - 18) + '" stroke="#1f2730" />'
+        + '<text x="' + tx + '" y="' + (height - 6) + '" text-anchor="middle" font-size="10" fill="#6e7681">' + esc(fmtTs(tickTs)) + '</text>';
+    }
+    return '<svg width="' + width + '" height="' + height + '" style="max-width:100%">' + ticks + bars + '</svg>';
+  }
 
   function refresh(){
     $("state").textContent = "polling…";
