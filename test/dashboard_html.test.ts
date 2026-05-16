@@ -341,3 +341,150 @@ describe("Phase 4 — per-proxy drill-down", () => {
     expect(html).toContain("proxy-chart-wait");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase-2 ADR-008 — signal mutation buttons + inline config editor.
+// These checks pin down the strings that the click delegator dispatches
+// on, so a refactor that renames `data-op="throttle-global"` (etc.)
+// breaks the test rather than silently breaking the dashboard.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("Phase-2 — runtime signal mutation UI", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("renders Throttle Global x2 button with data-op + factor attributes", () => {
+    expect(html).toContain('data-op="throttle-global"');
+    expect(html).toContain('data-factor="2"');
+    expect(html).toContain("Throttle global");
+  });
+
+  it("renders Throttle Global x4 button", () => {
+    expect(html).toContain('data-factor="4"');
+  });
+
+  it("renders Pause all runners button", () => {
+    expect(html).toContain('data-op="pause-all"');
+    expect(html).toContain("Pause all runners");
+  });
+
+  it("renders Resume (clear signals) button conditional on hasAnySig", () => {
+    expect(html).toContain('data-op="resume-signals"');
+    expect(html).toContain("Resume (clear signals)");
+  });
+
+  it("dispatches throttle_global signal via POST /signal", () => {
+    // Click handler body should construct the right body for the throttle button.
+    expect(html).toContain('kind: "throttle_global"');
+    expect(html).toMatch(/postJson\(\s*"\/signal"/);
+  });
+
+  it("dispatches pause_all signal via POST /signal", () => {
+    expect(html).toContain('kind: "pause_all"');
+  });
+
+  it("dispatches resume signal via POST /signal", () => {
+    expect(html).toContain('kind: "resume"');
+  });
+
+  it("removes the old Phase-1 disabled placeholder text", () => {
+    // Make sure the disabled buttons that were placeholder in Phase 1
+    // have been replaced. We assert the absence of the placeholder
+    // tooltip so renaming the buttons doesn't silently re-introduce
+    // a disabled state.
+    expect(html).not.toContain('title="Enabled in Phase 2 (Python consumer)"');
+    expect(html).not.toContain("Edit config inline");
+  });
+});
+
+describe("Phase-2 — inline config editor", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("renderConfig emits an edit button per key with data-edit-config", () => {
+    expect(html).toContain('data-edit-config="');
+  });
+
+  it("edit handler PATCHes /config using single-key audit format", () => {
+    // The body posted via fetch("/config", { method: "PATCH" }, ...) must
+    // be a single-key shape so each PATCH leaves one audit row, not many.
+    expect(html).toMatch(/method:\s*"PATCH"/);
+    expect(html).toMatch(/key:\s*editKey/);
+    expect(html).toMatch(/value:\s*newValue/);
+    expect(html).toMatch(/reason:\s*reason3/);
+  });
+
+  it("prompts with the current value pre-filled from data_last_snapshot", () => {
+    expect(html).toContain("data_last_snapshot");
+    expect(html).toContain("config.merged");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase-3 ADR-008 — MovieClaim / WorkDistributor panels + responsive CSS.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("Phase-3 — MovieClaim + WorkDistributor panels", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("renders the Today's Claims panel with badge slot", () => {
+    expect(html).toContain('id="movie-claim-stats"');
+    expect(html).toContain('id="movie-claim-badge"');
+    expect(html).toContain("Today's Claims");
+  });
+
+  it("renders the Work queue panel with badge slot", () => {
+    expect(html).toContain('id="work-stats"');
+    expect(html).toContain('id="work-queue-badge"');
+    expect(html).toContain("Work queue");
+  });
+
+  it("renderMovieClaimStats reads claims_active + staged + committed fields", () => {
+    expect(html).toContain("movie_claim_stats");
+    expect(html).toContain("claims_active");
+    expect(html).toContain("staged_count");
+    expect(html).toContain("completed_committed_count");
+    expect(html).toContain("dead_lettered_count");
+  });
+
+  it("renderWorkStats reads queue_size + visible + leased fields", () => {
+    expect(html).toContain("work_stats");
+    expect(html).toContain("queue_size");
+    expect(html).toContain("oldest_enqueued_at_ms");
+  });
+
+  it("renderers are invoked from refresh()", () => {
+    expect(html).toContain("renderMovieClaimStats(data)");
+    expect(html).toContain("renderWorkStats(data)");
+  });
+});
+
+describe("Phase-3 — responsive CSS + chart sizing", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("includes a max-width: 480px breakpoint", () => {
+    expect(html).toContain("max-width: 480px");
+  });
+
+  it("clamps drawer width under viewport on narrow screens", () => {
+    expect(html).toContain("min(360px, 95vw)");
+  });
+
+  it("makes panel bodies horizontally scrollable in mobile breakpoint", () => {
+    expect(html).toContain("overflow-x: auto");
+  });
+
+  it("makes the first table column sticky for horizontal scroll", () => {
+    expect(html).toContain("position: sticky");
+  });
+
+  it("declares the ResizeObserver-backed chart resize plumbing", () => {
+    expect(html).toContain("ResizeObserver");
+    expect(html).toContain("ensureChartResizeObserver");
+    expect(html).toContain("attachChartResize");
+  });
+
+  it("chartOptions now derives width from container instead of hard-coding 360", () => {
+    expect(html).toContain("chartWidthFor(panelId)");
+    // The old hard-coded width: 360 in chartOptions is gone.
+    expect(html).not.toMatch(/chartOptions\s*\(\s*[^)]*\)\s*{\s*return\s*{\s*width:\s*360/);
+  });
+});
