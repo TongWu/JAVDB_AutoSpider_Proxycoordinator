@@ -120,6 +120,7 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/sweep_orphan_stages",
   "/active_runners",
   "/config",
+  "/config/history",
   "/signals",
   "/signals/history",
   "/runners/history",
@@ -441,10 +442,21 @@ export default {
         case "/config": {
           if (request.method === "PATCH") {
             const body = await request.json();
-            return await forwardToConfigStateDo(env, "/do/patch", "POST", body);
+            // Phase 2 / ADR-002 — pass actor headers so the DO can write the
+            // audit row with the correct actor identity and actor_kind.
+            return await forwardToConfigStateDo(env, "/do/patch", "POST", body, request);
           }
           return await forwardToConfigStateDo(env, "/do/config", "GET", null);
         }
+        // Phase 2 / ADR-002 — config audit log history (DO-internal endpoint
+        // exposed at the Worker level; full Task 11 may extend further).
+        case "/config/history":
+          return await forwardToConfigStateDo(
+            env,
+            "/do/config/history?" + url.searchParams.toString(),
+            "GET",
+            null,
+          );
         // W5.7 / ADR-003 — MetricsState DO
         case "/metrics/record": {
           const body = await request.json();
@@ -823,12 +835,17 @@ async function forwardToRunnerRegistryDo(
  * Returns 503 when the binding is missing (v4 migration not yet applied),
  * mirroring the runner-registry fallback path: clients treat 503 as
  * "config DO unavailable, use env-var defaults" and continue.
+ *
+ * Phase 2 / ADR-002: when ``originalRequest`` is supplied (PATCH path only),
+ * the ``x-actor`` and ``x-actor-kind`` headers from the original Worker
+ * request are forwarded to the DO so the audit log captures the caller identity.
  */
 async function forwardToConfigStateDo(
   env: Env,
   path: string,
   method: "GET" | "POST",
   body: unknown,
+  originalRequest?: Request,
 ): Promise<Response> {
   if (!env.CONFIG_STATE_DO) {
     return jsonResponse(
@@ -838,12 +855,22 @@ async function forwardToConfigStateDo(
   }
   const id = env.CONFIG_STATE_DO.idFromName("global-config");
   const stub = env.CONFIG_STATE_DO.get(id);
+
+  // Build actor-header passthrough for PATCH calls that carry audit metadata.
+  const actorHeaders: Record<string, string> = {};
+  if (originalRequest) {
+    const actor = originalRequest.headers.get("x-actor");
+    const actorKind = originalRequest.headers.get("x-actor-kind");
+    if (actor) actorHeaders["x-actor"] = actor;
+    if (actorKind) actorHeaders["x-actor-kind"] = actorKind;
+  }
+
   const init: RequestInit =
     method === "GET"
       ? { method: "GET" }
       : {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...actorHeaders },
           body: JSON.stringify(body ?? {}),
         };
   const upstream = await stub.fetch(`https://do${path}`, init);
