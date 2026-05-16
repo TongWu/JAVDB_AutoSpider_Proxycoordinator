@@ -4,7 +4,7 @@ Cloudflare Worker + Durable Objects that coordinate **per-proxy request
 pacing** *and* **shared JavDB login state** across multiple GitHub Actions
 runners for the JavDB spider.
 
-Five cooperating Durable Object classes live behind the same Worker and
+Six cooperating Durable Object classes live behind the same Worker and
 the same bearer token:
 
 - `ProxyCoordinator` (per-proxy DO, addressed by `idFromName(proxy_id)`):
@@ -23,6 +23,9 @@ the same bearer token:
 - `ConfigState` (singleton, `idFromName("global-config")`):
   W5.3 — versioned snapshot of operator-tunable runtime parameters that
   runners pull on every heartbeat without a redeploy.
+- `WorkDistributor` (singleton, `idFromName("global-work")`):
+  W5.2 — deduplicated FIFO work queue with visibility leases. Active
+  dispatch alternative to MovieClaim's defensive mutex model.
 
 ## Why
 
@@ -73,8 +76,16 @@ Runner N ─┘   (auth +           │
                                 │     /register + /heartbeat + /unregister
                                 │     /signal + /signals               (W5.4)
                                 │
-                                └──> ConfigState (singleton)            (W5.3)
-                                      /config (GET, PATCH)
+                                ├──> ConfigState (singleton)            (W5.3)
+                                │     /config (GET, PATCH)
+                                │
+                                └──> WorkDistributor (singleton)        (W5.2)
+                                      /work/{enqueue,pull,complete,release,stats}
+
+Ops aggregators served directly by Worker (W5.1 + W5.5):
+  GET /dashboard            HTML SPA, 30 s auto-refresh
+  GET /ops/snapshot         cross-DO JSON aggregate
+  GET /recommend_proxy      cross-DO health-ranked proxy list
 ```
 
 Every DO class has **separate bindings** and **separate storage**:
@@ -91,6 +102,7 @@ rotating one cannot disrupt the others.
 | `src/movie_claim_state.ts` | `MovieClaimState` per-day DO: cross-runner detail-page mutex (P1-B), failure cooldown (P2-A), staged-commit (Phase-1) |
 | `src/runner_registry.ts` | `RunnerRegistry` singleton DO: live runner list + drift detection + W5.4 operator signals |
 | `src/config_state.ts` | `ConfigState` singleton DO (W5.3): versioned snapshot of operator-tunable runtime config |
+| `src/work_distributor.ts` | `WorkDistributor` singleton DO (W5.2): dedup'd FIFO queue with visibility leases |
 | `src/types.ts` | Env / payload / response type definitions for every DO |
 | `test/proxy_coordinator.test.ts` | Vitest suite (43 tests) — throttle math, auth, P2-D health snapshots |
 | `test/global_login_state.test.ts` | Vitest suite (46 tests) — lease, publish, invalidate, encryption, isolation |
@@ -99,8 +111,11 @@ rotating one cannot disrupt the others.
 | `test/config_state.test.ts` | Vitest suite (11 tests, W5.3) — GET / PATCH / heartbeat embedding |
 | `test/signals.test.ts` | Vitest suite (10 tests, W5.4) — POST /signal validation + register/heartbeat embedding |
 | `test/rate_limit.test.ts` | Vitest suite (10 tests, W5.6) — token-bucket math + fetch-handler integration |
+| `test/dashboard.test.ts` | Vitest suite (14 tests, W5.1) — HTML route + /ops/snapshot aggregation |
+| `test/recommend_proxy.test.ts` | Vitest suite (11 tests, W5.5) — cross-DO health ranking + filters |
+| `test/work_distributor.test.ts` | Vitest suite (16 tests, W5.2) — enqueue / pull / complete / release / stats |
 
-Total: **216 tests** across 7 files.
+Total: **257 tests** across 10 files.
 
 ## Auth
 
@@ -154,7 +169,7 @@ GitHub repo Variables as `PROXY_COORDINATOR_URL`.
 ```bash
 npm install
 npx wrangler dev          # http://localhost:8787
-npx vitest run            # 216 unit tests
+npx vitest run            # 257 unit tests
 npx tsc --noEmit          # type-check
 ```
 
@@ -348,6 +363,122 @@ parses `HeartbeatResult.active_signals` into a typed `Signal` list but
 same scope decision as W5.3 — distribution mechanism first, consumer
 integration in a follow-up.
 
+## Runtime observability dashboard (W5.1)
+
+Two routes ship a self-contained ops dashboard for the deployment:
+
+- `GET /dashboard` — HTML SPA (vanilla JS, inline CSS, no CDN deps).
+  Polls `/ops/snapshot` every 30 s. Four panels: active runners, active
+  signals (W5.4), config snapshot (W5.3), per-proxy throttle state.
+- `GET /ops/snapshot` — JSON aggregate the SPA polls. Same payload an
+  external monitor can consume.
+
+Both routes accept the Bearer token via either:
+
+- `Authorization: Bearer <token>` header (existing convention), or
+- `?token=<token>` query parameter (browser-bookmark workflow).
+
+The query-token fallback is **only** enabled for these two paths
+(see `QUERY_TOKEN_PATHS` in `src/index.ts`). Every other endpoint still
+requires the header. Tokens-in-URLs end up in browser history and
+Worker access logs — treat the dashboard URL as a secret bookmark and
+rotate `PROXY_COORDINATOR_TOKEN` if it leaks.
+
+Proxy enumeration: pass the IDs you want to inspect via
+`?proxy_ids=Proxy-1,Proxy-2,...` (comma-separated, capped at 32). The
+Worker has no master proxy list (each `ProxyCoordinator` DO is
+addressed per-id), so this is the operator's call.
+
+`GlobalLoginState` is **deliberately omitted** from the snapshot
+(the decrypted cookie must never ride along in a URL-token payload).
+
+```bash
+# Open in a browser:
+https://your.worker.dev/dashboard?token=$TOKEN&proxy_ids=Proxy-1,Proxy-2
+
+# Or fetch the raw JSON:
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://your.worker.dev/ops/snapshot?proxy_ids=Proxy-1,Proxy-2"
+```
+
+## Smart proxy selection (W5.5)
+
+Stateless aggregator that fans out to every `ProxyCoordinator` DO and
+returns the IDs ranked by health score. Lets a runner avoid re-deriving
+health locally.
+
+- `GET /recommend_proxy?proxy_ids=A,B,C&top_n=3&include_unhealthy=0`
+
+Ranking:
+
+1. `health.score` descending (clamped to `[0, 1]`; banned proxies = -1)
+2. `health.latency_ema_ms` ascending for ties
+3. `proxy_id` ascending for fully-stable tie-break
+
+By default, banned / unavailable proxies are filtered out so a runner
+can blindly take `recommendations[0]`. Pass `?include_unhealthy=1` to
+see them ranked last (ops debugging). Never-leased proxies get the
+neutral score 0.5 so a brand-new proxy gets some traffic on first use
+instead of being excluded entirely. Fan-out is capped at 32 proxy IDs.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://your.worker.dev/recommend_proxy?proxy_ids=Proxy-1,Proxy-2,Proxy-3"
+# → {"recommendations":[{proxy_id, score, latency_ema_ms, ...}], ...}
+```
+
+This commit ships ONLY the selection aggregator. Pool management
+(`/add_proxy` / `/remove_proxy`) needs KV (Paid plan) or a new
+pool-registry DO and is intentionally deferred — operators already
+manage the pool via the `PROXY_POOL_JSON` GitHub secret.
+
+## Work distribution (W5.2)
+
+Singleton `WorkDistributor` DO maintains a deduplicated FIFO work queue
+with visibility leases. Active dispatch alternative to MovieClaim's
+defensive per-href mutex; the two coexist so operators can flip between
+coordination models without a coordinated client deploy.
+
+**Scope note:** this section documents the Worker-side surface. The
+Python spider client is NOT yet updated — actually switching the fetch
+loop to pull from this queue (instead of iterating its locally-
+discovered href list + MovieClaim) is a separate downstream decision.
+
+| Method + path | Body | Purpose |
+|---|---|---|
+| `POST /work/enqueue` | `{items: [{key, payload?}], replace_existing?}` | Add items, dedup by `key`. `replace_existing=true` overwrites payload while preserving `enqueued_at` + `attempt_count`. Capped at 100 items per call. |
+| `POST /work/pull` | `{holder_id, max_items?, visibility_timeout_ms?}` | FIFO pull (default 10 items, server caps at 100). Each pulled item gets a visibility lease (default 5 min, clamped to `[1s, 1h]`). `attempt_count` increments on every pull. |
+| `POST /work/complete` | `{holder_id, keys[]}` | Remove items. Non-owner completes are silently skipped (lease may have expired and another puller now owns it). |
+| `POST /work/release` | `{holder_id, keys[]}` | Return items to the visible pool without marking done. Same non-owner skip rule. |
+| `GET /work/stats` | — | `{queue_size, visible, leased, oldest_enqueued_at_ms, server_time}` for ops dashboards. |
+
+Visibility leases auto-expire and the DO's GC alarm purges them every
+5 minutes; pull also runs inline expiry filtering so a freshly-arrived
+puller sees the correct visible set even between alarms.
+
+```bash
+# Producer enqueues hrefs
+curl -X POST https://your.worker.dev/work/enqueue \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"items":[{"key":"/v/ABC-123"},{"key":"/v/XYZ-456"}]}'
+
+# Consumer pulls
+curl -X POST https://your.worker.dev/work/pull \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"holder_id":"runner-1","max_items":5}'
+
+# Consumer acknowledges completion
+curl -X POST https://your.worker.dev/work/complete \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"holder_id":"runner-1","keys":["/v/ABC-123"]}'
+
+# Ops snapshot of queue depth
+curl -H "Authorization: Bearer $TOKEN" https://your.worker.dev/work/stats
+```
+
 ## Rate limit (W5.6)
 
 Every authenticated request runs through a per-Bearer-token token-bucket
@@ -364,13 +495,14 @@ probe can still verify the Worker is reachable.
 
 ## DO migrations
 
-`wrangler.toml` declares four migration tags:
+`wrangler.toml` declares five migration tags:
 
 - `v1`: introduces `ProxyCoordinator` (per-proxy throttle DO).
 - `v2`: introduces `GlobalLoginState` (singleton login state DO).
 - `v3`: introduces `MovieClaimState` (per-day claim DO) + `RunnerRegistry`
   (singleton ops/drift DO) in one atomic deploy.
 - `v4`: introduces `ConfigState` (singleton W5.3 config DO).
+- `v5`: introduces `WorkDistributor` (singleton W5.2 work-queue DO).
 
 Migrations are applied in tag order on every `wrangler deploy`; do **not**
 reorder or delete an earlier tag — that would re-create its DO class
