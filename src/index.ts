@@ -382,8 +382,36 @@ export default {
         // SPA (cookie-authed) AND by external monitoring scripts
         // (Bearer-authed). /dashboard + / are served pre-switch by
         // handleDashboardPublic so they can also render the login form.
-        case "/ops/snapshot":
-          return await aggregateOpsSnapshot(env, url);
+        case "/ops/snapshot": {
+          const snapResp = await aggregateOpsSnapshot(env, url);
+          // Phase 2 / ADR-003 — also persist for time-series. Source
+          // tag distinguishes from cron-driven writes. Fire-and-forget
+          // via waitUntil so the response is not blocked.
+          if (env.METRICS_STATE_DO) {
+            const cloned = snapResp.clone();
+            _ctx.waitUntil((async () => {
+              try {
+                const payload = await cloned.json();
+                // Use forwardToMetricsStateDo (which buffers the response body
+                // via .text()) rather than stub.fetch() directly. The
+                // body-buffering step prevents the SQLite WAL isolated-storage
+                // error in vitest-pool-workers and mirrors the same pattern used
+                // by the cron scheduled handler (Task 9 / ADR-003).
+                await forwardToMetricsStateDo(
+                  env,
+                  "/do/metrics/record",
+                  "POST",
+                  { ts: Date.now(), payload, source: "dashboard" },
+                );
+              } catch (err) {
+                console.warn("dashboard metrics write failed", {
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            })());
+          }
+          return snapResp;
+        }
         // W5.5 — cross-DO health aggregation; returns proxy IDs ranked
         // by their most-recent ProxyCoordinator health snapshot.
         case "/recommend_proxy":
@@ -992,17 +1020,49 @@ async function embedConfigSnapshot(env: Env, resp: Response): Promise<Response> 
  * Fail-open: each sub-fetch is independent; a single DO timing out
  * surfaces as `null` in its slot rather than failing the whole snapshot.
  */
+/**
+ * Phase 2 / ADR-004 — fetch the full list of known proxy_ids from
+ * RunnerRegistry's proxies_seen table. Used by /ops/snapshot when no
+ * explicit ?proxy_ids is given.
+ *
+ * Fail-open: any error returns an empty list, which the snapshot
+ * handler then renders as "no proxies seen yet" instead of crashing.
+ *
+ * Capped at 100 to bound fan-out cost. Operators with more than 100
+ * proxies should be using explicit ?proxy_ids filtering on the
+ * dashboard side anyway.
+ */
+async function fetchSeenProxyIds(env: Env): Promise<string[]> {
+  if (!env.RUNNER_REGISTRY_DO) return [];
+  try {
+    const id = env.RUNNER_REGISTRY_DO.idFromName("runners");
+    const stub = env.RUNNER_REGISTRY_DO.get(id);
+    const r = await stub.fetch("https://do/do/proxies_seen", { method: "GET" });
+    if (r.status !== 200) return [];
+    const data = (await r.json()) as {
+      proxies?: Array<{ id: string }>;
+    };
+    return (data.proxies ?? []).map((p) => p.id).slice(0, 100);
+  } catch {
+    return [];
+  }
+}
+
 async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
   const rawIds = (url.searchParams.get("proxy_ids") ?? "").trim();
-  // Cap at 32 to bound the fan-out fan-in fan-cost; ops dashboards
-  // monitor a handful of proxies at a time, not entire blast radius.
-  const proxyIds = rawIds
-    ? rawIds
-        .split(",")
-        .map((s) => normalizeProxyId(s.trim()))
-        .filter((s) => s !== "")
-        .slice(0, 32)
-    : [];
+  let proxyIds: string[] = [];
+  if (rawIds) {
+    // Caller explicitly listed proxy IDs — honour them (backward compat for
+    // external monitoring scripts).
+    proxyIds = rawIds
+      .split(",")
+      .map((s) => normalizeProxyId(s.trim()))
+      .filter((s) => s !== "")
+      .slice(0, 32);
+  } else {
+    // Phase 2 / ADR-004 — auto-enumerate from proxies_seen.
+    proxyIds = await fetchSeenProxyIds(env);
+  }
 
   const now = Date.now();
 
