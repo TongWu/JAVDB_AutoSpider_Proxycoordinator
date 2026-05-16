@@ -314,3 +314,30 @@ describe("Phase 4 — config drill-down", () => {
     expect(html).toMatch(/openDrawer\(['"]Config audit['"],\s*configDrawerRenderer/);
   });
 });
+
+describe("Phase 4 — per-proxy drill-down", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("perProxyDrawerRenderer is defined and queries /metrics/range", () => {
+    expect(html).toContain("function perProxyDrawerRenderer(");
+    expect(html).toContain("/metrics/range?from=");
+  });
+
+  it("per-proxy table rows have data-proxy-row attribute (for click-to-open)", () => {
+    expect(html).toContain('data-proxy-row');
+  });
+
+  it("declares renderProxyChartSuccessFailure and renderProxyChartWait", () => {
+    expect(html).toContain("function renderProxyChartSuccessFailure(");
+    expect(html).toContain("function renderProxyChartWait(");
+  });
+
+  it("click handler routes per-proxy rows to openDrawer with proxy_id context", () => {
+    expect(html).toMatch(/openDrawer\([^)]*?perProxyDrawerRenderer[^)]*?proxy_id/);
+  });
+
+  it("drawer renders two chart slots (success/failure + wait)", () => {
+    expect(html).toContain("proxy-chart-sf");
+    expect(html).toContain("proxy-chart-wait");
+  });
+});

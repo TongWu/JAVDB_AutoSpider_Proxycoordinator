@@ -293,6 +293,13 @@ ${commonDashboardStyles()}
     $("proxy-chips").innerHTML = html;
   }
   document.addEventListener("click", function(e){
+    // Phase 4: clicking a proxy row opens its drill-down drawer
+    var pRow = e.target.closest && e.target.closest("[data-proxy-row]");
+    if (pRow) {
+      var pid = pRow.getAttribute("data-proxy-row");
+      openDrawer("Proxy detail — " + pid, perProxyDrawerRenderer, { proxy_id: pid });
+      return;
+    }
     // Phase 4: panel "History →" button → open drawer
     var hBtn = e.target.closest && e.target.closest("[data-drawer]");
     if (hBtn) {
@@ -447,7 +454,7 @@ ${commonDashboardStyles()}
     var html = '<table><tr><th>Proxy</th><th>Status</th><th>Health</th><th>Latency</th><th>Wins / Losses</th><th>Wait</th></tr>';
     rows.forEach(function(p){
       if(p.error){
-        html += '<tr><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="5"><span class="pill bad">error: '+esc(p.error)+'</span></td></tr>';
+        html += '<tr data-proxy-row="' + esc(p.proxy_id) + '" style="cursor:pointer"><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="5"><span class="pill bad">error: '+esc(p.error)+'</span></td></tr>';
         return;
       }
       var statusPill;
@@ -461,7 +468,7 @@ ${commonDashboardStyles()}
       var wins = typeof h.success_count === "number" ? h.success_count : 0;
       var losses = typeof h.failure_count === "number" ? h.failure_count : 0;
       var waitMs = p.nextAvailableAt ? Math.max(0, p.nextAvailableAt - Date.now()) : 0;
-      html += '<tr><td><code>'+esc(p.proxy_id)+'</code></td>'
+      html += '<tr data-proxy-row="' + esc(p.proxy_id) + '" style="cursor:pointer"><td><code>'+esc(p.proxy_id)+'</code></td>'
         + '<td>'+statusPill+'</td>'
         + '<td>'+scoreBar+'</td>'
         + '<td class="muted">'+esc(latency)+'</td>'
@@ -892,6 +899,79 @@ ${commonDashboardStyles()}
         body.innerHTML = html;
       })
       .catch(function(err){ body.innerHTML = '<div class="empty">error: ' + esc(err.message) + '</div>'; });
+  }
+
+  // ── Phase 4: per-proxy drill-down ───────────────────────────────────
+  function perProxyDrawerRenderer(rangeMs, ctx){
+    var body = $("drawer-body");
+    body.innerHTML = '<div class="empty">loading…</div>';
+    var pid = ctx.proxy_id;
+    var to = Date.now();
+    var from = rangeMs > 0 ? to - rangeMs : to - 60 * 60000;  // Now → last 1h
+
+    fetch("/metrics/range?from=" + from + "&to=" + to, { credentials: "same-origin" })
+      .then(function(r){ if(r.status !== 200) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function(data){
+        var snapshots = data.rows || [];
+        if (snapshots.length === 0){ body.innerHTML = '<div class="empty">No metrics in this window.</div>'; return; }
+
+        body.innerHTML = ''
+          + '<div style="margin-bottom:18px">'
+          +   '<h4 style="font-size:11px;text-transform:uppercase;color:var(--muted);margin:0 0 6px">Success / Failure cumulative</h4>'
+          +   '<div id="proxy-chart-sf" style="height:180px"></div>'
+          + '</div>'
+          + '<div style="margin-bottom:18px">'
+          +   '<h4 style="font-size:11px;text-transform:uppercase;color:var(--muted);margin:0 0 6px">Wait time (ms)</h4>'
+          +   '<div id="proxy-chart-wait" style="height:180px"></div>'
+          + '</div>';
+
+        renderProxyChartSuccessFailure(snapshots, pid, $("proxy-chart-sf"));
+        renderProxyChartWait(snapshots, pid, $("proxy-chart-wait"));
+      })
+      .catch(function(err){ body.innerHTML = '<div class="empty">error: ' + esc(err.message) + '</div>'; });
+  }
+
+  function renderProxyChartSuccessFailure(snapshots, pid, container){
+    var ts = snapshots.map(function(s){ return Math.floor(s.ts/1000); });
+    var succ = snapshots.map(function(s){
+      var p = ((s.payload.proxies) || []).find(function(x){ return x.proxy_id === pid; });
+      return p && p.health ? p.health.success_count : null;
+    });
+    var fail = snapshots.map(function(s){
+      var p = ((s.payload.proxies) || []).find(function(x){ return x.proxy_id === pid; });
+      return p && p.health ? p.health.failure_count : null;
+    });
+    var width = container.clientWidth || 400;
+    new uPlot({
+      title: "", width: width, height: 180,
+      cursor: { drag: { x: false } },
+      legend: { show: true },
+      scales: { x: { time: true } },
+      series: [
+        {},
+        { label: "success (cum)", stroke: "#4ade80", width: 2, fill: "rgba(74,222,128,0.15)" },
+        { label: "failure (cum)", stroke: "#f87171", width: 2, fill: "rgba(248,113,113,0.15)" },
+      ],
+      axes: [{ stroke: "#6e7681" }, { stroke: "#6e7681" }],
+    }, [ts, succ, fail], container);
+  }
+
+  function renderProxyChartWait(snapshots, pid, container){
+    var ts = snapshots.map(function(s){ return Math.floor(s.ts/1000); });
+    var wait = snapshots.map(function(s){
+      var p = ((s.payload.proxies) || []).find(function(x){ return x.proxy_id === pid; });
+      if (!p || !p.nextAvailableAt) return 0;
+      var w = p.nextAvailableAt - s.ts;
+      return w > 0 ? w : 0;
+    });
+    var width = container.clientWidth || 400;
+    new uPlot({
+      title: "", width: width, height: 180,
+      legend: { show: false },
+      scales: { x: { time: true } },
+      series: [{}, { label: "wait_ms", stroke: "#fbbf24", width: 2, fill: "rgba(251,191,36,0.15)" }],
+      axes: [{ stroke: "#6e7681" }, { stroke: "#6e7681" }],
+    }, [ts, wait], container);
   }
 
   function refresh(){
