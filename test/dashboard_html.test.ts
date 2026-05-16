@@ -141,3 +141,33 @@ describe("Phase 3 — chart scaffolding", () => {
     expect(matches.length).toBe(5);
   });
 });
+
+describe("Phase 3 — 5 priority charts", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("declares all 5 chart renderer functions", () => {
+    expect(html).toContain("renderChartRunners");
+    expect(html).toContain("renderChartQueue");
+    expect(html).toContain("renderChartCfBypass");
+    expect(html).toContain("renderChartLatency");
+    expect(html).toContain("renderChartHealth");
+  });
+
+  it("fetches /metrics/range on each refresh", () => {
+    expect(html).toContain("/metrics/range");
+  });
+
+  it("uses uPlot for the 4 time-series charts", () => {
+    expect(html).toContain("new uPlot");
+  });
+
+  it("renders the donut without uPlot (custom SVG)", () => {
+    // Donut function uses inline <svg width=... viewBox=...
+    expect(html).toMatch(/renderChartCfBypass[\s\S]*?<svg/);
+  });
+
+  it("CHARTS_RANGE_MS defaults to 1 hour", () => {
+    // 1h = 60 * 60 * 1000 = 3600000
+    expect(html).toMatch(/CHARTS_RANGE_MS\s*=\s*60\s*\*\s*60\s*\*\s*1000/);
+  });
+});

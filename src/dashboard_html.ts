@@ -402,25 +402,200 @@ ${commonDashboardStyles()}
     brand.classList.toggle("err", !live);
   }
 
+  // ── Phase 3: charts ─────────────────────────────────────────────────
+  var CHARTS_RANGE_MS = 60 * 60 * 1000;  // last 1h on main view
+  var charts = {};  // chart-id → uPlot instance for cleanup
+
+  function chartOptions(seriesDef){
+    return {
+      width: 360, height: 180,
+      cursor: { drag: { x: false } },
+      legend: { show: false },
+      scales: { x: { time: true } },
+      series: seriesDef,
+      padding: [8, 12, 12, 36],
+      axes: [
+        { stroke: "#6e7681", grid: { stroke: "#1f2730" } },
+        { stroke: "#6e7681", grid: { stroke: "#1f2730" } },
+      ],
+    };
+  }
+
+  function destroyChart(id){
+    if(charts[id]){
+      try { charts[id].destroy(); } catch(e) {}
+      delete charts[id];
+    }
+  }
+
+  function timeAxis(snapshots){
+    // uPlot expects unix-seconds, not ms.
+    return snapshots.map(function(s){ return Math.floor(s.ts/1000); });
+  }
+
+  function chartBody(panelId){
+    return $(panelId).querySelector(".chart-body");
+  }
+
+  function renderChartRunners(snapshots){
+    var ts = timeAxis(snapshots);
+    var vals = snapshots.map(function(s){ return (s.payload.runners && s.payload.runners.active_runners && s.payload.runners.active_runners.length) || 0; });
+    destroyChart("runners");
+    var body = chartBody("chart-runners");
+    if(ts.length === 0){ body.innerHTML = '<div class="empty">no data</div>'; return; }
+    body.innerHTML = "";  // clear before uPlot mounts
+    charts["runners"] = new uPlot(
+      chartOptions([{}, { label: "active", stroke: "#4ade80", width: 2 }]),
+      [ts, vals],
+      body
+    );
+  }
+
+  function renderChartQueue(snapshots){
+    var ts = timeAxis(snapshots);
+    var queued = snapshots.map(function(s){ return (s.payload.work && s.payload.work.queued) || 0; });
+    var inFlight = snapshots.map(function(s){ return (s.payload.work && s.payload.work.in_flight) || 0; });
+    destroyChart("queue");
+    var body = chartBody("chart-queue");
+    if(ts.length === 0){ body.innerHTML = '<div class="empty">no data</div>'; return; }
+    body.innerHTML = "";
+    charts["queue"] = new uPlot(
+      chartOptions([
+        {},
+        { label: "queued", stroke: "#38bdf8", width: 2 },
+        { label: "in_flight", stroke: "#fbbf24", width: 2 },
+      ]),
+      [ts, queued, inFlight],
+      body
+    );
+  }
+
+  function renderChartCfBypass(snapshots){
+    var latest = snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
+    var proxies = (latest && latest.payload.proxies) || [];
+    var banned = proxies.filter(function(p){ return p.banned; }).length;
+    var cfBypass = proxies.filter(function(p){ return p.requires_cf_bypass; }).length;
+    var healthy = proxies.length - banned - cfBypass;
+    var total = proxies.length || 1;
+
+    function arc(start, end, color){
+      // SVG donut arc helper. start/end are fractions [0,1].
+      var R = 50, r = 30, CX = 70, CY = 70;
+      var a0 = start * Math.PI * 2 - Math.PI/2;
+      var a1 = end * Math.PI * 2 - Math.PI/2;
+      var large = (end - start) > 0.5 ? 1 : 0;
+      var x0 = CX + R * Math.cos(a0), y0 = CY + R * Math.sin(a0);
+      var x1 = CX + R * Math.cos(a1), y1 = CY + R * Math.sin(a1);
+      var xi0 = CX + r * Math.cos(a1), yi0 = CY + r * Math.sin(a1);
+      var xi1 = CX + r * Math.cos(a0), yi1 = CY + r * Math.sin(a0);
+      return '<path d="M' + x0 + ',' + y0 + ' A' + R + ',' + R + ' 0 ' + large + ',1 ' + x1 + ',' + y1
+        + ' L' + xi0 + ',' + yi0 + ' A' + r + ',' + r + ' 0 ' + large + ',0 ' + xi1 + ',' + yi1
+        + ' Z" fill="' + color + '" />';
+    }
+
+    var body = chartBody("chart-cf-bypass");
+    if(proxies.length === 0){ body.innerHTML = '<div class="empty">no data</div>'; return; }
+
+    var f1 = healthy / total;
+    var f2 = f1 + cfBypass / total;
+    var html = '<svg width="140" height="140" viewBox="0 0 140 140" style="margin:auto;display:block">';
+    if(healthy > 0)  html += arc(0,  f1, "#4ade80");
+    if(cfBypass > 0) html += arc(f1, f2, "#fbbf24");
+    if(banned > 0)   html += arc(f2, 1,  "#f87171");
+    html += '<text x="70" y="74" text-anchor="middle" font-size="14" fill="#d4d7e0" font-family="ui-sans-serif">' + proxies.length + '</text>';
+    html += '<text x="70" y="92" text-anchor="middle" font-size="9" fill="#6e7681">proxies</text>';
+    html += '</svg>'
+      + '<div style="text-align:center;font-size:11px;color:var(--muted);margin-top:6px">'
+      + '<span style="color:#4ade80">● healthy ' + healthy + '</span> · '
+      + '<span style="color:#fbbf24">● cf-bypass ' + cfBypass + '</span> · '
+      + '<span style="color:#f87171">● banned ' + banned + '</span>'
+      + '</div>';
+    body.innerHTML = html;
+  }
+
+  function renderChartLatency(snapshots){
+    var ts = timeAxis(snapshots);
+    var allIds = new Set();
+    snapshots.forEach(function(s){ ((s.payload.proxies) || []).forEach(function(p){ allIds.add(p.proxy_id); }); });
+    var idList = Array.from(allIds).filter(function(id){ return !proxyFilter.has(id); });
+    var series = idList.map(function(id){
+      return snapshots.map(function(s){
+        var p = ((s.payload.proxies) || []).find(function(x){ return x.proxy_id === id; });
+        return p && p.health ? p.health.latency_ema_ms : null;
+      });
+    });
+    destroyChart("latency");
+    var body = chartBody("chart-latency");
+    if(ts.length === 0 || idList.length === 0){ body.innerHTML = '<div class="empty">no data</div>'; return; }
+    body.innerHTML = "";
+    var seriesDef = [{}].concat(idList.map(function(id){
+      return { label: id, stroke: colorForProxy(id), width: 1.5 };
+    }));
+    charts["latency"] = new uPlot(
+      chartOptions(seriesDef),
+      [ts].concat(series),
+      body
+    );
+  }
+
+  function renderChartHealth(snapshots){
+    var ts = timeAxis(snapshots);
+    var allIds = new Set();
+    snapshots.forEach(function(s){ ((s.payload.proxies) || []).forEach(function(p){ allIds.add(p.proxy_id); }); });
+    var idList = Array.from(allIds).filter(function(id){ return !proxyFilter.has(id); });
+    var series = idList.map(function(id){
+      return snapshots.map(function(s){
+        var p = ((s.payload.proxies) || []).find(function(x){ return x.proxy_id === id; });
+        var sc = p && p.health ? p.health.score : null;
+        return typeof sc === "number" ? sc * 100 : null;
+      });
+    });
+    destroyChart("health");
+    var body = chartBody("chart-health");
+    if(ts.length === 0 || idList.length === 0){ body.innerHTML = '<div class="empty">no data</div>'; return; }
+    body.innerHTML = "";
+    var seriesDef = [{}].concat(idList.map(function(id){
+      return { label: id, stroke: colorForProxy(id), width: 1.5 };
+    }));
+    charts["health"] = new uPlot(
+      chartOptions(seriesDef),
+      [ts].concat(series),
+      body
+    );
+  }
+
   function refresh(){
     $("state").textContent = "polling…";
-    // Phase 2/ADR-004: /ops/snapshot auto-discovers proxies from
-    // proxies_seen when no proxy_ids is given. We no longer pass
-    // PROXY_IDS — the Worker handles the full pool.
-    return fetch("/ops/snapshot", { credentials: "same-origin" }).then(function(r){
-      if(r.status === 401){ window.location.href = "/"; throw new Error("auth"); }
-      if(r.status !== 200) throw new Error("HTTP "+r.status);
-      return r.json();
-    }).then(function(data){
+    return Promise.all([
+      fetch("/ops/snapshot", { credentials: "same-origin" }).then(function(r){
+        if(r.status === 401){ window.location.href = "/"; throw new Error("auth"); }
+        if(r.status !== 200) throw new Error("HTTP /ops/snapshot " + r.status);
+        return r.json();
+      }),
+      fetch("/metrics/range?from=" + (Date.now() - CHARTS_RANGE_MS) + "&to=" + Date.now(), { credentials: "same-origin" })
+        .then(function(r){ return r.status === 200 ? r.json() : { rows: [] }; })
+        .catch(function(){ return { rows: [] }; }),
+    ]).then(function(results){
+      var data = results[0];
+      var snapshots = (results[1].rows || []);
       var nowMs = data.server_time || Date.now();
+
       renderStats(data, nowMs);
       renderBanners(data);
       renderRunners(data, nowMs);
       renderSignals(data, nowMs);
       renderConfig(data);
       renderProxies(data);
+
+      renderChartRunners(snapshots);
+      renderChartQueue(snapshots);
+      renderChartCfBypass(snapshots);
+      renderChartLatency(snapshots);
+      renderChartHealth(snapshots);
+
       setBrandLive(true);
       $("state").textContent = "live";
+      // Topbar ts already uses innerHTML with tooltip from Task 4 — preserve.
       var tsAbs = fmtTs(nowMs);
       var tsRel = fmtAge(nowMs, Date.now()) + " ago";
       $("ts").innerHTML = '<span title="' + esc(tsRel) + '">' + esc(tsAbs) + '</span>';
