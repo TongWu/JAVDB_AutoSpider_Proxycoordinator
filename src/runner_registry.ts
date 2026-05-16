@@ -131,6 +131,12 @@ export class RunnerRegistry implements DurableObject {
       `CREATE INDEX IF NOT EXISTS idx_runners_event_log_holder
        ON runners_event_log(holder_id, ts);`,
     );
+
+    // Phase 2 follow-up — unconditionally arm the alarm in the constructor
+    // so retention sweeps run even when no register/signal traffic ever
+    // arrives. Matches the pattern in ConfigState/GlobalLoginState/MetricsState.
+    // Fire-and-forget: scheduleAlarm is idempotent and self-defending.
+    this.scheduleAlarm().catch(() => {});
   }
 
   async fetch(request: Request): Promise<Response> {
