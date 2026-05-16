@@ -13,9 +13,7 @@
  * See docs/ai/adr/ADR-003 for the data-pipeline design that feeds this UI.
  */
 
-export function renderDashboardHtml(url: URL): string {
-  const proxyIdsRaw = url.searchParams.get("proxy_ids") ?? "";
-  const proxyIdsJs = JSON.stringify(proxyIdsRaw);
+export function renderDashboardHtml(_url: URL): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8" />
 <title>Dashboard · Proxy Coordinator</title>
@@ -146,8 +144,6 @@ export function renderDashboardHtml(url: URL): string {
 </main>
 <script>
 (function(){
-  var PROXY_IDS = ${proxyIdsJs};
-  var REFRESH_MS = 30000;
   var $ = function(id){ return document.getElementById(id); };
   var brand = $("brand");
 
@@ -288,10 +284,11 @@ export function renderDashboardHtml(url: URL): string {
   }
 
   function refresh(){
-    var url = "/ops/snapshot";
-    if(PROXY_IDS) url += "?proxy_ids="+encodeURIComponent(PROXY_IDS);
     $("state").textContent = "polling…";
-    fetch(url, { credentials: "same-origin" }).then(function(r){
+    // Phase 2/ADR-004: /ops/snapshot auto-discovers proxies from
+    // proxies_seen when no proxy_ids is given. We no longer pass
+    // PROXY_IDS — the Worker handles the full pool.
+    return fetch("/ops/snapshot", { credentials: "same-origin" }).then(function(r){
       if(r.status === 401){ window.location.href = "/"; throw new Error("auth"); }
       if(r.status !== 200) throw new Error("HTTP "+r.status);
       return r.json();
@@ -311,8 +308,54 @@ export function renderDashboardHtml(url: URL): string {
       $("state").textContent = "error: " + err.message;
     });
   }
-  refresh();
-  setInterval(refresh, REFRESH_MS);
+
+  // ── Phase 3: visibility-aware polling ───────────────────────────────
+  var VISIBLE_MS = 5000;
+  var HIDDEN_MS = 30000;
+  var PAUSE_AFTER_HIDDEN_MS = 1800000;  // 30 min
+
+  var pollTimer = null;
+  var hiddenSinceMs = 0;
+  var paused = false;
+
+  function currentInterval() {
+    if (document.visibilityState === "visible") return VISIBLE_MS;
+    return HIDDEN_MS;
+  }
+
+  function scheduleNext() {
+    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+    if (paused) { return; }
+    pollTimer = setTimeout(tick, currentInterval());
+  }
+
+  function tick() {
+    pollTimer = null;
+    // If hidden too long, pause entirely until user returns.
+    if (document.visibilityState === "hidden" && hiddenSinceMs > 0) {
+      var hiddenFor = Date.now() - hiddenSinceMs;
+      if (hiddenFor >= PAUSE_AFTER_HIDDEN_MS) {
+        paused = true;
+        $("state").textContent = "paused (tab hidden)";
+        return;
+      }
+    }
+    refresh().finally(scheduleNext);
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") {
+      hiddenSinceMs = 0;
+      paused = false;
+      refresh().finally(scheduleNext); // immediate refresh on return
+    } else {
+      hiddenSinceMs = Date.now();
+      scheduleNext(); // re-arm at 30s cadence
+    }
+  });
+
+  // Initial fetch + start loop.
+  refresh().finally(scheduleNext);
 })();
 </script>
 </body></html>`;
