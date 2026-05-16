@@ -189,6 +189,13 @@ ${commonDashboardStyles()}
       </header>
       <div class="body" id="signals"></div>
     </div>
+    <div class="panel">
+      <header>
+        <span>Login state <span class="badge" id="login-badge">—</span></span>
+        <button class="panel-history-btn" data-drawer="login">History →</button>
+      </header>
+      <div class="body" id="login-state-body"></div>
+    </div>
     <div class="panel full">
       <header>
         Per-proxy state <span class="badge" id="proxy-count">0</span>
@@ -289,7 +296,7 @@ ${commonDashboardStyles()}
       var which = hBtn.getAttribute("data-drawer");
       if (which === "signals") openDrawer("Signals history", signalsDrawerRenderer, {});
       else if (which === "runners") openDrawer("Runners history", runnersDrawerRenderer, {});
-      // Tasks 4-6 will add more else-if branches here.
+      else if (which === "login") openDrawer("Login history", loginDrawerRenderer, {});
       return;
     }
     var chip = e.target.closest && e.target.closest(".chip");
@@ -459,6 +466,12 @@ ${commonDashboardStyles()}
     });
     html += '</table>';
     $("proxies").innerHTML = html;
+  }
+
+  function renderLoginState(_data){
+    var body = $("login-state-body");
+    body.innerHTML = '<div class="hint">Click <strong>History →</strong> to view recent login attempts, publishes, and lease activity.</div>';
+    $("login-badge").textContent = "—";
   }
 
   function setBrandLive(live){
@@ -798,6 +811,54 @@ ${commonDashboardStyles()}
       .catch(function(err){ body.innerHTML = '<div class="empty">error: ' + esc(err.message) + '</div>'; });
   }
 
+  // ── Phase 4: login drill-down ───────────────────────────────────────
+  function loginDrawerRenderer(rangeMs, _ctx){
+    var body = $("drawer-body");
+    body.innerHTML = '<div class="empty">loading…</div>';
+    var to = Date.now();
+    var from = rangeMs > 0 ? to - rangeMs : to - 60 * 60000;  // Now → last 1h
+
+    fetch("/login/history?from=" + from + "&to=" + to, { credentials: "same-origin" })
+      .then(function(r){ if(r.status !== 200) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function(data){
+        var rows = data.rows || [];
+        if (rows.length === 0){ body.innerHTML = '<div class="empty">No login events in this window.</div>'; return; }
+
+        // Summary chips: counts by event_kind (and per-outcome for 'attempt')
+        var counts = rows.reduce(function(acc, r){
+          acc[r.event_kind] = (acc[r.event_kind] || 0) + 1;
+          if (r.event_kind === "attempt" && r.outcome){
+            acc["_outcome_" + r.outcome] = (acc["_outcome_" + r.outcome] || 0) + 1;
+          }
+          return acc;
+        }, {});
+
+        var summaryParts = [];
+        Object.keys(counts).forEach(function(k){
+          if (k.indexOf("_outcome_") === 0) return;  // shown separately
+          summaryParts.push('<span class="pill muted" style="margin-right:6px">' + esc(k) + ' ' + counts[k] + '</span>');
+        });
+        if (counts._outcome_success) summaryParts.push('<span class="pill ok" style="margin-right:6px">success ' + counts._outcome_success + '</span>');
+        if (counts._outcome_failure) summaryParts.push('<span class="pill bad" style="margin-right:6px">failure ' + counts._outcome_failure + '</span>');
+        var summary = '<div style="margin-bottom:12px;font-size:12px;color:var(--muted)">' + summaryParts.join("") + '</div>';
+
+        var html = summary + '<table><tr><th>Time</th><th>Event</th><th>Outcome</th><th>Holder</th><th>Detail</th></tr>';
+        rows.forEach(function(r){
+          var outcomePill = r.outcome === "success" ? '<span class="pill ok">success</span>'
+                          : r.outcome === "failure" ? '<span class="pill bad">failure</span>'
+                          : '<span class="pill muted">—</span>';
+          html += '<tr><td class="muted">' + esc(fmtTs(r.ts)) + '</td>'
+            + '<td><code>' + esc(r.event_kind) + '</code></td>'
+            + '<td>' + outcomePill + '</td>'
+            + '<td><code>' + esc(r.holder_id || "—") + '</code></td>'
+            + '<td class="muted" style="font-size:11px">' + esc(r.detail || "—") + '</td></tr>';
+        });
+        html += '</table>';
+        body.innerHTML = html;
+      })
+      .catch(function(err){ body.innerHTML = '<div class="empty">error: ' + esc(err.message) + '</div>'; });
+  }
+
   function refresh(){
     $("state").textContent = "polling…";
     return Promise.all([
@@ -818,6 +879,7 @@ ${commonDashboardStyles()}
       renderBanners(data);
       renderRunners(data, nowMs);
       renderSignals(data, nowMs);
+      renderLoginState(data);
       renderConfig(data);
       renderProxies(data);
 

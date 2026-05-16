@@ -263,3 +263,29 @@ describe("Phase 4 — runners drill-down", () => {
     expect(html).toMatch(/openDrawer\(['"]Runners history['"],\s*runnersDrawerRenderer/);
   });
 });
+
+describe("Phase 4 — login drill-down", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("has a Login state panel with History button", () => {
+    expect(html).toMatch(/Login state[\s\S]*?data-drawer="login"/);
+  });
+
+  it("loginDrawerRenderer queries /login/history", () => {
+    expect(html).toContain("function loginDrawerRenderer(");
+    expect(html).toContain("/login/history?from=");
+  });
+
+  it("renderLoginState placeholder is defined and called on refresh", () => {
+    expect(html).toContain("function renderLoginState(");
+    expect(html).toContain("renderLoginState(data");
+  });
+
+  it("login drawer summary chips render counts by event_kind", () => {
+    expect(html).toContain("event_kind");  // summary loop
+  });
+
+  it("click handler routes the login button to openDrawer", () => {
+    expect(html).toMatch(/openDrawer\(['"]Login history['"],\s*loginDrawerRenderer/);
+  });
+});
