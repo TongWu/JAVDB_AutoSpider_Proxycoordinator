@@ -147,7 +147,17 @@ export function renderDashboardHtml(_url: URL): string {
   var $ = function(id){ return document.getElementById(id); };
   var brand = $("brand");
 
-  function fmtTs(ms){ if(!ms) return "—"; var d = new Date(ms); return d.toISOString().replace("T"," ").slice(11,19) + "Z"; }
+  // ── Phase 3: browser-local time formatting with tz abbreviation ─────
+  var _tzFormatter = new Intl.DateTimeFormat([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hour12: false, timeZoneName: "short",
+  });
+
+  function fmtTs(ms){
+    if(!ms) return "—";
+    // Intl.DateTimeFormat output is like "14:23:45 SGT"
+    return _tzFormatter.format(new Date(ms));
+  }
   function fmtAge(ms, nowMs){ if(!ms) return "—"; var s = Math.max(0,(nowMs-ms)/1000); if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
   function fmtDur(ms){ if(ms<=0) return "—"; var s = ms/1000; if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
   function esc(s){ return String(s).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c]; }); }
@@ -199,10 +209,14 @@ export function renderDashboardHtml(_url: URL): string {
     rows.forEach(function(r){
       var lastAge = nowMs - r.last_heartbeat;
       var lastCls = lastAge > 120000 ? "warn" : (lastAge > 300000 ? "bad" : "ok");
-      var lastPill = '<span class="pill '+lastCls+'">'+fmtAge(r.last_heartbeat, nowMs)+' ago</span>';
+      var lastAbsTs = fmtTs(r.last_heartbeat);
+      var lastRelAge = fmtAge(r.last_heartbeat, nowMs) + " ago";
+      var lastPill = '<span class="pill '+lastCls+'" title="' + esc(lastAbsTs) + '">' + esc(lastRelAge) + '</span>';
+      var uptimeAbs = fmtTs(r.started_at);
+      var uptimeRel = fmtAge(r.started_at, nowMs);
       html += '<tr><td><code>'+esc(r.holder_id)+'</code></td>'
         + '<td class="muted">'+esc(r.workflow_name || "—")+'</td>'
-        + '<td class="muted">'+fmtAge(r.started_at, nowMs)+'</td>'
+        + '<td class="muted"><span title="' + esc(uptimeAbs) + '">' + esc(uptimeRel) + '</span></td>'
         + '<td>'+lastPill+'</td>'
         + '<td><code>'+esc((r.proxy_pool_hash || "").slice(0,10) || "—")+'</code></td></tr>';
     });
@@ -221,8 +235,9 @@ export function renderDashboardHtml(_url: URL): string {
       var payload = "—";
       if(s.kind === "throttle_global") payload = '× '+esc(s.factor);
       else if(s.kind === "ban_proxy") payload = '<code>'+esc(s.proxy_id || "?")+'</code>';
-      var ttl = fmtDur((s.expires_at_ms || 0) - nowMs);
-      html += '<tr><td><span class="pill '+cls+'">'+esc(s.kind)+'</span></td><td>'+payload+'</td><td class="muted">in '+ttl+'</td></tr>';
+      var expiresAbs = fmtTs(s.expires_at_ms || 0);
+      var expiresRel = "in " + fmtDur((s.expires_at_ms || 0) - nowMs);
+      html += '<tr><td><span class="pill '+cls+'">'+esc(s.kind)+'</span></td><td>'+payload+'</td><td class="muted"><span title="' + esc(expiresAbs) + '">' + esc(expiresRel) + '</span></td></tr>';
     });
     html += '</table>';
     $("signals").innerHTML = html;
@@ -302,7 +317,9 @@ export function renderDashboardHtml(_url: URL): string {
       renderProxies(data);
       setBrandLive(true);
       $("state").textContent = "live";
-      $("ts").textContent = fmtTs(nowMs);
+      var tsAbs = fmtTs(nowMs);
+      var tsRel = fmtAge(nowMs, Date.now()) + " ago";
+      $("ts").innerHTML = '<span title="' + esc(tsRel) + '">' + esc(tsAbs) + '</span>';
     }).catch(function(err){
       setBrandLive(false);
       $("state").textContent = "error: " + err.message;
