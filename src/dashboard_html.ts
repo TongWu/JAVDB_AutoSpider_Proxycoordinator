@@ -761,7 +761,7 @@ ${commonDashboardStyles()}
       + statRow("In cooldown", cooldown, cooldown > 0 ? "warn" : null)
       + statRow("Dead-lettered", deadLetter, deadLetter > 0 ? "bad" : null)
       + '<div class="hint" style="padding:8px 0 0;font-size:11px">'
-      + 'Aggregated across all sub-shards for today\'s date (Asia/Singapore).'
+      + "Aggregated across all sub-shards for today's date (Asia/Singapore)."
       + '</div>';
   }
 

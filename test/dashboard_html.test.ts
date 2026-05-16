@@ -457,6 +457,28 @@ describe("Phase-3 — MovieClaim + WorkDistributor panels", () => {
   });
 });
 
+describe("Phase-3 — inline JS parses without syntax errors", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("every <script>...</script> block compiles as a function body", () => {
+    // Catches bugs like ``'today\\'s'`` inside a TS template literal,
+    // where the TS layer eats the backslash and emits ``'today's'`` to
+    // the browser — terminating the JS string mid-word. The Workers
+    // runtime can't ``eval`` here, but ``new Function`` only PARSES the
+    // body; SyntaxErrors propagate without executing the script.
+    const scriptRe = /<script>([\s\S]*?)<\/script>/g;
+    let m: RegExpExecArray | null;
+    while ((m = scriptRe.exec(html)) !== null) {
+      const body = m[1];
+      // Skip the vendored uPlot blob — it's framework-shaped (IIFE
+      // self-installs onto globalThis) and isn't authored by us, so a
+      // false positive here would be noise.
+      if (body.includes("uPlot") && body.length > 5000) continue;
+      expect(() => new Function(body)).not.toThrow();
+    }
+  });
+});
+
 describe("Phase-3 — responsive CSS + chart sizing", () => {
   const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
 
