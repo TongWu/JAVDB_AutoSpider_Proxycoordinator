@@ -730,6 +730,10 @@ const COOKIE_AUTH_PATHS = new Set<string>([
   "/proxies/ban",
   "/proxies/unban",
   "/login/invalidate_force",
+  // Phase-3 ADR-008 — Login state panel polls this directly on every
+  // dashboard refresh to surface non-sensitive fields + Force re-login.
+  // Without the cookie path the panel would 401 on every poll.
+  "/login_state",
   // Existing — needed for the "Pause Pipeline" toggle which PATCHes config.
   "/config",
   "/signal",
