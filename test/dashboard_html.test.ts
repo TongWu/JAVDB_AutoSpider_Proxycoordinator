@@ -239,3 +239,27 @@ describe("Phase 4 — signals drill-down", () => {
     expect(html).toMatch(/openDrawer\(['"]Signals history['"],\s*signalsDrawerRenderer/);
   });
 });
+
+describe("Phase 4 — runners drill-down", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("Active runners panel header has a History button", () => {
+    expect(html).toMatch(/Active runners[\s\S]*?data-drawer="runners"/);
+  });
+
+  it("runnersDrawerRenderer queries /runners/history", () => {
+    expect(html).toContain("function runnersDrawerRenderer(");
+    expect(html).toContain("/runners/history?from=");
+  });
+
+  it("renders pill mapping for register/unregister/crashed event kinds", () => {
+    // The renderer maps event_kind → pill class; check that all three labels appear.
+    expect(html).toContain('"register"');
+    expect(html).toContain('"unregister"');
+    expect(html).toContain('"crashed"');
+  });
+
+  it("click handler routes the runners button to openDrawer", () => {
+    expect(html).toMatch(/openDrawer\(['"]Runners history['"],\s*runnersDrawerRenderer/);
+  });
+});

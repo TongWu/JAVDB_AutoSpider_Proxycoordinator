@@ -176,7 +176,10 @@ ${commonDashboardStyles()}
   </div>
   <div class="grid">
     <div class="panel">
-      <header>Active runners <span class="badge" id="runner-count">0</span></header>
+      <header>
+        <span>Active runners <span class="badge" id="runner-count">0</span></span>
+        <button class="panel-history-btn" data-drawer="runners">History →</button>
+      </header>
       <div class="body" id="runners"></div>
     </div>
     <div class="panel">
@@ -285,7 +288,8 @@ ${commonDashboardStyles()}
     if (hBtn) {
       var which = hBtn.getAttribute("data-drawer");
       if (which === "signals") openDrawer("Signals history", signalsDrawerRenderer, {});
-      // Tasks 3-6 will add more "which === ..." branches here.
+      else if (which === "runners") openDrawer("Runners history", runnersDrawerRenderer, {});
+      // Tasks 4-6 will add more else-if branches here.
       return;
     }
     var chip = e.target.closest && e.target.closest(".chip");
@@ -761,6 +765,37 @@ ${commonDashboardStyles()}
         + '<text x="' + tx + '" y="' + (height - 6) + '" text-anchor="middle" font-size="10" fill="#6e7681">' + esc(fmtTs(tickTs)) + '</text>';
     }
     return '<svg width="' + width + '" height="' + height + '" style="max-width:100%">' + ticks + bars + '</svg>';
+  }
+
+  // ── Phase 4: runners drill-down ─────────────────────────────────────
+  function runnersDrawerRenderer(rangeMs, _ctx){
+    var body = $("drawer-body");
+    body.innerHTML = '<div class="empty">loading…</div>';
+    var to = Date.now();
+    var from = rangeMs > 0 ? to - rangeMs : to - 5 * 60000;  // Now → last 5 min
+
+    fetch("/runners/history?from=" + from + "&to=" + to, { credentials: "same-origin" })
+      .then(function(r){ if(r.status !== 200) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function(data){
+        var rows = data.rows || [];
+        if (rows.length === 0){ body.innerHTML = '<div class="empty">No runner events in this window.</div>'; return; }
+        var html = '<table><tr><th>Time</th><th>Event</th><th>Holder</th><th>Workflow</th><th>Status</th></tr>';
+        rows.forEach(function(r){
+          var pill;
+          if (r.event_kind === "register") pill = '<span class="pill ok">register</span>';
+          else if (r.event_kind === "unregister") pill = '<span class="pill muted">unregister</span>';
+          else if (r.event_kind === "crashed") pill = '<span class="pill bad">crashed</span>';
+          else pill = '<span class="pill muted">' + esc(r.event_kind) + '</span>';
+          html += '<tr><td class="muted">' + esc(fmtTs(r.ts)) + '</td>'
+            + '<td>' + pill + '</td>'
+            + '<td><code>' + esc(r.holder_id) + '</code></td>'
+            + '<td class="muted">' + esc(r.workflow_name || "—") + '</td>'
+            + '<td class="muted">' + esc(r.final_status || "—") + '</td></tr>';
+        });
+        html += '</table>';
+        body.innerHTML = html;
+      })
+      .catch(function(err){ body.innerHTML = '<div class="empty">error: ' + esc(err.message) + '</div>'; });
   }
 
   function refresh(){
