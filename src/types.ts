@@ -14,6 +14,11 @@ export interface Env {
    *  each heartbeat. `undefined` allowed so an older Worker without the
    *  v4 migration still serves config-less responses. */
   CONFIG_STATE_DO?: DurableObjectNamespace;
+  /** W5.2 — singleton work-distribution DO (see `src/work_distributor.ts`).
+   *  Active queue with visibility leases; coexists with MovieClaim as a
+   *  defensive dedup layer. `undefined` allowed: clients that hit
+   *  `/work/*` endpoints get 503 until the v5 migration is applied. */
+  WORK_DISTRIBUTOR_DO?: DurableObjectNamespace;
   LEASE_ANALYTICS?: AnalyticsEngineDataset;
   PROXY_COORDINATOR_TOKEN: string;
   SHORT_WINDOW_SEC?: string;
@@ -868,6 +873,129 @@ export interface ActiveRunnersResponse {
    *  by ops dashboards without keeping idle runners alive). */
   active_runners: RunnerInfo[];
   pool_hash_summary: Array<{ hash: string; count: number }>;
+  server_time: number;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// W5.2 — WorkDistributor DO: active work queue
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * One queue entry. ``key`` is the dedup primary — re-enqueue of the
+ * same key is idempotent (the existing entry's payload is replaced
+ * iff the caller opted in via ``replace_existing``).
+ *
+ * The queue is intended for hrefs the spider wants to fetch, but
+ * stays generic on purpose: any caller-meaningful string is a valid
+ * key, and ``payload`` rides along unparsed.
+ */
+export interface WorkItem {
+  /** Stable per-item key. The DO uses it for dedup and for lease /
+   *  complete / release operations. */
+  key: string;
+  /** Caller-meaningful blob (typically a JSON object). The DO never
+   *  inspects this; it round-trips verbatim. */
+  payload?: unknown;
+  /** Wall-clock ms when this item was first enqueued. */
+  enqueued_at_ms: number;
+  /** Times this item has been pulled (incremented on every pull,
+   *  regardless of whether the puller completed or released it). Lets
+   *  a poison-pill detector trim the queue after enough retries. */
+  attempt_count: number;
+}
+
+/**
+ * One active visibility lease. Items leased to a holder are hidden
+ * from other pulls until either ``expires_at_ms`` passes, the holder
+ * completes (removing the item entirely), or the holder releases
+ * (returning the item to the visible pool).
+ */
+export interface WorkLease {
+  key: string;
+  holder_id: string;
+  /** Wall-clock ms when this lease can be reclaimed by other pullers. */
+  expires_at_ms: number;
+}
+
+/** Body of ``POST /work/enqueue``. */
+export interface WorkEnqueueRequest {
+  /** Items to add. Max 100 per call (server-capped). */
+  items: Array<{ key: string; payload?: unknown }>;
+  /** When true, an existing key in the queue is overwritten with the
+   *  new payload (and its attempt_count is preserved). Default false:
+   *  duplicate keys are silent no-ops, the existing entry is kept. */
+  replace_existing?: boolean;
+}
+
+/** Response of ``POST /work/enqueue``. */
+export interface WorkEnqueueResponse {
+  /** Keys that were newly added to the queue. */
+  enqueued: string[];
+  /** Keys that already existed and were ignored (or overwritten when
+   *  ``replace_existing=true``). */
+  duplicates: string[];
+  /** Total queue depth AFTER this enqueue (includes leased items). */
+  queue_size: number;
+  server_time: number;
+}
+
+/** Body of ``POST /work/pull``. */
+export interface WorkPullRequest {
+  holder_id: string;
+  /** Max items to return. Server caps at 100. Default 10. */
+  max_items?: number;
+  /** Lease TTL in ms for each pulled item. Server clamps to [1s, 1h].
+   *  Default 5 min. */
+  visibility_timeout_ms?: number;
+}
+
+/** Response of ``POST /work/pull``. */
+export interface WorkPullResponse {
+  /** Items now leased to ``holder_id``. ``payload`` and ``attempt_count``
+   *  are surfaced so the caller can apply per-item back-off. */
+  items: WorkItem[];
+  /** Live queue depth (visible + leased). */
+  queue_size: number;
+  server_time: number;
+}
+
+/** Body of ``POST /work/complete``. */
+export interface WorkCompleteRequest {
+  holder_id: string;
+  /** Keys to mark done. Items not held by ``holder_id`` are silently
+   *  skipped (probably already reclaimed by another puller). */
+  keys: string[];
+}
+
+/** Response of ``POST /work/complete``. */
+export interface WorkCompleteResponse {
+  completed: string[];
+  skipped: string[];
+  server_time: number;
+}
+
+/** Body of ``POST /work/release``. */
+export interface WorkReleaseRequest {
+  holder_id: string;
+  /** Keys to return to the visible pool. Same skip semantics as
+   *  ``WorkCompleteRequest`` for non-owner. */
+  keys: string[];
+}
+
+/** Response of ``POST /work/release``. */
+export interface WorkReleaseResponse {
+  released: string[];
+  skipped: string[];
+  server_time: number;
+}
+
+/** Response of ``GET /work/stats``. */
+export interface WorkStatsResponse {
+  queue_size: number;
+  visible: number;
+  leased: number;
+  /** Oldest enqueued_at_ms still present in the queue, or null when empty. */
+  oldest_enqueued_at_ms: number | null;
   server_time: number;
 }
 

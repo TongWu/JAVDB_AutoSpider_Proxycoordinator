@@ -50,6 +50,13 @@ class_name = "RunnerRegistry"
 name = "CONFIG_STATE_DO"
 class_name = "ConfigState"
 
+# W5.2 — singleton work-distribution DO. Active queue with visibility
+# leases; coexists with MovieClaim as defence-in-depth. Addressed by
+# `idFromName("global-work")`. See src/work_distributor.ts.
+[[durable_objects.bindings]]
+name = "WORK_DISTRIBUTOR_DO"
+class_name = "WorkDistributor"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProxyCoordinator"]
@@ -76,6 +83,13 @@ new_sqlite_classes = ["MovieClaimState", "RunnerRegistry"]
 [[migrations]]
 tag = "v4"
 new_sqlite_classes = ["ConfigState"]
+
+# v5 — W5.2 WorkDistributor singleton. Active dedup'd FIFO queue with
+# visibility leases (5-min default); coexists with MovieClaim as
+# defence-in-depth.
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["WorkDistributor"]
 
 # Workers Analytics Engine for per-lease metrics (free tier: 100k data points/day).
 #

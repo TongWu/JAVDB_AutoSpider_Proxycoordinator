@@ -5,6 +5,7 @@ export { GlobalLoginState } from "./global_login_state";
 export { MovieClaimState } from "./movie_claim_state";
 export { RunnerRegistry } from "./runner_registry";
 export { ConfigState } from "./config_state";
+export { WorkDistributor } from "./work_distributor";
 
 /**
  * W5.6 — Worker-level token-bucket rate limit.
@@ -122,6 +123,7 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/dashboard",
   "/ops/snapshot",
   "/recommend_proxy",
+  "/work/stats",
 ]);
 
 /** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
@@ -362,6 +364,27 @@ export default {
         // by their most-recent ProxyCoordinator health snapshot.
         case "/recommend_proxy":
           return await recommendProxies(env, url);
+        // W5.2 — WorkDistributor singleton (deduplicated work queue with
+        // visibility leases). All four mutating routes are POSTs; /work/stats
+        // is the read-only ops endpoint.
+        case "/work/enqueue": {
+          const body = await request.json();
+          return await forwardToWorkDistributorDo(env, "/do/work/enqueue", "POST", body);
+        }
+        case "/work/pull": {
+          const body = await request.json();
+          return await forwardToWorkDistributorDo(env, "/do/work/pull", "POST", body);
+        }
+        case "/work/complete": {
+          const body = await request.json();
+          return await forwardToWorkDistributorDo(env, "/do/work/complete", "POST", body);
+        }
+        case "/work/release": {
+          const body = await request.json();
+          return await forwardToWorkDistributorDo(env, "/do/work/release", "POST", body);
+        }
+        case "/work/stats":
+          return await forwardToWorkDistributorDo(env, "/do/work/stats", "GET", null);
         // W5.4 — operator-pushed active signals (live in RunnerRegistry DO)
         case "/signal": {
           const body = await request.json();
@@ -820,6 +843,44 @@ async function snapshotProxies(
     }),
   );
   return results;
+}
+
+/**
+ * W5.2 — proxy a request to the singleton WorkDistributor DO.
+ *
+ * Returns 503 when the binding is missing (v5 migration not yet applied),
+ * mirroring the runner-registry / config-state fallback path: clients
+ * treat 503 as "work queue not available" and either fall back to local
+ * dispatch or fail fast.
+ */
+async function forwardToWorkDistributorDo(
+  env: Env,
+  path: string,
+  method: "GET" | "POST",
+  body: unknown,
+): Promise<Response> {
+  if (!env.WORK_DISTRIBUTOR_DO) {
+    return jsonResponse(
+      { error: "work_distributor binding not configured (apply v5 migration)" },
+      503,
+    );
+  }
+  const id = env.WORK_DISTRIBUTOR_DO.idFromName("global-work");
+  const stub = env.WORK_DISTRIBUTOR_DO.get(id);
+  const init: RequestInit =
+    method === "GET"
+      ? { method: "GET" }
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body ?? {}),
+        };
+  const upstream = await stub.fetch(`https://do${path}`, init);
+  const text = await upstream.text();
+  return new Response(text, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
 }
 
 /**
