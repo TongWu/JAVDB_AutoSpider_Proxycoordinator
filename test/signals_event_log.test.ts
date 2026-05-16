@@ -69,4 +69,32 @@ describe("signals_event_log (Phase 2 / ADR-002)", () => {
       expect(expired.signal_kind).toBe("pause_all");
     }
   });
+
+  it("logs 'explicit_revoke' when a resume signal clears active signals", async () => {
+    // First create a ban_proxy signal that will be cleared by resume.
+    await workerFetch("/signal", "POST", {
+      kind: "ban_proxy",
+      proxy_id: "P-To-Be-Revoked",
+      ttl_ms: 600_000,
+      reason: "test-explicit-revoke-setup",
+    });
+
+    // Then send a resume signal which clears all active signals.
+    await workerFetch("/signal", "POST", {
+      kind: "resume",
+      reason: "test-explicit-revoke-trigger",
+    });
+
+    const q = await workerFetch(
+      "/signals/history?from=0&to=" + (Date.now() + 1_000_000),
+      "GET",
+    );
+    const data = (await q.json()) as { rows?: Array<any> };
+    const revoked = (data.rows ?? []).find(
+      (row) =>
+        row.event_kind === "explicit_revoke" &&
+        row.signal_kind === "ban_proxy",
+    );
+    expect(revoked).toBeDefined();
+  });
 });
