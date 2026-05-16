@@ -1,5 +1,14 @@
-import { ConfigSnapshot, Env, LeaseRequest, ReportRequest } from "./types";
+import {
+  AlertEvent,
+  AlertTestRequest,
+  ALERT_SUMMARY_MAX_LEN,
+  ConfigSnapshot,
+  Env,
+  LeaseRequest,
+  ReportRequest,
+} from "./types";
 import { renderDashboardHtml, commonDashboardStyles, escapeHtmlForServer } from "./dashboard_html";
+import { recordAndDispatch } from "./alert_dispatcher";
 
 export { ProxyCoordinator } from "./proxy_coordinator";
 export { GlobalLoginState } from "./global_login_state";
@@ -132,6 +141,11 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/work/stats",
   "/metrics/range",
   "/proxies_seen",
+  // Phase-1 ADR-008
+  "/sessions",
+  "/alerts",
+  // Phase-3 ADR-008
+  "/movie_claim/stats",
 ]);
 
 /** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
@@ -358,6 +372,16 @@ export default {
           const upstreamUrl = `/do/movie_status?${url.searchParams.toString()}`;
           return await forwardToMovieClaimDo(env, shard, upstreamUrl, "GET", null);
         }
+        // Phase-3 ADR-008 — aggregate today's MovieClaim stats by fanning
+        // out to every sub-shard. `fanOutToAllClaimShards` sums numeric
+        // fields and dedups non-numeric ones, which matches the count
+        // shape returned by `/do/movie_claim/stats`.
+        case "/movie_claim/stats": {
+          const date = url.searchParams.get("date");
+          return await fanOutToAllClaimShards(
+            env, date, "/do/movie_claim/stats", "GET", null,
+          );
+        }
         // ── P2-E: runner registry singleton ───────────────────────────
         case "/register": {
           const body = await request.json();
@@ -379,6 +403,98 @@ export default {
         }
         case "/active_runners":
           return await forwardToRunnerRegistryDo(env, "/do/active_runners", "GET", null);
+        // Phase-1 ADR-008 — runner-reported session lifecycle
+        case "/sessions":
+          return await forwardToRunnerRegistryDo(
+            env,
+            "/do/sessions?" + url.searchParams.toString(),
+            "GET",
+            null,
+          );
+        // Phase-1 ADR-008 — alert history + ack + test trigger
+        case "/alerts":
+          return await forwardToRunnerRegistryDo(
+            env,
+            "/do/alerts?" + url.searchParams.toString(),
+            "GET",
+            null,
+          );
+        case "/alerts/ack": {
+          const body = await request.json();
+          return await forwardToRunnerRegistryDo(env, "/do/alerts/ack", "POST", body);
+        }
+        case "/alerts/test": {
+          const body = (await request.json().catch(() => ({}))) as AlertTestRequest;
+          const now = Date.now();
+          const summary = (
+            typeof body?.summary === "string" && body.summary.trim()
+              ? body.summary.trim()
+              : "Manual alert test (dashboard probe)"
+          ).slice(0, ALERT_SUMMARY_MAX_LEN);
+          const alert: AlertEvent = {
+            id: `test-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`,
+            kind: "manual_test",
+            ts: now,
+            severity: "warning",
+            summary,
+            details: { triggered_by: "dashboard" },
+          };
+          await recordAndDispatch(env, alert);
+          return jsonResponse({ recorded: true, alert });
+        }
+        // Phase-1 ADR-008 — mutation buttons (no-Python-consumer-needed)
+        case "/proxies/ban": {
+          const body = (await request.json()) as {
+            proxy_id?: string;
+            ttl_ms?: number;
+            reason?: string;
+          };
+          const proxyId = normalizeProxyId(body?.proxy_id);
+          if (!proxyId) return jsonResponse({ error: "missing proxy_id" }, 400);
+          const reportBody: ReportRequest = {
+            proxy_id: proxyId,
+            kind: "ban",
+            ttl_ms: body?.ttl_ms,
+            reason: body?.reason ?? "dashboard manual ban",
+          };
+          return await forwardToProxyDo(env, proxyId, "/do/report", reportBody);
+        }
+        case "/proxies/unban": {
+          const body = (await request.json()) as {
+            proxy_id?: string;
+            reason?: string;
+          };
+          const proxyId = normalizeProxyId(body?.proxy_id);
+          if (!proxyId) return jsonResponse({ error: "missing proxy_id" }, 400);
+          const reportBody: ReportRequest = {
+            proxy_id: proxyId,
+            kind: "unban",
+            reason: body?.reason ?? "dashboard manual unban",
+          };
+          return await forwardToProxyDo(env, proxyId, "/do/report", reportBody);
+        }
+        case "/login/invalidate_force": {
+          // Force invalidate without optimistic version lock: pass version=0
+          // so the DO matches when its own version is 0 (fresh state). For
+          // any other version, we read the current and pass it. Use a
+          // two-step to avoid an extra route: GET current version then POST.
+          const cur = await forwardToGlobalLoginStateDo(
+            env, "/do/login_state/get", "GET", null,
+          );
+          let version = 0;
+          try {
+            const curData = (await cur.json()) as { version?: number };
+            version = Number(curData?.version ?? 0);
+          } catch {
+            version = 0;
+          }
+          return await forwardToGlobalLoginStateDo(
+            env,
+            "/do/login_state/invalidate",
+            "POST",
+            { version },
+          );
+        }
         // W5.1 — runtime observability snapshot consumed by /dashboard
         // SPA (cookie-authed) AND by external monitoring scripts
         // (Bearer-authed). /dashboard + / are served pre-switch by
@@ -606,6 +722,20 @@ const COOKIE_AUTH_PATHS = new Set<string>([
   "/runners/history",
   "/login/history",
   "/dashboard/logout",
+  // Phase-1 ADR-008 — dashboard reads + mutation buttons go via cookie.
+  "/sessions",
+  "/alerts",
+  "/alerts/ack",
+  "/alerts/test",
+  "/proxies/ban",
+  "/proxies/unban",
+  "/login/invalidate_force",
+  // Existing — needed for the "Pause Pipeline" toggle which PATCHes config.
+  "/config",
+  "/signal",
+  // Phase-3 ADR-008 — dashboard reads these via cookie auth.
+  "/movie_claim/stats",
+  "/work/stats",
 ]);
 
 /** Routes inside ``/dashboard/*`` that bypass the normal auth gate
@@ -990,6 +1120,23 @@ async function embedConfigSnapshot(env: Env, resp: Response): Promise<Response> 
       const { server_time: _unused, ...config } = snap;
       void _unused;
       registryBody.config = config;
+      // Phase-1 ADR-008 — surface the pipeline pause state at the
+      // response root so Python clients see it without diffing
+      // `config.values`. Read from the snapshot's `values` map (the
+      // operator-set override layer); falling back to env-var defaults
+      // is intentionally NOT done here — pause state must always come
+      // from an explicit operator action, not a deploy-time default.
+      const pausedRaw = snap?.values?.pipeline_paused_until;
+      const pausedUntil = typeof pausedRaw === "string"
+        ? parseInt(pausedRaw, 10)
+        : NaN;
+      if (Number.isFinite(pausedUntil) && pausedUntil > 0) {
+        registryBody.pipeline_paused_until = pausedUntil;
+      }
+      const pauseReason = snap?.values?.pipeline_pause_reason;
+      if (typeof pauseReason === "string" && pauseReason.length > 0) {
+        registryBody.pipeline_pause_reason = pauseReason;
+      }
     }
   } catch (err) {
     // Swallow any error: heartbeat must succeed even if config DO is down.
@@ -1069,11 +1216,26 @@ async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
 
   // Fan out in parallel; each promise resolves to a `{ ok, data }` shape
   // so one failure can't poison Promise.all.
-  const [runners, signals, config, proxies] = await Promise.all([
+  const [
+    runners,
+    signals,
+    config,
+    proxies,
+    sessions,
+    alerts,
+    movieClaimStats,
+    workStats,
+  ] = await Promise.all([
     snapshotFromRegistry(env, "/do/active_runners"),
     snapshotFromRegistry(env, "/do/signals"),
     snapshotFromConfigState(env),
     snapshotProxies(env, proxyIds),
+    // Phase-1 ADR-008 — sessions + alerts surfaces.
+    snapshotFromRegistry(env, "/do/sessions"),
+    snapshotFromRegistry(env, "/do/alerts"),
+    // Phase-3 ADR-008 — MovieClaim + WorkDistributor stats.
+    snapshotMovieClaimStats(env),
+    snapshotWorkStats(env),
   ]);
 
   return jsonResponse({
@@ -1082,9 +1244,46 @@ async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
     signals,
     config,
     proxies,
+    sessions,
+    alerts,
+    movie_claim_stats: movieClaimStats,
+    work_stats: workStats,
     // Echo back so the SPA can rebuild the query for refresh links.
     queried_proxy_ids: proxyIds,
   });
+}
+
+/**
+ * Phase-3 ADR-008 — fan out to every MovieClaim sub-shard for today and
+ * sum the count fields. Mirrors `fanOutToAllClaimShards` but as a
+ * read-only helper that returns `null` on any failure so a missing
+ * binding doesn't break the rest of the snapshot.
+ */
+async function snapshotMovieClaimStats(env: Env): Promise<unknown> {
+  if (!env.MOVIE_CLAIM_DO) return null;
+  try {
+    const resp = await fanOutToAllClaimShards(
+      env, null, "/do/movie_claim/stats", "GET", null,
+    );
+    if (resp.status !== 200) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+/** Phase-3 ADR-008 — proxy /work/stats so dashboard sees queue depth. */
+async function snapshotWorkStats(env: Env): Promise<unknown> {
+  if (!env.WORK_DISTRIBUTOR_DO) return null;
+  try {
+    const id = env.WORK_DISTRIBUTOR_DO.idFromName("global-work");
+    const stub = env.WORK_DISTRIBUTOR_DO.get(id);
+    const r = await stub.fetch("https://do/do/work/stats", { method: "GET" });
+    if (r.status !== 200) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
 }
 
 async function snapshotFromRegistry(
