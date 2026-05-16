@@ -6,6 +6,7 @@ export { MovieClaimState } from "./movie_claim_state";
 export { RunnerRegistry } from "./runner_registry";
 export { ConfigState } from "./config_state";
 export { WorkDistributor } from "./work_distributor";
+export { MetricsState } from "./metrics_state";
 
 /**
  * W5.6 — Worker-level token-bucket rate limit.
@@ -124,6 +125,7 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/ops/snapshot",
   "/recommend_proxy",
   "/work/stats",
+  "/metrics/range",
 ]);
 
 /** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
@@ -410,6 +412,19 @@ export default {
             return await forwardToConfigStateDo(env, "/do/patch", "POST", body);
           }
           return await forwardToConfigStateDo(env, "/do/config", "GET", null);
+        }
+        // W5.7 / ADR-003 — MetricsState DO
+        case "/metrics/record": {
+          const body = await request.json();
+          return await forwardToMetricsStateDo(env, "/do/metrics/record", "POST", body);
+        }
+        case "/metrics/range":
+          return await forwardToMetricsStateDo(
+            env, `/do/metrics/range?${url.searchParams.toString()}`, "GET", null,
+          );
+        case "/metrics/prune": {
+          const body = await request.json();
+          return await forwardToMetricsStateDo(env, "/do/metrics/prune", "POST", body);
         }
         default:
           return jsonResponse({ error: "not found" }, 404);
@@ -1784,6 +1799,43 @@ function currentSingaporeDate(): string {
   const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(now.getUTCDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+/**
+ * W5.7 / ADR-003 — proxy a request to the singleton MetricsState DO.
+ *
+ * Returns 503 when the binding is missing (v6 migration not yet applied).
+ * Body buffering mirrors the other forwardTo* helpers to avoid leaking
+ * the DO's SQLite storage frame across the JSRPC boundary.
+ */
+async function forwardToMetricsStateDo(
+  env: Env,
+  path: string,
+  method: "GET" | "POST",
+  body: unknown,
+): Promise<Response> {
+  if (!env.METRICS_STATE_DO) {
+    return jsonResponse(
+      { error: "metrics_state binding not configured (apply v6 migration)" },
+      503,
+    );
+  }
+  const id = env.METRICS_STATE_DO.idFromName("global-metrics");
+  const stub = env.METRICS_STATE_DO.get(id);
+  const init: RequestInit =
+    method === "GET"
+      ? { method: "GET" }
+      : {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body ?? {}),
+        };
+  const upstream = await stub.fetch(`https://do${path}`, init);
+  const text = await upstream.text();
+  return new Response(text, {
+    status: upstream.status,
+    headers: upstream.headers,
+  });
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

@@ -19,6 +19,29 @@ export interface Env {
    *  defensive dedup layer. `undefined` allowed: clients that hit
    *  `/work/*` endpoints get 503 until the v5 migration is applied. */
   WORK_DISTRIBUTOR_DO?: DurableObjectNamespace;
+  /** W5.7 / ADR-003 — singleton MetricsState DO (see `src/metrics_state.ts`).
+   *  Stores time-series snapshots of the /ops/snapshot payload for dashboard
+   *  charts and history drill-downs. `undefined` allowed: wired in by
+   *  the v6 migration; older deploys without it skip metrics writes. */
+  METRICS_STATE_DO?: DurableObjectNamespace;
+  /** W5.7 / ADR-003 — retention window in days for MetricsState snapshots.
+   *  Rows older than this are pruned on each GC alarm. Default "30". */
+  METRICS_RETENTION_DAYS?: string;
+  /** W5.7 / ADR-003 — hard row-count ceiling for MetricsState. Defence
+   *  against unbounded growth if idle suppression is misconfigured. Default "100000". */
+  METRICS_MAX_ROWS?: string;
+  /** ADR-002 — retention window in days for the signals event log table
+   *  inside RunnerRegistry DO. Default "90". */
+  SIGNALS_EVENT_LOG_RETENTION_DAYS?: string;
+  /** ADR-002 — retention window in days for the runners event log table
+   *  inside RunnerRegistry DO. Default "90". */
+  RUNNERS_EVENT_LOG_RETENTION_DAYS?: string;
+  /** ADR-002 — retention window in days for the login event log table
+   *  inside GlobalLoginState DO. Default "30". */
+  LOGIN_EVENT_LOG_RETENTION_DAYS?: string;
+  /** ADR-002 — retention window in days for the config audit log table
+   *  inside ConfigState DO. Default "365". */
+  CONFIG_AUDIT_LOG_RETENTION_DAYS?: string;
   LEASE_ANALYTICS?: AnalyticsEngineDataset;
   PROXY_COORDINATOR_TOKEN: string;
   SHORT_WINDOW_SEC?: string;
