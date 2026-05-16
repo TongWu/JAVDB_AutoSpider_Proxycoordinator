@@ -211,7 +211,10 @@ ${commonDashboardStyles()}
       </div>
     </div>
     <div class="panel full">
-      <header>Config snapshot</header>
+      <header>
+        <span>Config snapshot</span>
+        <button class="panel-history-btn" data-drawer="config">History →</button>
+      </header>
       <div class="body" id="config"></div>
     </div>
   </div>
@@ -297,6 +300,7 @@ ${commonDashboardStyles()}
       if (which === "signals") openDrawer("Signals history", signalsDrawerRenderer, {});
       else if (which === "runners") openDrawer("Runners history", runnersDrawerRenderer, {});
       else if (which === "login") openDrawer("Login history", loginDrawerRenderer, {});
+      else if (which === "config") openDrawer("Config audit", configDrawerRenderer, {});
       return;
     }
     var chip = e.target.closest && e.target.closest(".chip");
@@ -852,6 +856,37 @@ ${commonDashboardStyles()}
             + '<td>' + outcomePill + '</td>'
             + '<td><code>' + esc(r.holder_id || "—") + '</code></td>'
             + '<td class="muted" style="font-size:11px">' + esc(r.detail || "—") + '</td></tr>';
+        });
+        html += '</table>';
+        body.innerHTML = html;
+      })
+      .catch(function(err){ body.innerHTML = '<div class="empty">error: ' + esc(err.message) + '</div>'; });
+  }
+
+  // ── Phase 4: config drill-down ──────────────────────────────────────
+  function configDrawerRenderer(rangeMs, _ctx){
+    var body = $("drawer-body");
+    body.innerHTML = '<div class="empty">loading…</div>';
+    var to = Date.now();
+    // Config changes are rare; "Now" defaults to all-time (from=0).
+    var from = rangeMs > 0 ? to - rangeMs : 0;
+
+    fetch("/config/history?from=" + from + "&to=" + to, { credentials: "same-origin" })
+      .then(function(r){ if(r.status !== 200) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function(data){
+        var rows = data.rows || [];
+        if (rows.length === 0){ body.innerHTML = '<div class="empty">No config changes in this window.</div>'; return; }
+        var html = '<table><tr><th>Time</th><th>Key</th><th>Old</th><th>New</th><th>Actor</th><th>Reason</th></tr>';
+        rows.forEach(function(r){
+          var oldText = r.old_value === null || r.old_value === undefined ? "(none)" : String(r.old_value);
+          var newText = String(r.new_value);
+          var actorPillCls = r.actor_kind === "operator" ? "warn" : "muted";
+          html += '<tr><td class="muted">' + esc(fmtTs(r.ts)) + '</td>'
+            + '<td><code>' + esc(r.key) + '</code></td>'
+            + '<td class="muted"><code>' + esc(oldText) + '</code></td>'
+            + '<td><code>' + esc(newText) + '</code></td>'
+            + '<td class="muted">' + esc(r.actor || "—") + ' <span class="pill ' + actorPillCls + '" style="font-size:10px">' + esc(r.actor_kind) + '</span></td>'
+            + '<td class="muted" style="font-size:11px">' + esc(r.reason || "—") + '</td></tr>';
         });
         html += '</table>';
         body.innerHTML = html;

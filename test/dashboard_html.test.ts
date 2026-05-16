@@ -289,3 +289,28 @@ describe("Phase 4 — login drill-down", () => {
     expect(html).toMatch(/openDrawer\(['"]Login history['"],\s*loginDrawerRenderer/);
   });
 });
+
+describe("Phase 4 — config drill-down", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("Config snapshot panel has History button", () => {
+    expect(html).toMatch(/Config snapshot[\s\S]*?data-drawer="config"/);
+  });
+
+  it("configDrawerRenderer queries /config/history", () => {
+    expect(html).toContain("function configDrawerRenderer(");
+    expect(html).toContain("/config/history?from=");
+  });
+
+  it("renders old_value / new_value columns", () => {
+    expect(html).toMatch(/<th>Old<\/th>[\s\S]*?<th>New<\/th>/);
+  });
+
+  it("renders actor_kind pill (operator vs system)", () => {
+    expect(html).toContain("actor_kind");
+  });
+
+  it("click handler routes the config button to openDrawer", () => {
+    expect(html).toMatch(/openDrawer\(['"]Config audit['"],\s*configDrawerRenderer/);
+  });
+});
