@@ -119,6 +119,8 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/active_runners",
   "/config",
   "/signals",
+  "/dashboard",
+  "/ops/snapshot",
 ]);
 
 /** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
@@ -193,7 +195,12 @@ export default {
     // checkAuth so unauthenticated probes can't poison legitimate tokens'
     // buckets, and BEFORE the route switch so a depleted bucket short-
     // circuits even cheap routes.
-    const bearerToken = extractBearerToken(request);
+    //
+    // Uses the same header-or-query fallback as auth so the W5.1
+    // dashboard's polling requests (which carry `?token=`) count against
+    // the same bucket — an operator who opens the dashboard in two tabs
+    // gets one bucket, not two.
+    const bearerToken = extractTokenWithQueryFallback(request, url);
     const capacity = resolveRateLimitCapacity(env);
     if (bearerToken && !rateLimitAllow(bearerToken, capacity, Date.now())) {
       return jsonResponse({ error: "rate_limited" }, 429);
@@ -337,6 +344,19 @@ export default {
         }
         case "/active_runners":
           return await forwardToRunnerRegistryDo(env, "/do/active_runners", "GET", null);
+        // W5.1 — runtime observability dashboard
+        case "/dashboard":
+          return new Response(renderDashboardHtml(url), {
+            status: 200,
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              // Dashboard polls itself; prevent intermediaries from caching
+              // a stale snapshot in case the operator hard-refreshes.
+              "cache-control": "no-store",
+            },
+          });
+        case "/ops/snapshot":
+          return await aggregateOpsSnapshot(env, url);
         // W5.4 — operator-pushed active signals (live in RunnerRegistry DO)
         case "/signal": {
           const body = await request.json();
@@ -383,9 +403,9 @@ function checkAuth(request: Request, env: Env): boolean {
      */
     return false;
   }
-  const header = request.headers.get("authorization") ?? "";
-  if (!header.toLowerCase().startsWith("bearer ")) return false;
-  const provided = header.slice("bearer ".length).trim();
+  const url = new URL(request.url);
+  const provided = extractTokenWithQueryFallback(request, url);
+  if (!provided) return false;
   return constantTimeEqual(provided, token);
 }
 
@@ -398,6 +418,34 @@ function extractBearerToken(request: Request): string {
   const header = request.headers.get("authorization") ?? "";
   if (!header.toLowerCase().startsWith("bearer ")) return "";
   return header.slice("bearer ".length).trim();
+}
+
+/**
+ * W5.1 — paths where the dashboard can pass the bearer token via a
+ * `?token=` query parameter so the operator can paste a URL into a
+ * browser without curl gymnastics. The token still has to match the
+ * Worker secret exactly; the only thing the query alternative buys us
+ * is browser-friendliness for the operator's own dashboard URL.
+ *
+ * Trade-off: tokens in URLs end up in browser history and Worker
+ * access logs. Treat the dashboard URL as a secret bookmark; rotate
+ * `PROXY_COORDINATOR_TOKEN` if it leaks.
+ */
+const QUERY_TOKEN_PATHS = new Set<string>([
+  "/dashboard",
+  "/ops/snapshot",
+]);
+
+/**
+ * Like {@link extractBearerToken} but for dashboard / snapshot routes:
+ * accepts either the standard ``Authorization`` header OR a ``?token=``
+ * query parameter. Returns the empty string when neither is present.
+ */
+function extractTokenWithQueryFallback(request: Request, url: URL): string {
+  const header = extractBearerToken(request);
+  if (header) return header;
+  if (!QUERY_TOKEN_PATHS.has(url.pathname)) return "";
+  return (url.searchParams.get("token") ?? "").trim();
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -656,6 +704,282 @@ async function embedConfigSnapshot(env: Env, resp: Response): Promise<Response> 
     });
   }
   return jsonResponse(registryBody, resp.status);
+}
+
+/**
+ * W5.1 — aggregate live state across every DO into a single JSON
+ * snapshot the dashboard SPA can render in one round-trip.
+ *
+ * Proxy enumeration:
+ *   The ProxyCoordinator DO is addressed per-id (`idFromName(proxy_id)`);
+ *   there is no master "list of known proxies" registry. The operator
+ *   passes the proxy IDs they care about via `?proxy_ids=a,b,c` (comma
+ *   separated, max 32). Empty query → snapshot omits the proxies block
+ *   (the dashboard SPA shows a hint).
+ *
+ * Privacy:
+ *   Deliberately omits `GlobalLoginState` — the cookie inside it must
+ *   NEVER ride along in a dashboard payload (the token-in-URL workflow
+ *   exposes the snapshot to browser history + server logs). Operators
+ *   needing to inspect login state should use `GET /login_state` with
+ *   the standard header auth.
+ *
+ * Fail-open: each sub-fetch is independent; a single DO timing out
+ * surfaces as `null` in its slot rather than failing the whole snapshot.
+ */
+async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
+  const rawIds = (url.searchParams.get("proxy_ids") ?? "").trim();
+  // Cap at 32 to bound the fan-out fan-in fan-cost; ops dashboards
+  // monitor a handful of proxies at a time, not entire blast radius.
+  const proxyIds = rawIds
+    ? rawIds
+        .split(",")
+        .map((s) => normalizeProxyId(s.trim()))
+        .filter((s) => s !== "")
+        .slice(0, 32)
+    : [];
+
+  const now = Date.now();
+
+  // Fan out in parallel; each promise resolves to a `{ ok, data }` shape
+  // so one failure can't poison Promise.all.
+  const [runners, signals, config, proxies] = await Promise.all([
+    snapshotFromRegistry(env, "/do/active_runners"),
+    snapshotFromRegistry(env, "/do/signals"),
+    snapshotFromConfigState(env),
+    snapshotProxies(env, proxyIds),
+  ]);
+
+  return jsonResponse({
+    server_time: now,
+    runners,
+    signals,
+    config,
+    proxies,
+    // Echo back so the SPA can rebuild the query for refresh links.
+    queried_proxy_ids: proxyIds,
+  });
+}
+
+async function snapshotFromRegistry(
+  env: Env,
+  path: string,
+): Promise<unknown> {
+  if (!env.RUNNER_REGISTRY_DO) return null;
+  try {
+    const id = env.RUNNER_REGISTRY_DO.idFromName("runners");
+    const stub = env.RUNNER_REGISTRY_DO.get(id);
+    const r = await stub.fetch(`https://do${path}`, { method: "GET" });
+    if (r.status !== 200) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+async function snapshotFromConfigState(env: Env): Promise<unknown> {
+  if (!env.CONFIG_STATE_DO) return null;
+  try {
+    const id = env.CONFIG_STATE_DO.idFromName("global-config");
+    const stub = env.CONFIG_STATE_DO.get(id);
+    const r = await stub.fetch("https://do/do/config", { method: "GET" });
+    if (r.status !== 200) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+async function snapshotProxies(
+  env: Env,
+  proxyIds: string[],
+): Promise<Array<Record<string, unknown>>> {
+  if (proxyIds.length === 0) return [];
+  const results = await Promise.all(
+    proxyIds.map(async (proxyId) => {
+      try {
+        const id = env.PROXY_DO.idFromName(proxyId);
+        const stub = env.PROXY_DO.get(id);
+        const r = await stub.fetch("https://do/do/state", { method: "GET" });
+        if (r.status !== 200) {
+          return { proxy_id: proxyId, error: `status_${r.status}` };
+        }
+        const data = (await r.json()) as Record<string, unknown>;
+        return { proxy_id: proxyId, ...data };
+      } catch (err) {
+        return {
+          proxy_id: proxyId,
+          error: err instanceof Error ? err.message : "fetch_failed",
+        };
+      }
+    }),
+  );
+  return results;
+}
+
+/**
+ * W5.1 — render the dashboard HTML. Self-contained: inline CSS + vanilla
+ * JS, no CDN dependencies (Workers Free deployments behind operator
+ * firewalls shouldn't need to phone home to a CDN to render an ops
+ * panel). Reads the bearer token from the same `?token=` query that
+ * loaded this page and reuses it for snapshot polling.
+ *
+ * Stays under ~6 KB so the response is one TCP frame even cold-start.
+ */
+function renderDashboardHtml(url: URL): string {
+  const token = url.searchParams.get("token") ?? "";
+  const proxyIdsRaw = url.searchParams.get("proxy_ids") ?? "";
+  // JSON-safe embedding — escape the token only so it can't break the
+  // string literal in the inline script. The query already had to match
+  // the Bearer secret so this isn't a security boundary, just a
+  // string-injection guard.
+  const tokenJs = JSON.stringify(token);
+  const proxyIdsJs = JSON.stringify(proxyIdsRaw);
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<title>proxy-coordinator dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; margin: 0; background:#0f1115; color:#d6d8df; }
+  header { padding: 14px 20px; background:#1a1d24; border-bottom:1px solid #272a31; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { margin:0; font-size:16px; font-weight:600; }
+  header .status { font-size:12px; color:#8b8f97; }
+  main { padding: 16px 20px 32px; max-width: 1280px; margin: 0 auto; }
+  section { margin-top:24px; }
+  section h2 { font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:#8b8f97; margin:0 0 8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; background:#161920; border:1px solid #272a31; border-radius:6px; overflow:hidden; }
+  th, td { padding:8px 10px; text-align:left; border-bottom:1px solid #272a31; }
+  th { background:#1a1d24; font-weight:600; color:#a8acb5; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; }
+  tr:last-child td { border-bottom:none; }
+  td.muted { color:#8b8f97; }
+  td.warn { color:#f7c873; }
+  td.bad { color:#f47174; }
+  td.ok { color:#7fc88c; }
+  .empty { padding:14px; color:#8b8f97; font-style:italic; }
+  .hint { background:#1a1d24; border:1px solid #272a31; border-radius:6px; padding:14px; color:#8b8f97; font-size:13px; }
+  code { background:#0a0c10; padding:1px 5px; border-radius:3px; color:#d6d8df; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style></head>
+<body>
+<header>
+  <h1>proxy-coordinator dashboard</h1>
+  <div class="status"><span id="state">loading…</span> · refresh every 30 s · <span id="ts"></span></div>
+</header>
+<main>
+  <section><h2>Active runners</h2><div id="runners"><div class="empty">no data yet</div></div></section>
+  <section><h2>Active signals (W5.4)</h2><div id="signals"><div class="empty">no data yet</div></div></section>
+  <section><h2>Config snapshot (W5.3)</h2><div id="config"><div class="empty">no data yet</div></div></section>
+  <section><h2>Per-proxy state</h2><div id="proxies"><div class="empty">no data yet</div></div></section>
+</main>
+<script>
+(function(){
+  var TOKEN = ${tokenJs};
+  var PROXY_IDS = ${proxyIdsJs};
+  var REFRESH_MS = 30000;
+  var stateEl = document.getElementById("state");
+  var tsEl = document.getElementById("ts");
+
+  function fmtTs(ms){ if(!ms) return "—"; var d = new Date(ms); return d.toISOString().replace("T"," ").slice(0,19) + " UTC"; }
+  function escapeHtml(s){ return String(s).replace(/[&<>\"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c]; }); }
+  function fmtAge(ms, nowMs){ if(!ms) return "—"; var s = Math.max(0,(nowMs-ms)/1000); if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
+
+  function renderRunners(data, nowMs){
+    if(!data || !data.active_runners) return '<div class="empty">registry unavailable</div>';
+    var rows = data.active_runners;
+    if(rows.length === 0) return '<div class="empty">no live runners</div>';
+    var head = '<tr><th>holder_id</th><th>workflow</th><th>started</th><th>last heartbeat</th><th>pool hash</th><th>page range</th></tr>';
+    var body = rows.map(function(r){
+      var lastHb = fmtAge(r.last_heartbeat, nowMs);
+      var lastCls = r.last_heartbeat && (nowMs - r.last_heartbeat) > 120000 ? "warn" : "ok";
+      return '<tr>'
+        + '<td><code>'+escapeHtml(r.holder_id)+'</code></td>'
+        + '<td class="muted">'+escapeHtml(r.workflow_name||"—")+'</td>'
+        + '<td class="muted">'+fmtAge(r.started_at, nowMs)+' ago</td>'
+        + '<td class="'+lastCls+'">'+lastHb+' ago</td>'
+        + '<td><code>'+escapeHtml((r.proxy_pool_hash||"").slice(0,12))+'</code></td>'
+        + '<td class="muted">'+escapeHtml(r.page_range||"—")+'</td>'
+        + '</tr>';
+    }).join("");
+    return '<table>'+head+body+'</table>';
+  }
+
+  function renderSignals(data, nowMs){
+    if(!data || !data.active_signals) return '<div class="empty">registry unavailable</div>';
+    var rows = data.active_signals;
+    if(rows.length === 0) return '<div class="empty">no signals active (cohort is healthy)</div>';
+    var head = '<tr><th>id</th><th>kind</th><th>payload</th><th>expires</th><th>reason</th></tr>';
+    var body = rows.map(function(s){
+      var payload = s.kind === "throttle_global" ? ("factor="+s.factor) : s.kind === "ban_proxy" ? ("proxy_id="+s.proxy_id) : "—";
+      var exp = fmtAge(s.expires_at_ms, nowMs);
+      var expCls = s.expires_at_ms && (s.expires_at_ms - nowMs) < 60000 ? "warn" : "bad";
+      return '<tr>'
+        + '<td><code>'+escapeHtml(s.id)+'</code></td>'
+        + '<td class="'+(s.kind === "pause_all" ? "bad" : "warn")+'">'+escapeHtml(s.kind)+'</td>'
+        + '<td>'+escapeHtml(payload)+'</td>'
+        + '<td class="'+expCls+'">in '+exp+'</td>'
+        + '<td class="muted">'+escapeHtml(s.reason||"—")+'</td>'
+        + '</tr>';
+    }).join("");
+    return '<table>'+head+body+'</table>';
+  }
+
+  function renderConfig(data){
+    if(!data) return '<div class="empty">config-state DO unavailable</div>';
+    var entries = Object.entries(data.values||{});
+    var meta = '<div class="hint">version <code>'+escapeHtml(String(data.version||0))+'</code> · updated '+fmtTs(data.updated_at)+'</div>';
+    if(entries.length === 0) return meta + '<div class="empty">no operator overrides — all values use env-var defaults</div>';
+    var head = '<tr><th>key</th><th>value</th></tr>';
+    var body = entries.map(function(kv){ return '<tr><td><code>'+escapeHtml(kv[0])+'</code></td><td>'+escapeHtml(kv[1])+'</td></tr>'; }).join("");
+    return meta + '<table style="margin-top:8px">'+head+body+'</table>';
+  }
+
+  function renderProxies(rows){
+    if(!rows || rows.length === 0){
+      return '<div class="hint">No proxy IDs supplied. Add <code>?proxy_ids=Proxy-1,Proxy-2</code> to the URL to enumerate per-proxy throttle state.</div>';
+    }
+    var head = '<tr><th>proxy_id</th><th>wait until</th><th>banned</th><th>cf bypass</th><th>events</th></tr>';
+    var body = rows.map(function(p){
+      if(p.error){
+        return '<tr><td><code>'+escapeHtml(p.proxy_id)+'</code></td><td class="bad" colspan="4">error: '+escapeHtml(p.error)+'</td></tr>';
+      }
+      var banned = p.banned ? '<span class="bad">yes</span>' : '<span class="muted">no</span>';
+      var cfBp = p.requires_cf_bypass ? '<span class="warn">required</span>' : '<span class="muted">no</span>';
+      var nextWait = p.nextAvailableAt ? Math.max(0, p.nextAvailableAt - Date.now())+"ms" : "—";
+      var cfEventCount = (p.cfEvents && p.cfEvents.length) || 0;
+      return '<tr>'
+        + '<td><code>'+escapeHtml(p.proxy_id)+'</code></td>'
+        + '<td class="muted">'+escapeHtml(nextWait)+'</td>'
+        + '<td>'+banned+'</td>'
+        + '<td>'+cfBp+'</td>'
+        + '<td class="muted">'+escapeHtml(String(cfEventCount))+'</td>'
+        + '</tr>';
+    }).join("");
+    return '<table>'+head+body+'</table>';
+  }
+
+  function refresh(){
+    var url = "/ops/snapshot?token="+encodeURIComponent(TOKEN);
+    if(PROXY_IDS) url += "&proxy_ids="+encodeURIComponent(PROXY_IDS);
+    stateEl.textContent = "polling…";
+    fetch(url).then(function(r){
+      if(r.status !== 200) throw new Error("HTTP "+r.status);
+      return r.json();
+    }).then(function(data){
+      var nowMs = data.server_time || Date.now();
+      document.getElementById("runners").innerHTML = renderRunners(data.runners, nowMs);
+      document.getElementById("signals").innerHTML = renderSignals(data.signals, nowMs);
+      document.getElementById("config").innerHTML = renderConfig(data.config);
+      document.getElementById("proxies").innerHTML = renderProxies(data.proxies);
+      stateEl.textContent = "live";
+      tsEl.textContent = fmtTs(nowMs);
+    }).catch(function(err){
+      stateEl.textContent = "error: "+err.message;
+    });
+  }
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+</body></html>`;
 }
 
 function resolveClaimShard(rawDate?: string | null): string {
