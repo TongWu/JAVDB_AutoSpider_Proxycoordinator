@@ -6,6 +6,7 @@ import {
   ConfigSnapshot,
   Env,
 } from "./types";
+import { pruneLogTable } from "./event_log_helpers";
 
 /**
  * ConfigState — singleton DO holding operator-tunable runtime parameters
@@ -69,6 +70,24 @@ export class ConfigState implements DurableObject {
         PRIMARY KEY (ts, key)
       );
     `);
+    // Arm the first GC alarm so retention sweeps run even without PATCH traffic.
+    // setAlarm is idempotent — the value is replaced, not stacked.
+    state.storage.setAlarm(Date.now() + 86_400_000).catch(() => {});
+  }
+
+  /**
+   * Phase 2 / ADR-002 — retention sweep for config_audit_log.
+   * Default retention: 365 days (high audit value, low write volume).
+   * Hard cap: 100k rows (defensive).
+   * The alarm re-arms itself once per day so the sweep runs even when
+   * no PATCH traffic touches the DO.
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    const retentionMs = parseInt(this.env.CONFIG_AUDIT_LOG_RETENTION_DAYS ?? "365", 10) * 86_400_000;
+    pruneLogTable(this.state.storage.sql, "config_audit_log", retentionMs, 100_000, now);
+    // Re-arm daily.
+    await this.state.storage.setAlarm(now + 86_400_000);
   }
 
   async fetch(request: Request): Promise<Response> {

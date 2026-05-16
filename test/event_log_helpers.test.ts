@@ -70,4 +70,17 @@ describe("pruneLogTable", () => {
       expect(remaining).toHaveLength(1);
     });
   });
+
+  it("does not error when called on an empty table", async () => {
+    const id = env.GLOBAL_LOGIN_STATE_DO.idFromName("prune-empty");
+    const stub = env.GLOBAL_LOGIN_STATE_DO.get(id);
+    await runInDurableObject(stub, async (_inst, state) => {
+      const sql = state.storage.sql;
+      sql.exec("CREATE TABLE IF NOT EXISTS empty_log (ts INTEGER PRIMARY KEY)");
+      sql.exec("DELETE FROM empty_log");
+      pruneLogTable(sql, "empty_log", 1000, 100, 5000);
+      const count = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM empty_log").one().n;
+      expect(count).toBe(0);
+    });
+  });
 });

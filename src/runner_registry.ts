@@ -16,6 +16,7 @@ import {
   UnregisterRunnerRequest,
   UnregisterRunnerResponse,
 } from "./types";
+import { pruneLogTable } from "./event_log_helpers";
 
 /**
  * RunnerRegistry — singleton DO that tracks live spider runners across
@@ -220,6 +221,12 @@ export class RunnerRegistry implements DurableObject {
     if (purged > 0 || sigPurged > 0) {
       await this.persistState(data);
     }
+    // Phase 2 / ADR-002 — retention sweep on history tables.
+    const now2 = Date.now();
+    const signalsRetentionMs = parseInt(this.env.SIGNALS_EVENT_LOG_RETENTION_DAYS ?? "90", 10) * 86_400_000;
+    const runnersRetentionMs = parseInt(this.env.RUNNERS_EVENT_LOG_RETENTION_DAYS ?? "90", 10) * 86_400_000;
+    pruneLogTable(this.sql, "signals_event_log", signalsRetentionMs, 100_000, now2);
+    pruneLogTable(this.sql, "runners_event_log", runnersRetentionMs, 100_000, now2);
     // Re-arm when EITHER runners or signals remain — both are
     // time-bounded state worth GC'ing.
     if (

@@ -68,10 +68,12 @@ function isHourAnchor(ts: number): boolean {
 
 export class MetricsState implements DurableObject {
   private sql: SqlStorage;
+  private storage: DurableObjectStorage;
   private env: Env;
 
   constructor(state: DurableObjectState, env: Env) {
     this.sql = state.storage.sql;
+    this.storage = state.storage;
     this.env = env;
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS metrics_snapshots (
@@ -96,6 +98,18 @@ export class MetricsState implements DurableObject {
         last_ts_ms INTEGER NOT NULL DEFAULT 0
       );
     `);
+    // Arm the first GC alarm so retention sweeps run even without cron traffic.
+    // setAlarm is idempotent — the value is replaced, not stacked.
+    state.storage.setAlarm(Date.now() + 3_600_000).catch(() => {});
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    const retentionDays = parseInt(this.env.METRICS_RETENTION_DAYS ?? "30", 10);
+    const maxRows = parseInt(this.env.METRICS_MAX_ROWS ?? "100000", 10);
+    pruneLogTable(this.sql, "metrics_snapshots", retentionDays * 86_400_000, maxRows, now);
+    // Re-arm hourly — metrics churn is much higher than other history tables.
+    await this.storage.setAlarm(now + 3_600_000);
   }
 
   async fetch(request: Request): Promise<Response> {

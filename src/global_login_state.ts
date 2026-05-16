@@ -19,6 +19,7 @@ import {
   ReleaseLeaseRequest,
   ReleaseLeaseResponse,
 } from "./types";
+import { pruneLogTable } from "./event_log_helpers";
 
 /**
  * GlobalLoginState — singleton DO that arbitrates a single shared JavDB
@@ -152,6 +153,17 @@ export class GlobalLoginState implements DurableObject {
       CREATE INDEX IF NOT EXISTS idx_login_event_log_holder
       ON login_event_log(holder_id, ts);
     `);
+    // Arm the first GC alarm so retention sweeps run even without traffic.
+    // setAlarm is idempotent — the value is replaced, not stacked.
+    state.storage.setAlarm(Date.now() + 86_400_000).catch(() => {});
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    const retentionMs = parseInt(this.env.LOGIN_EVENT_LOG_RETENTION_DAYS ?? "30", 10) * 86_400_000;
+    pruneLogTable(this.state.storage.sql, "login_event_log", retentionMs, 100_000, now);
+    // Re-arm daily.
+    await this.state.storage.setAlarm(now + 86_400_000);
   }
 
   async fetch(request: Request): Promise<Response> {
