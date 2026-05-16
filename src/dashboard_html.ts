@@ -13,12 +13,15 @@
  * See docs/ai/adr/ADR-003 for the data-pipeline design that feeds this UI.
  */
 
+import { UPLOT_MIN_JS, UPLOT_MIN_CSS } from "./uplot_vendor";
+
 export function renderDashboardHtml(_url: URL): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8" />
 <title>Dashboard · Proxy Coordinator</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<style>${commonDashboardStyles()}
+<style>${UPLOT_MIN_CSS}
+${commonDashboardStyles()}
   body { padding-top: 56px; }
   .topbar {
     position: fixed; top: 0; left: 0; right: 0; height: 56px; z-index: 10;
@@ -112,6 +115,12 @@ export function renderDashboardHtml(_url: URL): string {
   .chip { display: inline-block; padding: 2px 10px; margin: 2px; font-size: 11px; border-radius: 999px; cursor: pointer; background: var(--input-bg); color: var(--muted); border: 1px solid var(--border); user-select: none; transition: all .12s; }
   .chip.active { background: var(--accent-dim); color: #0a0e14; border-color: var(--accent); }
   .chip .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+
+  .charts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 22px; }
+  @media (max-width: 1100px) { .charts { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 700px) { .charts { grid-template-columns: 1fr; } }
+  .chart-panel .chart-body { padding: 8px 12px 12px; min-height: 180px; }
+  .chart-panel header { font-size: 11px; }
 </style></head>
 <body>
 <div class="topbar">
@@ -128,6 +137,13 @@ export function renderDashboardHtml(_url: URL): string {
 <main>
   <div id="banners"></div>
   <div class="stats" id="stats"></div>
+  <div class="charts">
+    <div class="panel chart-panel" id="chart-runners"><header>Active runners trend</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-queue"><header>Queue depth</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-cf-bypass"><header>CF-bypass / banned ratio</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-latency"><header>Per-proxy latency (ms)</header><div class="chart-body"></div></div>
+    <div class="panel chart-panel" id="chart-health"><header>Per-proxy health score</header><div class="chart-body"></div></div>
+  </div>
   <div class="grid">
     <div class="panel">
       <header>Active runners <span class="badge" id="runner-count">0</span></header>
@@ -157,6 +173,7 @@ export function renderDashboardHtml(_url: URL): string {
     </div>
   </div>
 </main>
+<script>${UPLOT_MIN_JS}</script>
 <script>
 (function(){
   var $ = function(id){ return document.getElementById(id); };

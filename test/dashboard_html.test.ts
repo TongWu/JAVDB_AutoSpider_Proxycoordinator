@@ -106,3 +106,38 @@ describe("Phase 3 — per-proxy chip filter", () => {
     expect(html).toContain("localStorage.setItem(PROXY_FILTER_KEY");
   });
 });
+
+describe("Phase 3 — chart scaffolding", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("inlines uPlot JS", () => {
+    // The vendor JS exports a global `uPlot` IIFE; we check that some
+    // unique uPlot internal token appears in the HTML.
+    // uPlot's IIFE starts with !function (or var uPlot=)
+    expect(html).toMatch(/(?:var\s+uPlot\s*=|uPlot\.IIFE|function\s+uPlot)/);
+  });
+
+  it("inlines uPlot CSS class", () => {
+    // uPlot's CSS uses .u-plot, .u-cursor, etc.
+    expect(html).toContain(".u-wrap");
+  });
+
+  it("has 5 chart panel slots in the DOM", () => {
+    expect(html).toContain('id="chart-runners"');
+    expect(html).toContain('id="chart-queue"');
+    expect(html).toContain('id="chart-cf-bypass"');
+    expect(html).toContain('id="chart-latency"');
+    expect(html).toContain('id="chart-health"');
+  });
+
+  it("has chart row CSS grid", () => {
+    expect(html).toContain(".charts {");
+    expect(html).toContain("grid-template-columns");
+  });
+
+  it("each chart panel has a chart-body div", () => {
+    // Counts occurrences of 'class="chart-body"' — should be 5 (one per slot).
+    var matches = html.match(/class="chart-body"/g) ?? [];
+    expect(matches.length).toBe(5);
+  });
+});
