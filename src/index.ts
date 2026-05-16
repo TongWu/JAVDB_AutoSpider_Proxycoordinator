@@ -190,22 +190,40 @@ export default {
       return new Response("ok", { status: 200 });
     }
 
-    if (!checkAuth(request, env)) {
+    // ── W5.1 dashboard public surface ────────────────────────────────────
+    // The login form + login POST are intentionally pre-auth: they ARE
+    // the dashboard auth gate. `/` and `/dashboard` render either the
+    // login form (no valid cookie) or the dashboard (valid cookie).
+    if (DASHBOARD_PUBLIC_PATHS.has(url.pathname)) {
+      return await handleDashboardPublic(request, env, url);
+    }
+    if (url.pathname === "/dashboard/logout") {
+      return handleDashboardLogout();
+    }
+
+    // ── Standard auth (Bearer header OR dashboard cookie) ────────────────
+    const cookieAuth =
+      COOKIE_AUTH_PATHS.has(url.pathname) &&
+      (await verifyDashboardCookie(
+        env,
+        readCookie(request, DASHBOARD_COOKIE_NAME),
+      ));
+    if (!cookieAuth && !checkAuth(request, env)) {
       return jsonResponse({ error: "unauthorized" }, 401);
     }
 
-    // W5.6 — token-bucket rate limit, keyed by Bearer token. Runs AFTER
-    // checkAuth so unauthenticated probes can't poison legitimate tokens'
-    // buckets, and BEFORE the route switch so a depleted bucket short-
-    // circuits even cheap routes.
+    // W5.6 — token-bucket rate limit. Runs AFTER auth so unauthenticated
+    // probes can't poison legitimate tokens' buckets, and BEFORE the
+    // route switch so a depleted bucket short-circuits cheap routes.
     //
-    // Uses the same header-or-query fallback as auth so the W5.1
-    // dashboard's polling requests (which carry `?token=`) count against
-    // the same bucket — an operator who opens the dashboard in two tabs
-    // gets one bucket, not two.
-    const bearerToken = extractTokenWithQueryFallback(request, url);
+    // Bucket key: the Bearer token if present (machine-to-machine
+    // workflow), or the literal "dashboard" sentinel for cookie-authed
+    // requests — operator polling at 30 s is well under any sane limit
+    // but we still want it metered so a runaway dashboard tab is
+    // visible in metrics.
+    const bucketKey = extractBearerToken(request) || (cookieAuth ? "dashboard" : "");
     const capacity = resolveRateLimitCapacity(env);
-    if (bearerToken && !rateLimitAllow(bearerToken, capacity, Date.now())) {
+    if (bucketKey && !rateLimitAllow(bucketKey, capacity, Date.now())) {
       return jsonResponse({ error: "rate_limited" }, 429);
     }
 
@@ -347,17 +365,10 @@ export default {
         }
         case "/active_runners":
           return await forwardToRunnerRegistryDo(env, "/do/active_runners", "GET", null);
-        // W5.1 — runtime observability dashboard
-        case "/dashboard":
-          return new Response(renderDashboardHtml(url), {
-            status: 200,
-            headers: {
-              "content-type": "text/html; charset=utf-8",
-              // Dashboard polls itself; prevent intermediaries from caching
-              // a stale snapshot in case the operator hard-refreshes.
-              "cache-control": "no-store",
-            },
-          });
+        // W5.1 — runtime observability snapshot consumed by /dashboard
+        // SPA (cookie-authed) AND by external monitoring scripts
+        // (Bearer-authed). /dashboard + / are served pre-switch by
+        // handleDashboardPublic so they can also render the login form.
         case "/ops/snapshot":
           return await aggregateOpsSnapshot(env, url);
         // W5.5 — cross-DO health aggregation; returns proxy IDs ranked
@@ -431,8 +442,7 @@ function checkAuth(request: Request, env: Env): boolean {
      */
     return false;
   }
-  const url = new URL(request.url);
-  const provided = extractTokenWithQueryFallback(request, url);
+  const provided = extractBearerToken(request);
   if (!provided) return false;
   return constantTimeEqual(provided, token);
 }
@@ -449,31 +459,138 @@ function extractBearerToken(request: Request): string {
 }
 
 /**
- * W5.1 — paths where the dashboard can pass the bearer token via a
- * `?token=` query parameter so the operator can paste a URL into a
- * browser without curl gymnastics. The token still has to match the
- * Worker secret exactly; the only thing the query alternative buys us
- * is browser-friendliness for the operator's own dashboard URL.
- *
- * Trade-off: tokens in URLs end up in browser history and Worker
- * access logs. Treat the dashboard URL as a secret bookmark; rotate
- * `PROXY_COORDINATOR_TOKEN` if it leaks.
+ * W5.1 — paths where the dashboard cookie alone (no Bearer header)
+ * satisfies authentication. The cookie is HMAC-signed against
+ * ``PROXY_COORDINATOR_TOKEN`` and only issued after a successful
+ * password login at ``POST /dashboard/login`` (`DASHBOARD_PASSWORD`
+ * secret). External monitoring scripts hitting these same paths can
+ * still use the standard ``Authorization: Bearer`` header.
  */
-const QUERY_TOKEN_PATHS = new Set<string>([
+const COOKIE_AUTH_PATHS = new Set<string>([
+  "/",
   "/dashboard",
   "/ops/snapshot",
+  "/recommend_proxy",
+  "/dashboard/logout",
 ]);
 
+/** Routes inside ``/dashboard/*`` that bypass the normal auth gate
+ *  because they ARE the auth gate. ``/dashboard/login`` accepts a
+ *  password POST; ``/`` and ``/dashboard`` either render the login
+ *  form (no cookie) or the dashboard (valid cookie) inline. */
+const DASHBOARD_PUBLIC_PATHS = new Set<string>([
+  "/",
+  "/dashboard",
+  "/dashboard/login",
+]);
+
+const DASHBOARD_COOKIE_NAME = "dashboard_session";
+const DASHBOARD_DEFAULT_SESSION_TTL_SEC = 8 * 60 * 60; // 8 h
+
 /**
- * Like {@link extractBearerToken} but for dashboard / snapshot routes:
- * accepts either the standard ``Authorization`` header OR a ``?token=``
- * query parameter. Returns the empty string when neither is present.
+ * HMAC-SHA256 sign a payload with the Worker's main token as the key.
+ * Returns the signature as a lowercase hex string.
  */
-function extractTokenWithQueryFallback(request: Request, url: URL): string {
-  const header = extractBearerToken(request);
-  if (header) return header;
-  if (!QUERY_TOKEN_PATHS.has(url.pathname)) return "";
-  return (url.searchParams.get("token") ?? "").trim();
+async function hmacSign(secret: string, payload: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(payload),
+  );
+  return arrayBufferToHex(sig);
+}
+
+function arrayBufferToHex(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+/**
+ * Build a dashboard session cookie value of the form
+ * ``<expiry_ms>.<hex_signature>``. The signature commits to a
+ * versioned label + the expiry so neither field can be modified
+ * without invalidating the cookie.
+ */
+async function buildDashboardCookie(env: Env, ttlSec: number): Promise<string> {
+  const exp = Date.now() + ttlSec * 1000;
+  const sig = await hmacSign(
+    env.PROXY_COORDINATOR_TOKEN,
+    `dashboard_session_v1:${exp}`,
+  );
+  return `${exp}.${sig}`;
+}
+
+/**
+ * Verify a dashboard session cookie. Returns true iff:
+ *   - it parses as ``<int>.<hex>``;
+ *   - the expiry is in the future;
+ *   - the signature matches when recomputed with the current token.
+ *
+ * Constant-time equality protects against timing-side-channel attacks
+ * on the signature half. Returns false on every failure mode so the
+ * caller doesn't need to differentiate between "no cookie" and "bad
+ * cookie".
+ */
+async function verifyDashboardCookie(
+  env: Env,
+  rawCookie: string,
+): Promise<boolean> {
+  if (!rawCookie) return false;
+  const dot = rawCookie.indexOf(".");
+  if (dot <= 0) return false;
+  const expStr = rawCookie.slice(0, dot);
+  const providedSig = rawCookie.slice(dot + 1);
+  const exp = parseInt(expStr, 10);
+  if (!Number.isFinite(exp) || exp <= Date.now()) return false;
+  let expectedSig: string;
+  try {
+    expectedSig = await hmacSign(
+      env.PROXY_COORDINATOR_TOKEN,
+      `dashboard_session_v1:${exp}`,
+    );
+  } catch {
+    return false;
+  }
+  return constantTimeEqual(providedSig, expectedSig);
+}
+
+/** Read one cookie value from the request's ``Cookie:`` header.
+ *  Returns the empty string when the header is missing or the named
+ *  cookie isn't present. Defensive parse — does not pull in a full
+ *  cookie library. */
+function readCookie(request: Request, name: string): string {
+  const header = request.headers.get("cookie") ?? "";
+  if (!header) return "";
+  const parts = header.split(";");
+  for (const part of parts) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    const k = part.slice(0, eq).trim();
+    if (k !== name) continue;
+    return part.slice(eq + 1).trim();
+  }
+  return "";
+}
+
+function resolveDashboardSessionTtlSec(env: Env): number {
+  const raw = env.DASHBOARD_SESSION_TTL_SEC;
+  if (!raw) return DASHBOARD_DEFAULT_SESSION_TTL_SEC;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 60) return DASHBOARD_DEFAULT_SESSION_TTL_SEC;
+  // Hard ceiling at 30 days so an accidentally-large value can't keep a
+  // stale session alive forever.
+  return Math.min(n, 30 * 24 * 60 * 60);
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -1002,161 +1119,541 @@ function clampNumber(
 }
 
 /**
- * W5.1 — render the dashboard HTML. Self-contained: inline CSS + vanilla
- * JS, no CDN dependencies (Workers Free deployments behind operator
- * firewalls shouldn't need to phone home to a CDN to render an ops
- * panel). Reads the bearer token from the same `?token=` query that
- * loaded this page and reuses it for snapshot polling.
+ * W5.1 — dispatch the dashboard's public surface (no Bearer header
+ * required because we ARE the auth gate). Renders the login form when
+ * the dashboard session cookie is absent / invalid; renders the
+ * dashboard SPA when the cookie verifies.
  *
- * Stays under ~6 KB so the response is one TCP frame even cold-start.
+ * Three routes flow through here:
+ *   - GET  /                  — root domain alias for /dashboard
+ *   - GET  /dashboard         — explicit dashboard route
+ *   - POST /dashboard/login   — password form submission
+ */
+async function handleDashboardPublic(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response> {
+  if (
+    url.pathname === "/dashboard/login" &&
+    request.method === "POST"
+  ) {
+    return await handleDashboardLogin(request, env, url);
+  }
+  if (request.method !== "GET") {
+    return jsonResponse({ error: "method not allowed" }, 405);
+  }
+  const cookie = readCookie(request, DASHBOARD_COOKIE_NAME);
+  const valid = await verifyDashboardCookie(env, cookie);
+  const html = valid
+    ? renderDashboardHtml(url)
+    : renderLoginHtml(url, env, undefined);
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      // Browsers should never see this rendered inside a frame on another
+      // origin — defence-in-depth against clickjacking attacks against
+      // the login form.
+      "x-frame-options": "DENY",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
+/**
+ * Process a password submission. Accepts either application/json
+ * (``{password: ...}``) or application/x-www-form-urlencoded
+ * (``password=...``) so a no-JS browser submission still works.
+ *
+ * On success: redirect to /, with the signed session cookie.
+ * On failure: re-render the login form with an inline error.
+ *
+ * Two failure modes are surfaced verbatim ("invalid password",
+ * "dashboard not configured") because they correspond to operator
+ * misconfiguration; the response itself is constant-status (200) so
+ * automated scrapers can't easily distinguish them, and the 1-second
+ * sleep on every failure path bounds brute-force throughput.
+ */
+async function handleDashboardLogin(
+  request: Request,
+  env: Env,
+  url: URL,
+): Promise<Response> {
+  const errorRender = async (msg: string): Promise<Response> => {
+    // Burn ~750 ms on every failed login to cap brute-force throughput
+    // to ~80 attempts/minute even from a single isolate. Combined with
+    // W5.6 rate-limit (1000 req/min keyed by "dashboard"), an attacker
+    // gets at most ~1000/min total before being throttled.
+    await new Promise((r) => setTimeout(r, 750));
+    return new Response(renderLoginHtml(url, env, msg), {
+      status: 200,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "x-frame-options": "DENY",
+        "referrer-policy": "no-referrer",
+      },
+    });
+  };
+
+  const expected = env.DASHBOARD_PASSWORD;
+  if (!expected) {
+    return errorRender("Dashboard password is not configured on the Worker.");
+  }
+
+  let provided = "";
+  const ctype = (request.headers.get("content-type") ?? "").toLowerCase();
+  if (ctype.includes("application/json")) {
+    try {
+      const body = (await request.json()) as { password?: unknown };
+      if (typeof body?.password === "string") provided = body.password;
+    } catch {
+      /* fall through; provided stays "" */
+    }
+  } else {
+    // Default: form-encoded (HTML <form> POST).
+    try {
+      const text = await request.text();
+      const params = new URLSearchParams(text);
+      provided = params.get("password") ?? "";
+    } catch {
+      /* fall through */
+    }
+  }
+  if (!provided) {
+    return errorRender("Please enter a password.");
+  }
+  if (!constantTimeEqual(provided, expected)) {
+    return errorRender("Invalid password.");
+  }
+
+  const ttl = resolveDashboardSessionTtlSec(env);
+  const cookieValue = await buildDashboardCookie(env, ttl);
+  const cookie = [
+    `${DASHBOARD_COOKIE_NAME}=${cookieValue}`,
+    `Max-Age=${ttl}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Secure",
+  ].join("; ");
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location: "/",
+      "set-cookie": cookie,
+      "cache-control": "no-store",
+    },
+  });
+}
+
+/**
+ * Clear the dashboard session cookie. Returns the operator to /, where
+ * the login form will render on the next request because the cookie is
+ * now expired.
+ */
+function handleDashboardLogout(): Response {
+  const cookie = [
+    `${DASHBOARD_COOKIE_NAME}=`,
+    "Max-Age=0",
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Secure",
+  ].join("; ");
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location: "/",
+      "set-cookie": cookie,
+      "cache-control": "no-store",
+    },
+  });
+}
+
+/**
+ * Render the login form. ``errorMessage`` (if set) is shown inline
+ * above the password field. The form posts to ``/dashboard/login``
+ * as ``application/x-www-form-urlencoded`` so it works with no JS.
+ */
+function renderLoginHtml(
+  _url: URL,
+  _env: Env,
+  errorMessage: string | undefined,
+): string {
+  const errorBlock = errorMessage
+    ? `<div class="alert">${escapeHtmlForServer(errorMessage)}</div>`
+    : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8" />
+<title>Sign in · Proxy Coordinator</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>${commonDashboardStyles()}
+  .login-shell {
+    min-height: 100vh; display:flex; align-items:center; justify-content:center;
+    background:
+      radial-gradient(1100px 600px at 80% -10%, rgba(56, 189, 248, 0.08), transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, rgba(168, 85, 247, 0.07), transparent 60%),
+      var(--bg);
+  }
+  .card {
+    width: 380px; padding: 32px; background: var(--card-bg);
+    border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: 0 20px 50px -20px rgba(0,0,0,0.7);
+  }
+  .brand { display:flex; align-items:center; gap:10px; margin-bottom: 22px; }
+  .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 12px var(--ok); }
+  .brand .title { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text); }
+  .brand .sub { font-size: 11px; color: var(--muted); margin-left: auto; }
+  h2 { margin: 0 0 6px; font-size: 20px; color: var(--text); }
+  .lead { color: var(--muted); font-size: 13px; margin: 0 0 22px; line-height: 1.5; }
+  label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color: var(--muted); margin-bottom: 6px; }
+  input[type="password"] {
+    width: 100%; padding: 11px 14px; font-size: 14px; border-radius: 8px;
+    background: var(--input-bg); border: 1px solid var(--border); color: var(--text);
+    box-sizing: border-box; outline: none; transition: border-color .15s;
+  }
+  input[type="password"]:focus { border-color: var(--accent); }
+  button {
+    width: 100%; margin-top: 18px; padding: 11px 14px; font-size: 14px; font-weight: 500;
+    border: none; border-radius: 8px; cursor: pointer;
+    background: linear-gradient(180deg, var(--accent), var(--accent-dim));
+    color: #0a0e14; transition: filter .15s;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:active { filter: brightness(0.95); }
+  .alert {
+    margin: -6px 0 16px; padding: 10px 12px; font-size: 12px; color: var(--bad);
+    background: rgba(248, 113, 113, 0.08); border: 1px solid rgba(248, 113, 113, 0.25);
+    border-radius: 6px;
+  }
+  .foot { margin-top: 18px; font-size: 11px; color: var(--muted); text-align:center; }
+  .foot code { background: var(--input-bg); padding: 1px 5px; border-radius: 3px; }
+</style></head>
+<body>
+<div class="login-shell">
+  <div class="card">
+    <div class="brand">
+      <span class="dot"></span>
+      <span class="title">Proxy Coordinator</span>
+      <span class="sub">ops</span>
+    </div>
+    <h2>Sign in</h2>
+    <p class="lead">Enter the operator dashboard password to access live runner state, signals, and config.</p>
+    ${errorBlock}
+    <form method="POST" action="/dashboard/login" autocomplete="off">
+      <label for="password">Password</label>
+      <input id="password" type="password" name="password" autofocus required />
+      <button type="submit">Sign in</button>
+    </form>
+    <div class="foot">Configure with <code>wrangler secret put DASHBOARD_PASSWORD</code></div>
+  </div>
+</div>
+</body></html>`;
+}
+
+/**
+ * Render the dashboard SPA. Reads the operator session cookie that
+ * was set by ``/dashboard/login``; uses ``credentials: same-origin``
+ * on every fetch so the cookie rides along automatically.
  */
 function renderDashboardHtml(url: URL): string {
-  const token = url.searchParams.get("token") ?? "";
   const proxyIdsRaw = url.searchParams.get("proxy_ids") ?? "";
-  // JSON-safe embedding — escape the token only so it can't break the
-  // string literal in the inline script. The query already had to match
-  // the Bearer secret so this isn't a security boundary, just a
-  // string-injection guard.
-  const tokenJs = JSON.stringify(token);
   const proxyIdsJs = JSON.stringify(proxyIdsRaw);
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8" />
-<title>proxy-coordinator dashboard</title>
+<title>Dashboard · Proxy Coordinator</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; margin: 0; background:#0f1115; color:#d6d8df; }
-  header { padding: 14px 20px; background:#1a1d24; border-bottom:1px solid #272a31; display:flex; justify-content:space-between; align-items:center; }
-  header h1 { margin:0; font-size:16px; font-weight:600; }
-  header .status { font-size:12px; color:#8b8f97; }
-  main { padding: 16px 20px 32px; max-width: 1280px; margin: 0 auto; }
-  section { margin-top:24px; }
-  section h2 { font-size:13px; text-transform:uppercase; letter-spacing:0.05em; color:#8b8f97; margin:0 0 8px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; background:#161920; border:1px solid #272a31; border-radius:6px; overflow:hidden; }
-  th, td { padding:8px 10px; text-align:left; border-bottom:1px solid #272a31; }
-  th { background:#1a1d24; font-weight:600; color:#a8acb5; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; }
-  tr:last-child td { border-bottom:none; }
-  td.muted { color:#8b8f97; }
-  td.warn { color:#f7c873; }
-  td.bad { color:#f47174; }
-  td.ok { color:#7fc88c; }
-  .empty { padding:14px; color:#8b8f97; font-style:italic; }
-  .hint { background:#1a1d24; border:1px solid #272a31; border-radius:6px; padding:14px; color:#8b8f97; font-size:13px; }
-  code { background:#0a0c10; padding:1px 5px; border-radius:3px; color:#d6d8df; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+<style>${commonDashboardStyles()}
+  body { padding-top: 56px; }
+  .topbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 56px; z-index: 10;
+    display: flex; align-items: center; padding: 0 24px;
+    background: rgba(11, 15, 21, 0.85); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar .brand { display:flex; align-items:center; gap:10px; }
+  .topbar .brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .2s, box-shadow .2s; }
+  .topbar .brand.live .dot { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: pulse 2s infinite; }
+  .topbar .brand.err .dot { background: var(--bad); box-shadow: 0 0 10px var(--bad); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .topbar .title { font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text); }
+  .topbar .sub { font-size: 11px; color: var(--muted); }
+  .topbar .spacer { flex: 1; }
+  .topbar .meta { display:flex; align-items:center; gap:18px; font-size: 12px; color: var(--muted); }
+  .topbar .meta code { color: var(--text); }
+  .topbar a.logout { color: var(--muted); text-decoration: none; font-size: 12px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 6px; transition: color .15s, border-color .15s; }
+  .topbar a.logout:hover { color: var(--text); border-color: var(--muted); }
+  main { max-width: 1440px; margin: 0 auto; padding: 28px 24px 56px; }
+
+  /* Hero stats row */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
+  .stat-card {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .stat-card .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin-bottom: 6px; }
+  .stat-card .value { font-size: 32px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; line-height: 1.1; }
+  .stat-card .delta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .stat-card.warn .value { color: var(--warn); }
+  .stat-card.bad .value { color: var(--bad); }
+  .stat-card.ok .value { color: var(--ok); }
+
+  /* Section grid */
+  .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 20px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, 1fr); } }
+  .panel {
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .panel header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+  }
+  .panel header .badge { font-size: 10px; background: var(--input-bg); color: var(--text); padding: 2px 7px; border-radius: 4px; letter-spacing: 0; text-transform: none; }
+  .panel .body { padding: 0; }
+  .panel.full { grid-column: 1 / -1; }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { padding: 9px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  th { font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); background: rgba(0,0,0,0.15); }
+  td code { background: var(--input-bg); padding: 2px 6px; border-radius: 3px; color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+  td .muted { color: var(--muted); }
+  td .pill { display: inline-block; padding: 2px 7px; font-size: 11px; border-radius: 999px; font-weight: 500; }
+  td .pill.ok { background: rgba(74, 222, 128, 0.12); color: var(--ok); }
+  td .pill.warn { background: rgba(251, 191, 36, 0.12); color: var(--warn); }
+  td .pill.bad { background: rgba(248, 113, 113, 0.12); color: var(--bad); }
+  td .pill.muted { background: var(--input-bg); color: var(--muted); }
+
+  .score-bar { display: inline-flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
+  .score-bar .track { width: 80px; height: 4px; border-radius: 2px; background: var(--input-bg); overflow: hidden; }
+  .score-bar .fill { display: block; height: 100%; background: linear-gradient(90deg, var(--ok), var(--accent)); border-radius: 2px; }
+
+  .empty { padding: 22px 16px; color: var(--muted); font-style: italic; font-size: 12.5px; text-align: center; }
+  .hint { padding: 14px 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .hint code { background: var(--input-bg); padding: 1px 5px; border-radius: 3px; color: var(--text); }
+
+  .banner {
+    margin: 0 0 22px; padding: 12px 16px;
+    background: linear-gradient(90deg, rgba(248, 113, 113, 0.10), rgba(248, 113, 113, 0.02));
+    border: 1px solid rgba(248, 113, 113, 0.30); border-radius: 8px;
+    color: var(--bad); font-size: 12.5px;
+  }
+  .banner strong { color: var(--text); margin-right: 6px; }
+  .banner.warn { background: linear-gradient(90deg, rgba(251, 191, 36, 0.10), rgba(251, 191, 36, 0.02)); border-color: rgba(251, 191, 36, 0.30); color: var(--warn); }
+
+  details { padding: 0 16px; }
+  details summary { padding: 12px 0; cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); list-style: none; user-select: none; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary::before { content: "▸"; margin-right: 6px; display: inline-block; transition: transform .15s; }
+  details[open] summary::before { transform: rotate(90deg); }
+  details .config-grid { padding: 0 0 16px; display: grid; grid-template-columns: minmax(220px, auto) 1fr; gap: 4px 16px; font-size: 12.5px; }
+  details .config-grid .k { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  details .config-grid .v { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style></head>
 <body>
-<header>
-  <h1>proxy-coordinator dashboard</h1>
-  <div class="status"><span id="state">loading…</span> · refresh every 30 s · <span id="ts"></span></div>
-</header>
+<div class="topbar">
+  <div class="brand" id="brand"><span class="dot"></span><span class="title">Proxy Coordinator</span><span class="sub">/ ops</span></div>
+  <div class="spacer"></div>
+  <div class="meta">
+    <span>last update <code id="ts">—</code></span>
+    <span id="state">connecting…</span>
+    <form method="POST" action="/dashboard/logout" style="margin:0">
+      <button type="submit" style="all:unset"><a class="logout" href="/dashboard/logout" onclick="this.closest('form').submit(); return false;">Sign out</a></button>
+    </form>
+  </div>
+</div>
 <main>
-  <section><h2>Active runners</h2><div id="runners"><div class="empty">no data yet</div></div></section>
-  <section><h2>Active signals (W5.4)</h2><div id="signals"><div class="empty">no data yet</div></div></section>
-  <section><h2>Config snapshot (W5.3)</h2><div id="config"><div class="empty">no data yet</div></div></section>
-  <section><h2>Per-proxy state</h2><div id="proxies"><div class="empty">no data yet</div></div></section>
+  <div id="banners"></div>
+  <div class="stats" id="stats"></div>
+  <div class="grid">
+    <div class="panel">
+      <header>Active runners <span class="badge" id="runner-count">0</span></header>
+      <div class="body" id="runners"></div>
+    </div>
+    <div class="panel">
+      <header>Active signals <span class="badge" id="signal-count">0</span></header>
+      <div class="body" id="signals"></div>
+    </div>
+    <div class="panel full">
+      <header>Per-proxy state <span class="badge" id="proxy-count">0</span></header>
+      <div class="body" id="proxies"></div>
+    </div>
+    <div class="panel full">
+      <header>Config snapshot</header>
+      <div class="body" id="config"></div>
+    </div>
+  </div>
 </main>
 <script>
 (function(){
-  var TOKEN = ${tokenJs};
   var PROXY_IDS = ${proxyIdsJs};
   var REFRESH_MS = 30000;
-  var stateEl = document.getElementById("state");
-  var tsEl = document.getElementById("ts");
+  var $ = function(id){ return document.getElementById(id); };
+  var brand = $("brand");
 
-  function fmtTs(ms){ if(!ms) return "—"; var d = new Date(ms); return d.toISOString().replace("T"," ").slice(0,19) + " UTC"; }
-  function escapeHtml(s){ return String(s).replace(/[&<>\"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c]; }); }
+  function fmtTs(ms){ if(!ms) return "—"; var d = new Date(ms); return d.toISOString().replace("T"," ").slice(11,19) + "Z"; }
   function fmtAge(ms, nowMs){ if(!ms) return "—"; var s = Math.max(0,(nowMs-ms)/1000); if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
+  function fmtDur(ms){ if(ms<=0) return "—"; var s = ms/1000; if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c]; }); }
+
+  function statTile(label, value, cls){
+    return '<div class="stat-card '+(cls||"")+'"><div class="label">'+label+'</div><div class="value">'+esc(String(value))+'</div></div>';
+  }
+
+  function renderStats(data, nowMs){
+    var runners = (data.runners && data.runners.active_runners) || [];
+    var signals = (data.signals && data.signals.active_signals) || [];
+    var proxies = data.proxies || [];
+    var healthyProxies = proxies.filter(function(p){ return !p.banned && !p.error; }).length;
+    var signalCls = signals.length === 0 ? "" : (signals.some(function(s){ return s.kind === "pause_all"; }) ? "bad" : "warn");
+    var html = "";
+    html += statTile("Live runners", runners.length, runners.length > 0 ? "ok" : "");
+    html += statTile("Active signals", signals.length, signalCls);
+    html += statTile("Proxies tracked", proxies.length, "");
+    html += statTile("Healthy proxies", healthyProxies + " / " + proxies.length, healthyProxies === proxies.length && proxies.length > 0 ? "ok" : (healthyProxies === 0 && proxies.length > 0 ? "bad" : ""));
+    $("stats").innerHTML = html;
+  }
+
+  function renderBanners(data){
+    var signals = (data.signals && data.signals.active_signals) || [];
+    if(signals.length === 0){ $("banners").innerHTML = ""; return; }
+    var nowMs = data.server_time || Date.now();
+    var html = "";
+    signals.forEach(function(s){
+      var cls = s.kind === "pause_all" ? "" : "warn";
+      var payload = "";
+      if(s.kind === "throttle_global") payload = "global throttle × " + s.factor;
+      else if(s.kind === "ban_proxy") payload = "ban proxy " + esc(s.proxy_id || "?");
+      else if(s.kind === "pause_all") payload = "PAUSE ALL RUNNERS";
+      else payload = esc(s.kind);
+      var ttl = fmtDur((s.expires_at_ms || 0) - nowMs);
+      html += '<div class="banner '+cls+'"><strong>'+payload+'</strong>· expires in '+ttl;
+      if(s.reason) html += ' · <em>'+esc(s.reason)+'</em>';
+      html += ' · <code>'+esc(s.id)+'</code></div>';
+    });
+    $("banners").innerHTML = html;
+  }
 
   function renderRunners(data, nowMs){
-    if(!data || !data.active_runners) return '<div class="empty">registry unavailable</div>';
-    var rows = data.active_runners;
-    if(rows.length === 0) return '<div class="empty">no live runners</div>';
-    var head = '<tr><th>holder_id</th><th>workflow</th><th>started</th><th>last heartbeat</th><th>pool hash</th><th>page range</th></tr>';
-    var body = rows.map(function(r){
-      var lastHb = fmtAge(r.last_heartbeat, nowMs);
-      var lastCls = r.last_heartbeat && (nowMs - r.last_heartbeat) > 120000 ? "warn" : "ok";
-      return '<tr>'
-        + '<td><code>'+escapeHtml(r.holder_id)+'</code></td>'
-        + '<td class="muted">'+escapeHtml(r.workflow_name||"—")+'</td>'
-        + '<td class="muted">'+fmtAge(r.started_at, nowMs)+' ago</td>'
-        + '<td class="'+lastCls+'">'+lastHb+' ago</td>'
-        + '<td><code>'+escapeHtml((r.proxy_pool_hash||"").slice(0,12))+'</code></td>'
-        + '<td class="muted">'+escapeHtml(r.page_range||"—")+'</td>'
-        + '</tr>';
-    }).join("");
-    return '<table>'+head+body+'</table>';
+    if(!data.runners || !data.runners.active_runners){ $("runners").innerHTML = '<div class="empty">registry unavailable</div>'; $("runner-count").textContent = "0"; return; }
+    var rows = data.runners.active_runners;
+    $("runner-count").textContent = String(rows.length);
+    if(rows.length === 0){ $("runners").innerHTML = '<div class="empty">No live runners</div>'; return; }
+    var html = '<table><tr><th>Holder</th><th>Workflow</th><th>Uptime</th><th>Last heartbeat</th><th>Pool hash</th></tr>';
+    rows.forEach(function(r){
+      var lastAge = nowMs - r.last_heartbeat;
+      var lastCls = lastAge > 120000 ? "warn" : (lastAge > 300000 ? "bad" : "ok");
+      var lastPill = '<span class="pill '+lastCls+'">'+fmtAge(r.last_heartbeat, nowMs)+' ago</span>';
+      html += '<tr><td><code>'+esc(r.holder_id)+'</code></td>'
+        + '<td class="muted">'+esc(r.workflow_name || "—")+'</td>'
+        + '<td class="muted">'+fmtAge(r.started_at, nowMs)+'</td>'
+        + '<td>'+lastPill+'</td>'
+        + '<td><code>'+esc((r.proxy_pool_hash || "").slice(0,10) || "—")+'</code></td></tr>';
+    });
+    html += '</table>';
+    $("runners").innerHTML = html;
   }
 
   function renderSignals(data, nowMs){
-    if(!data || !data.active_signals) return '<div class="empty">registry unavailable</div>';
-    var rows = data.active_signals;
-    if(rows.length === 0) return '<div class="empty">no signals active (cohort is healthy)</div>';
-    var head = '<tr><th>id</th><th>kind</th><th>payload</th><th>expires</th><th>reason</th></tr>';
-    var body = rows.map(function(s){
-      var payload = s.kind === "throttle_global" ? ("factor="+s.factor) : s.kind === "ban_proxy" ? ("proxy_id="+s.proxy_id) : "—";
-      var exp = fmtAge(s.expires_at_ms, nowMs);
-      var expCls = s.expires_at_ms && (s.expires_at_ms - nowMs) < 60000 ? "warn" : "bad";
-      return '<tr>'
-        + '<td><code>'+escapeHtml(s.id)+'</code></td>'
-        + '<td class="'+(s.kind === "pause_all" ? "bad" : "warn")+'">'+escapeHtml(s.kind)+'</td>'
-        + '<td>'+escapeHtml(payload)+'</td>'
-        + '<td class="'+expCls+'">in '+exp+'</td>'
-        + '<td class="muted">'+escapeHtml(s.reason||"—")+'</td>'
-        + '</tr>';
-    }).join("");
-    return '<table>'+head+body+'</table>';
+    if(!data.signals || !data.signals.active_signals){ $("signals").innerHTML = '<div class="empty">registry unavailable</div>'; $("signal-count").textContent = "0"; return; }
+    var rows = data.signals.active_signals;
+    $("signal-count").textContent = String(rows.length);
+    if(rows.length === 0){ $("signals").innerHTML = '<div class="empty">Cohort healthy — no operator signals</div>'; return; }
+    var html = '<table><tr><th>Kind</th><th>Payload</th><th>Expires</th></tr>';
+    rows.forEach(function(s){
+      var cls = s.kind === "pause_all" ? "bad" : "warn";
+      var payload = "—";
+      if(s.kind === "throttle_global") payload = '× '+esc(s.factor);
+      else if(s.kind === "ban_proxy") payload = '<code>'+esc(s.proxy_id || "?")+'</code>';
+      var ttl = fmtDur((s.expires_at_ms || 0) - nowMs);
+      html += '<tr><td><span class="pill '+cls+'">'+esc(s.kind)+'</span></td><td>'+payload+'</td><td class="muted">in '+ttl+'</td></tr>';
+    });
+    html += '</table>';
+    $("signals").innerHTML = html;
   }
 
   function renderConfig(data){
-    if(!data) return '<div class="empty">config-state DO unavailable</div>';
-    var entries = Object.entries(data.values||{});
-    var meta = '<div class="hint">version <code>'+escapeHtml(String(data.version||0))+'</code> · updated '+fmtTs(data.updated_at)+'</div>';
-    if(entries.length === 0) return meta + '<div class="empty">no operator overrides — all values use env-var defaults</div>';
-    var head = '<tr><th>key</th><th>value</th></tr>';
-    var body = entries.map(function(kv){ return '<tr><td><code>'+escapeHtml(kv[0])+'</code></td><td>'+escapeHtml(kv[1])+'</td></tr>'; }).join("");
-    return meta + '<table style="margin-top:8px">'+head+body+'</table>';
+    if(!data.config){ $("config").innerHTML = '<div class="empty">config-state DO unavailable</div>'; return; }
+    var entries = Object.entries(data.config.values || {});
+    if(entries.length === 0){
+      $("config").innerHTML = '<div class="hint">No operator overrides — all values use env-var defaults from <code>wrangler.toml</code>. Snapshot version <code>'+esc(String(data.config.version||0))+'</code>.</div>';
+      return;
+    }
+    var html = '<details open><summary>'+entries.length+' override(s) · version <code style="text-transform:none;letter-spacing:0">'+esc(String(data.config.version||0))+'</code></summary><div class="config-grid">';
+    entries.forEach(function(kv){
+      html += '<div class="k">'+esc(kv[0])+'</div><div class="v">'+esc(kv[1])+'</div>';
+    });
+    html += '</div></details>';
+    $("config").innerHTML = html;
   }
 
-  function renderProxies(rows){
-    if(!rows || rows.length === 0){
-      return '<div class="hint">No proxy IDs supplied. Add <code>?proxy_ids=Proxy-1,Proxy-2</code> to the URL to enumerate per-proxy throttle state.</div>';
+  function renderProxies(data){
+    var rows = data.proxies || [];
+    $("proxy-count").textContent = String(rows.length);
+    if(rows.length === 0){
+      $("proxies").innerHTML = '<div class="hint">No proxies queried. Append <code>?proxy_ids=Proxy-1,Proxy-2</code> to this URL to enumerate per-proxy throttle state.</div>';
+      return;
     }
-    var head = '<tr><th>proxy_id</th><th>wait until</th><th>banned</th><th>cf bypass</th><th>events</th></tr>';
-    var body = rows.map(function(p){
+    var html = '<table><tr><th>Proxy</th><th>Status</th><th>Health</th><th>Latency</th><th>Wins / Losses</th><th>Wait</th></tr>';
+    rows.forEach(function(p){
       if(p.error){
-        return '<tr><td><code>'+escapeHtml(p.proxy_id)+'</code></td><td class="bad" colspan="4">error: '+escapeHtml(p.error)+'</td></tr>';
+        html += '<tr><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="5"><span class="pill bad">error: '+esc(p.error)+'</span></td></tr>';
+        return;
       }
-      var banned = p.banned ? '<span class="bad">yes</span>' : '<span class="muted">no</span>';
-      var cfBp = p.requires_cf_bypass ? '<span class="warn">required</span>' : '<span class="muted">no</span>';
-      var nextWait = p.nextAvailableAt ? Math.max(0, p.nextAvailableAt - Date.now())+"ms" : "—";
-      var cfEventCount = (p.cfEvents && p.cfEvents.length) || 0;
-      return '<tr>'
-        + '<td><code>'+escapeHtml(p.proxy_id)+'</code></td>'
-        + '<td class="muted">'+escapeHtml(nextWait)+'</td>'
-        + '<td>'+banned+'</td>'
-        + '<td>'+cfBp+'</td>'
-        + '<td class="muted">'+escapeHtml(String(cfEventCount))+'</td>'
-        + '</tr>';
-    }).join("");
-    return '<table>'+head+body+'</table>';
+      var statusPill;
+      if(p.banned) statusPill = '<span class="pill bad">banned</span>';
+      else if(p.requires_cf_bypass) statusPill = '<span class="pill warn">cf-bypass</span>';
+      else statusPill = '<span class="pill ok">live</span>';
+      var h = p.health || {};
+      var score = typeof h.score === "number" ? h.score : 0.5;
+      var scoreBar = '<span class="score-bar"><span class="track"><span class="fill" style="width:'+(score*100).toFixed(0)+'%"></span></span><span>'+(score*100).toFixed(0)+'</span></span>';
+      var latency = typeof h.latency_ema_ms === "number" ? h.latency_ema_ms.toFixed(0)+" ms" : "—";
+      var wins = typeof h.success_count === "number" ? h.success_count : 0;
+      var losses = typeof h.failure_count === "number" ? h.failure_count : 0;
+      var waitMs = p.nextAvailableAt ? Math.max(0, p.nextAvailableAt - Date.now()) : 0;
+      html += '<tr><td><code>'+esc(p.proxy_id)+'</code></td>'
+        + '<td>'+statusPill+'</td>'
+        + '<td>'+scoreBar+'</td>'
+        + '<td class="muted">'+esc(latency)+'</td>'
+        + '<td class="muted">'+wins+' / '+losses+'</td>'
+        + '<td class="muted">'+(waitMs > 0 ? waitMs+"ms" : "—")+'</td></tr>';
+    });
+    html += '</table>';
+    $("proxies").innerHTML = html;
+  }
+
+  function setBrandLive(live){
+    brand.classList.toggle("live", !!live);
+    brand.classList.toggle("err", !live);
   }
 
   function refresh(){
-    var url = "/ops/snapshot?token="+encodeURIComponent(TOKEN);
-    if(PROXY_IDS) url += "&proxy_ids="+encodeURIComponent(PROXY_IDS);
-    stateEl.textContent = "polling…";
-    fetch(url).then(function(r){
+    var url = "/ops/snapshot";
+    if(PROXY_IDS) url += "?proxy_ids="+encodeURIComponent(PROXY_IDS);
+    $("state").textContent = "polling…";
+    fetch(url, { credentials: "same-origin" }).then(function(r){
+      if(r.status === 401){ window.location.href = "/"; throw new Error("auth"); }
       if(r.status !== 200) throw new Error("HTTP "+r.status);
       return r.json();
     }).then(function(data){
       var nowMs = data.server_time || Date.now();
-      document.getElementById("runners").innerHTML = renderRunners(data.runners, nowMs);
-      document.getElementById("signals").innerHTML = renderSignals(data.signals, nowMs);
-      document.getElementById("config").innerHTML = renderConfig(data.config);
-      document.getElementById("proxies").innerHTML = renderProxies(data.proxies);
-      stateEl.textContent = "live";
-      tsEl.textContent = fmtTs(nowMs);
+      renderStats(data, nowMs);
+      renderBanners(data);
+      renderRunners(data, nowMs);
+      renderSignals(data, nowMs);
+      renderConfig(data);
+      renderProxies(data);
+      setBrandLive(true);
+      $("state").textContent = "live";
+      $("ts").textContent = fmtTs(nowMs);
     }).catch(function(err){
-      stateEl.textContent = "error: "+err.message;
+      setBrandLive(false);
+      $("state").textContent = "error: " + err.message;
     });
   }
   refresh();
@@ -1164,6 +1661,44 @@ function renderDashboardHtml(url: URL): string {
 })();
 </script>
 </body></html>`;
+}
+
+/** CSS shared between login form + dashboard SPA. Single source of
+ *  truth for the color palette + base typography. */
+function commonDashboardStyles(): string {
+  return `
+  :root {
+    --bg: #0a0e14;
+    --card-bg: #131820;
+    --input-bg: #1c2230;
+    --border: #1f2730;
+    --text: #d4d7e0;
+    --muted: #6e7681;
+    --accent: #38bdf8;
+    --accent-dim: #0ea5e9;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Inter", sans-serif;
+    margin: 0; background: var(--bg); color: var(--text);
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  `;
+}
+
+/** Server-side HTML escape used in the login form's error message slot.
+ *  The dashboard's client-side ``esc()`` covers the live-poll path. */
+function escapeHtmlForServer(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function resolveClaimShard(rawDate?: string | null): string {

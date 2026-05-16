@@ -1,4 +1,4 @@
-# proxy-coordinator
+# Proxy Coordinator
 
 Cloudflare Worker + Durable Objects that coordinate **per-proxy request
 pacing** *and* **shared JavDB login state** across multiple GitHub Actions
@@ -83,9 +83,11 @@ Runner N ─┘   (auth +           │
                                       /work/{enqueue,pull,complete,release,stats}
 
 Ops aggregators served directly by Worker (W5.1 + W5.5):
-  GET /dashboard            HTML SPA, 30 s auto-refresh
-  GET /ops/snapshot         cross-DO JSON aggregate
-  GET /recommend_proxy      cross-DO health-ranked proxy list
+  GET / + /dashboard        Login form (no cookie) or dashboard SPA (W5.1)
+  POST /dashboard/login     Password form → sets signed session cookie
+  POST /dashboard/logout    Clears session cookie
+  GET /ops/snapshot         Cross-DO JSON aggregate (cookie OR Bearer)
+  GET /recommend_proxy      Cross-DO health-ranked proxy list (W5.5)
 ```
 
 Every DO class has **separate bindings** and **separate storage**:
@@ -111,28 +113,69 @@ rotating one cannot disrupt the others.
 | `test/config_state.test.ts` | Vitest suite (11 tests, W5.3) — GET / PATCH / heartbeat embedding |
 | `test/signals.test.ts` | Vitest suite (10 tests, W5.4) — POST /signal validation + register/heartbeat embedding |
 | `test/rate_limit.test.ts` | Vitest suite (10 tests, W5.6) — token-bucket math + fetch-handler integration |
-| `test/dashboard.test.ts` | Vitest suite (14 tests, W5.1) — HTML route + /ops/snapshot aggregation |
+| `test/dashboard.test.ts` | Vitest suite (17 tests, W5.1) — login flow + cookie auth + /ops/snapshot aggregation |
 | `test/recommend_proxy.test.ts` | Vitest suite (11 tests, W5.5) — cross-DO health ranking + filters |
 | `test/work_distributor.test.ts` | Vitest suite (16 tests, W5.2) — enqueue / pull / complete / release / stats |
 
-Total: **257 tests** across 10 files.
+Total: **260 tests** across 10 files.
 
 ## Auth
 
-Every endpoint except `GET /health` requires:
+Two distinct auth surfaces, never to be confused:
+
+### 1. Machine-to-machine: `PROXY_COORDINATOR_TOKEN` (Bearer)
+
+Every API endpoint except `GET /health` and the dashboard's public
+login surface requires:
 
 ```
 Authorization: Bearer <PROXY_COORDINATOR_TOKEN>
 ```
 
-Set the secret with:
+Set the secret on **both** sides:
 
 ```bash
+# Cloudflare (Worker secret store)
 openssl rand -hex 32 | wrangler secret put PROXY_COORDINATOR_TOKEN
+
+# GitHub (repo Secrets) — same value, name PROXY_COORDINATOR_TOKEN
 ```
 
-The same value must be added to GitHub repo Secrets as
-`PROXY_COORDINATOR_TOKEN`.
+Used by every spider runner and external monitoring script. Rotating
+this value invalidates the AES-GCM key for stored cookies (forces a
+fresh JavDB login on the next runner) and invalidates all dashboard
+sessions (operators have to log back in).
+
+### 2. Human-to-machine: `DASHBOARD_PASSWORD` (operator login)
+
+The W5.1 dashboard at the **root domain** (e.g.
+`https://proxy-coordinator.wu.engineer/`) is gated by a password the
+operator types into a login form. After a successful login the Worker
+sets an HttpOnly, HMAC-signed session cookie; subsequent fetches from
+the dashboard SPA ride that cookie.
+
+```bash
+# Configure on the CLOUDFLARE side only (NOT GitHub Secrets — this is
+# operator-only, never shared with runners or CI).
+echo -n "your-strong-passphrase" | wrangler secret put DASHBOARD_PASSWORD
+
+# Optional — override the default 8-hour session TTL (seconds):
+echo -n "14400" | wrangler secret put DASHBOARD_SESSION_TTL_SEC
+```
+
+The cookie is signed with HMAC-SHA256 keyed by `PROXY_COORDINATOR_TOKEN`,
+so a leaked dashboard URL is useless without both secrets and rotating
+`PROXY_COORDINATOR_TOKEN` instantly logs out every operator.
+
+To access the dashboard:
+
+1. Visit `https://proxy-coordinator.<your-domain>/` (or `/dashboard`).
+2. Enter `DASHBOARD_PASSWORD`.
+3. The SPA auto-refreshes every 30 s. Click **Sign out** to clear the
+   cookie.
+
+External tools (curl, monitoring) still use the Bearer header on
+`/ops/snapshot` — both auth methods are accepted on that endpoint.
 
 ## proxy_id consistency (CRITICAL)
 
@@ -169,7 +212,7 @@ GitHub repo Variables as `PROXY_COORDINATOR_URL`.
 ```bash
 npm install
 npx wrangler dev          # http://localhost:8787
-npx vitest run            # 257 unit tests
+npx vitest run            # 260 unit tests
 npx tsc --noEmit          # type-check
 ```
 
@@ -365,40 +408,66 @@ integration in a follow-up.
 
 ## Runtime observability dashboard (W5.1)
 
-Two routes ship a self-contained ops dashboard for the deployment:
+The dashboard is served at the **root domain** — open
+`https://proxy-coordinator.<your-domain>/` in a browser. No token in
+the URL; the operator gets a login form, types `DASHBOARD_PASSWORD`,
+and the Worker sets an HttpOnly signed cookie that drives the SPA's
+auto-refresh.
 
-- `GET /dashboard` — HTML SPA (vanilla JS, inline CSS, no CDN deps).
-  Polls `/ops/snapshot` every 30 s. Four panels: active runners, active
-  signals (W5.4), config snapshot (W5.3), per-proxy throttle state.
-- `GET /ops/snapshot` — JSON aggregate the SPA polls. Same payload an
-  external monitor can consume.
+Endpoints involved:
 
-Both routes accept the Bearer token via either:
+| Method + path | Purpose |
+|---|---|
+| `GET /` | Login form if no valid cookie; dashboard SPA if cookie verifies. |
+| `GET /dashboard` | Alias of `/`. |
+| `POST /dashboard/login` | Form submission; on success sets `dashboard_session` cookie and redirects to `/`. |
+| `POST /dashboard/logout` | Clears the cookie. The "Sign out" button in the top bar posts here. |
+| `GET /ops/snapshot` | JSON aggregate consumed by the SPA. Accepts EITHER the dashboard cookie OR a Bearer header. |
 
-- `Authorization: Bearer <token>` header (existing convention), or
-- `?token=<token>` query parameter (browser-bookmark workflow).
+### Visual
 
-The query-token fallback is **only** enabled for these two paths
-(see `QUERY_TOKEN_PATHS` in `src/index.ts`). Every other endpoint still
-requires the header. Tokens-in-URLs end up in browser history and
-Worker access logs — treat the dashboard URL as a secret bookmark and
-rotate `PROXY_COORDINATOR_TOKEN` if it leaks.
+Dark monitoring aesthetic (Cloudflare/Grafana-style). Top bar with live
+status pill + last-update timestamp + sign-out. Hero stats row (live
+runners / active signals / proxies tracked / healthy proxies). Below
+that: paired panels for runners + signals; full-width per-proxy table
+with health score bars; collapsible config snapshot. Active signals
+also render as inline warning banners at the top so a `pause_all` is
+impossible to miss.
 
-Proxy enumeration: pass the IDs you want to inspect via
-`?proxy_ids=Proxy-1,Proxy-2,...` (comma-separated, capped at 32). The
-Worker has no master proxy list (each `ProxyCoordinator` DO is
-addressed per-id), so this is the operator's call.
+### Auth model
 
-`GlobalLoginState` is **deliberately omitted** from the snapshot
-(the decrypted cookie must never ride along in a URL-token payload).
+The dashboard cookie is HMAC-SHA256 signed against
+`PROXY_COORDINATOR_TOKEN`, so:
+
+- A leaked dashboard URL alone grants no access (no token in URL).
+- Rotating `PROXY_COORDINATOR_TOKEN` immediately invalidates every
+  in-flight session.
+- The cookie is `HttpOnly` + `Secure` + `SameSite=Lax`; cannot be read
+  from JavaScript or sent across cross-site navigations.
+- Failed logins are slowed to ~750 ms server-side, capping brute-force
+  throughput.
+
+Default session TTL is **8 hours** — set `DASHBOARD_SESSION_TTL_SEC`
+to override. Minimum 60 s, max 30 days, hard-clamped server-side.
+
+`GlobalLoginState` is **deliberately omitted** from `/ops/snapshot`
+(the decrypted JavDB cookie must never ride along in a payload reachable
+via the operator's browser session).
+
+### Proxy enumeration
+
+Append `?proxy_ids=Proxy-1,Proxy-2,...` to the URL to populate the
+per-proxy panel (comma-separated, capped at 32). The Worker has no
+master proxy list (each `ProxyCoordinator` DO is addressed per-id) so
+this is the operator's call.
 
 ```bash
-# Open in a browser:
-https://your.worker.dev/dashboard?token=$TOKEN&proxy_ids=Proxy-1,Proxy-2
+# Browser:
+open "https://proxy-coordinator.wu.engineer/?proxy_ids=Proxy-1,Proxy-2"
 
-# Or fetch the raw JSON:
-curl -H "Authorization: Bearer $TOKEN" \
-  "https://your.worker.dev/ops/snapshot?proxy_ids=Proxy-1,Proxy-2"
+# External monitor (Bearer-authed, no cookie):
+curl -H "Authorization: Bearer $PROXY_COORDINATOR_TOKEN" \
+  "https://proxy-coordinator.wu.engineer/ops/snapshot?proxy_ids=Proxy-1,Proxy-2"
 ```
 
 ## Smart proxy selection (W5.5)

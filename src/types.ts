@@ -67,6 +67,17 @@ export interface Env {
    *  Worker isolate and resets on cold start, but burst abuse from a
    *  single token within a single isolate is still blocked. */
   WORKER_RATE_LIMIT_PER_MIN?: string;
+  /** W5.1 — password the operator types into the dashboard login form.
+   *  Set via ``wrangler secret put DASHBOARD_PASSWORD`` (Cloudflare side,
+   *  NOT GitHub Secrets — this is a human-only credential distinct from
+   *  the machine-to-machine ``PROXY_COORDINATOR_TOKEN`` used by spider
+   *  runners). When unset, the dashboard refuses every login and only
+   *  the Bearer-header workflow is available. */
+  DASHBOARD_PASSWORD?: string;
+  /** W5.1 — dashboard session cookie TTL in seconds.  Defaults to 8 h
+   *  (28800). The cookie is HMAC-signed against ``PROXY_COORDINATOR_TOKEN``
+   *  so an operator re-login is the only way to refresh it. */
+  DASHBOARD_SESSION_TTL_SEC?: string;
 }
 
 /** Default ban duration when the client doesn't pass `ttl_ms`. 3 days = 259_200_000 ms. */
