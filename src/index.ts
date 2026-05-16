@@ -497,6 +497,40 @@ export default {
       return jsonResponse({ error: "internal_error" }, 500);
     }
   },
+
+  /**
+   * Phase 2 / ADR-003 — Cron 1-min tick.
+   *
+   * Pulls the current /ops/snapshot payload and writes it to
+   * MetricsState DO. The DO applies idle suppression internally
+   * (skips writes when the system is fully idle except at
+   * active↔idle boundaries and top-of-hour heartbeats).
+   *
+   * Errors are logged and swallowed — a cron failure must never
+   * surface to the operator. The next tick (1 min later) re-tries.
+   */
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    if (!env.METRICS_STATE_DO) return;
+    try {
+      const fakeUrl = new URL("https://internal/ops/snapshot");
+      const snapResp = await aggregateOpsSnapshot(env, fakeUrl);
+      const payload = await snapResp.json();
+      // Use forwardToMetricsStateDo (which buffers the response body via .text())
+      // rather than stub.fetch() directly. The body-buffering step prevents the
+      // SQLite WAL isolated-storage error in vitest-pool-workers and mirrors the
+      // same pattern used by all other forwardTo* helpers.
+      await forwardToMetricsStateDo(
+        env,
+        "/do/metrics/record",
+        "POST",
+        { ts: Date.now(), payload, source: "cron" },
+      );
+    } catch (err) {
+      console.error("scheduled handler error", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
 };
 
 function checkAuth(request: Request, env: Env): boolean {
