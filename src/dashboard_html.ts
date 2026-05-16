@@ -93,6 +93,20 @@ ${commonDashboardStyles()}
   .hint { padding: 14px 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
   .hint code { background: var(--input-bg); padding: 1px 5px; border-radius: 3px; color: var(--text); }
 
+  /* Phase-1 ADR-008 — operator mutation buttons. */
+  .op-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 11px; font-size: 11.5px; line-height: 1;
+    background: var(--input-bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    cursor: pointer; transition: background .12s, border-color .12s;
+    font-family: inherit;
+  }
+  .op-btn:hover:not(:disabled) { background: rgba(56,189,248,0.08); border-color: var(--accent); }
+  .op-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .op-btn-danger { color: var(--bad); border-color: rgba(248, 113, 113, 0.40); }
+  .op-btn-danger:hover:not(:disabled) { background: rgba(248,113,113,0.10); border-color: var(--bad); }
+
   .banner {
     margin: 0 0 22px; padding: 12px 16px;
     background: linear-gradient(90deg, rgba(248, 113, 113, 0.10), rgba(248, 113, 113, 0.02));
@@ -151,6 +165,30 @@ ${commonDashboardStyles()}
   .range-btn.active { background: var(--accent-dim); color: #0a0e14; border-color: var(--accent); }
   .drawer-body { flex: 1; overflow-y: auto; padding: 16px 18px; }
   @media (max-width: 700px) { .drawer { width: 100vw; } }
+
+  /* Phase-3 ADR-008 — mobile/narrow-viewport polish.
+     - The drawer used to floor at 360px; clamp it under viewport width.
+     - Tables get a horizontal-scroll wrapper at narrow widths so long
+       proxy/session rows don't push the layout sideways.
+     - Charts shrink with their container via ResizeObserver (see JS). */
+  @media (max-width: 480px) {
+    .drawer { min-width: min(360px, 95vw); }
+    main { padding: 18px 12px 40px; }
+    .topbar { padding: 0 12px; }
+    .stats { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat-card .value { font-size: 24px; }
+    table { font-size: 11.5px; }
+    th, td { padding: 7px 10px; }
+    /* Force the wide proxy / session tables into a horizontal scroll
+       wrapper. The ".panel .body" selector is the standard container so
+       this applies everywhere a table sits inside a panel. */
+    .panel .body { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    /* Sticky first column for proxy / session tables — keeps the
+       identifier visible while the user scrolls horizontally. */
+    table th:first-child, table td:first-child {
+      position: sticky; left: 0; background: var(--card-bg); z-index: 1;
+    }
+  }
 </style></head>
 <body>
 <div class="topbar">
@@ -165,6 +203,8 @@ ${commonDashboardStyles()}
   </div>
 </div>
 <main>
+  <div id="alerts-banner"></div>
+  <div id="pipeline-pause-banner"></div>
   <div id="banners"></div>
   <div class="stats" id="stats"></div>
   <div class="charts">
@@ -195,6 +235,34 @@ ${commonDashboardStyles()}
         <button class="panel-history-btn" data-drawer="login">History →</button>
       </header>
       <div class="body" id="login-state-body"></div>
+    </div>
+    <div class="panel full">
+      <header>
+        <span>Sessions <span class="badge" id="session-count">0</span></span>
+        <span style="font-size:10px;color:var(--muted)">runner-reported lifecycle (ADR-008)</span>
+      </header>
+      <div class="body" id="sessions"></div>
+    </div>
+    <div class="panel full">
+      <header>
+        <span>Ops controls</span>
+        <span style="font-size:10px;color:var(--muted)">Phase-1 ADR-008 · mutation buttons</span>
+      </header>
+      <div class="body" id="ops-controls" style="padding:14px 16px"></div>
+    </div>
+    <div class="panel">
+      <header>
+        <span>Today's Claims <span class="badge" id="movie-claim-badge">—</span></span>
+        <span style="font-size:10px;color:var(--muted)">MovieClaim DO · Phase-3</span>
+      </header>
+      <div class="body" id="movie-claim-stats" style="padding:14px 16px"></div>
+    </div>
+    <div class="panel">
+      <header>
+        <span>Work queue <span class="badge" id="work-queue-badge">—</span></span>
+        <span style="font-size:10px;color:var(--muted)">WorkDistributor · Phase-3</span>
+      </header>
+      <div class="body" id="work-stats" style="padding:14px 16px"></div>
     </div>
     <div class="panel full">
       <header>
@@ -431,7 +499,12 @@ ${commonDashboardStyles()}
       var srcPill = entry.source === "override"
         ? '<span class="pill warn" style="margin-left:8px;font-size:9px;vertical-align:1px">override</span>'
         : '';
-      html += '<div class="k">'+esc(k)+srcPill+'</div><div class="v">'+esc(String(entry.value))+'</div>';
+      // Phase-2 — inline edit pencil; PATCHes the single key via
+      // ConfigState's audit format (key/value/reason).
+      var editBtn = '<button class="op-btn" data-edit-config="' + esc(k) + '" '
+                  + 'style="margin-left:10px;padding:2px 7px;font-size:10px" '
+                  + 'title="Edit override (audit log)">edit</button>';
+      html += '<div class="k">'+esc(k)+srcPill+editBtn+'</div><div class="v">'+esc(String(entry.value))+'</div>';
     });
     html += '</div></details>';
     $("config").innerHTML = html;
@@ -451,10 +524,10 @@ ${commonDashboardStyles()}
       $("proxies").innerHTML = '<div class="hint">All proxies hidden by chip filter. Click <strong>all</strong> above to show them.</div>';
       return;
     }
-    var html = '<table><tr><th>Proxy</th><th>Status</th><th>Health</th><th>Latency</th><th>Wins / Losses</th><th>Wait</th></tr>';
+    var html = '<table><tr><th>Proxy</th><th>Status</th><th>Health</th><th>Latency</th><th>Wins / Losses</th><th>Wait</th><th>Ops</th></tr>';
     rows.forEach(function(p){
       if(p.error){
-        html += '<tr data-proxy-row="' + esc(p.proxy_id) + '" style="cursor:pointer"><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="5"><span class="pill bad">error: '+esc(p.error)+'</span></td></tr>';
+        html += '<tr data-proxy-row="' + esc(p.proxy_id) + '" style="cursor:pointer"><td><code>'+esc(p.proxy_id)+'</code></td><td colspan="6"><span class="pill bad">error: '+esc(p.error)+'</span></td></tr>';
         return;
       }
       var statusPill;
@@ -468,12 +541,17 @@ ${commonDashboardStyles()}
       var wins = typeof h.success_count === "number" ? h.success_count : 0;
       var losses = typeof h.failure_count === "number" ? h.failure_count : 0;
       var waitMs = p.nextAvailableAt ? Math.max(0, p.nextAvailableAt - Date.now()) : 0;
-      html += '<tr data-proxy-row="' + esc(p.proxy_id) + '" style="cursor:pointer"><td><code>'+esc(p.proxy_id)+'</code></td>'
+      // Phase-1 ADR-008 — Ban / Unban buttons (no Python consumer needed)
+      var opsHtml = p.banned
+        ? '<button class="op-btn" data-unban-proxy="' + esc(p.proxy_id) + '">Unban</button>'
+        : '<button class="op-btn op-btn-danger" data-ban-proxy="' + esc(p.proxy_id) + '">Ban</button>';
+      html += '<tr data-proxy-row="' + esc(p.proxy_id) + '"><td><code>'+esc(p.proxy_id)+'</code></td>'
         + '<td>'+statusPill+'</td>'
         + '<td>'+scoreBar+'</td>'
         + '<td class="muted">'+esc(latency)+'</td>'
         + '<td class="muted">'+wins+' / '+losses+'</td>'
-        + '<td class="muted">'+(waitMs > 0 ? waitMs+"ms" : "—")+'</td></tr>';
+        + '<td class="muted">'+(waitMs > 0 ? waitMs+"ms" : "—")+'</td>'
+        + '<td>' + opsHtml + '</td></tr>';
     });
     html += '</table>';
     $("proxies").innerHTML = html;
@@ -481,9 +559,399 @@ ${commonDashboardStyles()}
 
   function renderLoginState(_data){
     var body = $("login-state-body");
-    body.innerHTML = '<div class="hint">Click <strong>History →</strong> to view recent login attempts, publishes, and lease activity.</div>';
-    $("login-badge").textContent = "—";
+    // Phase-1 ADR-008 — surface non-sensitive fields + Force re-login
+    // button. Cookie itself never crosses this surface.
+    fetch("/login_state", { credentials: "same-origin" })
+      .then(function(r){ return r.status === 200 ? r.json() : null; })
+      .then(function(s){
+        if(!s){
+          body.innerHTML = '<div class="hint">login_state unavailable. Click <strong>History →</strong> for past activity.</div>';
+          $("login-badge").textContent = "—";
+          return;
+        }
+        var pill = s.has_active_lease
+          ? '<span class="pill warn">lease held</span>'
+          : (s.cookie ? '<span class="pill ok">cookie ready</span>' : '<span class="pill bad">no cookie</span>');
+        $("login-badge").textContent = "v" + (s.version || 0);
+        var html = '<div style="padding:14px 16px">'
+          + '<div style="display:grid;grid-template-columns:auto 1fr;gap:6px 16px;font-size:12.5px">'
+          + '<div class="muted">version</div><div><code>' + esc(String(s.version || 0)) + '</code></div>'
+          + '<div class="muted">lease</div><div>' + pill + '</div>'
+          + '<div class="muted">last verified</div><div>' + (s.last_verified_at ? fmtTs(s.last_verified_at) : '—') + '</div>'
+          + '<div class="muted">proxy</div><div>' + esc(s.proxy_name || '—') + '</div>'
+          + '</div>'
+          + '<div style="margin-top:14px"><button class="op-btn op-btn-danger" data-op="force-relogin">Force re-login</button></div>'
+          + '<div class="hint" style="padding:8px 0 0">Cookie value is never displayed. Click <strong>History →</strong> for attempt audit log.</div>'
+          + '</div>';
+        body.innerHTML = html;
+      });
   }
+
+  // ── Phase-1 ADR-008: alerts banner + sessions panel + ops controls ─────
+
+  function renderAlertsBanner(data){
+    var alerts = (data.alerts && data.alerts.alerts) || [];
+    var unacked = alerts.filter(function(a){ return !a.ack; });
+    var holder = $("alerts-banner");
+    if(unacked.length === 0){ holder.innerHTML = ""; return; }
+    var html = '';
+    unacked.slice(0, 5).forEach(function(a){
+      var kindLabel = a.kind === 'session_failed' ? 'SESSION FAILED'
+        : a.kind === 'ban_spike' ? 'BAN SPIKE'
+        : a.kind === 'login_cooldown' ? 'LOGIN COOLDOWN'
+        : a.kind === 'manual_test' ? 'TEST'
+        : String(a.kind || '').toUpperCase();
+      html += '<div class="banner" style="margin-bottom:10px">'
+        + '<strong>[' + esc(kindLabel) + ']</strong> ' + esc(a.summary || '')
+        + ' <span class="muted" style="margin-left:6px">' + esc(fmtTs(a.ts)) + '</span>'
+        + ' <button class="op-btn" style="float:right;margin-top:-3px" data-ack-alert="' + esc(a.id) + '">Ack</button>'
+        + '</div>';
+    });
+    if(unacked.length > 5){
+      html += '<div class="hint">+ ' + (unacked.length - 5) + ' more unacked alert(s)</div>';
+    }
+    holder.innerHTML = html;
+  }
+
+  function renderPipelinePauseBanner(data){
+    var cfg = data.config || {};
+    var values = cfg.values || {};
+    var pausedUntilStr = values.pipeline_paused_until || "";
+    var pausedUntil = parseInt(pausedUntilStr, 10);
+    var holder = $("pipeline-pause-banner");
+    if(!Number.isFinite(pausedUntil) || pausedUntil <= 0 || pausedUntil <= Date.now()){
+      holder.innerHTML = ""; return;
+    }
+    var reason = values.pipeline_pause_reason || '';
+    var until = fmtTs(pausedUntil);
+    var rel = fmtDur(pausedUntil - Date.now());
+    holder.innerHTML = '<div class="banner" style="margin-bottom:10px"><strong>PIPELINE PAUSED</strong> · until '
+      + esc(until) + ' (' + esc(rel) + ' left)'
+      + (reason ? ' · <em>' + esc(reason) + '</em>' : '')
+      + ' · <button class="op-btn" data-op="resume-pipeline">Resume now</button>'
+      + '</div>';
+  }
+
+  function renderSessions(data, nowMs){
+    var s = data.sessions || {};
+    var active = s.active || [];
+    var failed = s.recent_failed || [];
+    var committed = s.recent_committed || [];
+    $("session-count").textContent = active.length + " active · " + failed.length + " failed (24h)";
+    if(active.length === 0 && failed.length === 0 && committed.length === 0){
+      $("sessions").innerHTML = '<div class="empty">No runner sessions reported yet. Requires Python client v1.1+ (ADR-008).</div>';
+      return;
+    }
+    function rowsHtml(rows, cls){
+      if(rows.length === 0) return '';
+      var html = '<table><tr><th>Session</th><th>Status</th><th>Write mode</th><th>Workflow</th><th>Failure reason</th><th>When</th></tr>';
+      rows.forEach(function(sess){
+        var pillCls = sess.status === 'failed' ? 'bad'
+          : sess.status === 'committed' ? 'ok'
+          : sess.status === 'in_progress' ? 'warn' : 'muted';
+        var when = sess.ended_at > 0 ? fmtTs(sess.ended_at) : fmtTs(sess.updated_at || sess.started_at);
+        html += '<tr><td><code>' + esc(sess.session_id) + '</code></td>'
+          + '<td><span class="pill ' + pillCls + '">' + esc(sess.status) + '</span></td>'
+          + '<td class="muted">' + esc(sess.write_mode || 'unknown') + '</td>'
+          + '<td class="muted">' + esc(sess.workflow_name || '—');
+        if(sess.workflow_run_id) html += ' · <code>' + esc(sess.workflow_run_id) + '</code>';
+        html += '</td>'
+          + '<td class="muted" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(sess.failure_reason || '') + '">' + esc(sess.failure_reason || '—') + '</td>'
+          + '<td class="muted">' + esc(when) + '</td></tr>';
+      });
+      html += '</table>';
+      return html;
+    }
+    var html = '';
+    if(active.length > 0){
+      html += '<div style="padding:8px 16px 0;font-size:11px;color:var(--muted)">ACTIVE</div>' + rowsHtml(active);
+    }
+    if(failed.length > 0){
+      html += '<div style="padding:14px 16px 0;font-size:11px;color:var(--bad)">RECENT FAILURES</div>' + rowsHtml(failed);
+    }
+    if(committed.length > 0){
+      html += '<div style="padding:14px 16px 0;font-size:11px;color:var(--muted)">RECENT COMMITTED</div>' + rowsHtml(committed.slice(0, 10));
+    }
+    void nowMs;
+    $("sessions").innerHTML = html;
+  }
+
+  function renderOpsControls(data){
+    var values = (data.config && data.config.values) || {};
+    var pausedUntilRaw = values.pipeline_paused_until || "";
+    var pausedUntil = parseInt(pausedUntilRaw, 10);
+    var pausedActive = Number.isFinite(pausedUntil) && pausedUntil > Date.now();
+    // Phase-2: detect already-active throttle_global / pause_all signals
+    // so we render Resume only when there's something to clear.
+    var sigs = (data.signals && data.signals.active_signals) || [];
+    var hasGlobalThrottle = sigs.some(function(s){ return s.kind === "throttle_global"; });
+    var hasPauseAll = sigs.some(function(s){ return s.kind === "pause_all"; });
+    var hasAnySig = sigs.length > 0;
+    var html = ''
+      + '<div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center">'
+      + '<button class="op-btn" data-op="pause-pipeline" data-hours="1">Pause pipeline · 1h</button>'
+      + '<button class="op-btn" data-op="pause-pipeline" data-hours="3">3h</button>'
+      + '<button class="op-btn" data-op="pause-pipeline" data-hours="6">6h</button>'
+      + '<button class="op-btn" data-op="pause-pipeline" data-hours="24">24h</button>'
+      + (pausedActive
+          ? '<button class="op-btn op-btn-danger" data-op="resume-pipeline">Resume now</button>'
+          : '')
+      + '<span class="muted" style="font-size:11px">'
+      + (pausedActive
+          ? 'Paused until ' + esc(fmtTs(pausedUntil)) + ' (' + esc(fmtDur(pausedUntil - Date.now())) + ' left)'
+          : 'No active pause')
+      + '</span>'
+      + '<span style="flex:1"></span>'
+      + '<button class="op-btn" data-op="test-alert">Test alert webhook</button>'
+      + '</div>'
+      // ── Phase-2: Global throttle / Pause-all / Resume — wired to /signal ──
+      + '<div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">'
+      + '<span style="font-size:10px;color:var(--muted);margin-right:4px">RUNTIME SIGNALS</span>'
+      + '<button class="op-btn" data-op="throttle-global" data-factor="2">Throttle global ×2</button>'
+      + '<button class="op-btn" data-op="throttle-global" data-factor="4">×4</button>'
+      + '<button class="op-btn op-btn-danger" data-op="pause-all">Pause all runners</button>'
+      + (hasAnySig
+          ? '<button class="op-btn" data-op="resume-signals">Resume (clear signals)</button>'
+          : '')
+      + (hasGlobalThrottle || hasPauseAll
+          ? '<span class="pill warn" style="font-size:11px">'
+            + (hasGlobalThrottle ? 'global throttle active' : '')
+            + (hasGlobalThrottle && hasPauseAll ? ' · ' : '')
+            + (hasPauseAll ? 'pause_all active' : '')
+            + '</span>'
+          : '')
+      + '</div>'
+      + '<div class="hint" style="padding:8px 0 0;font-size:11px">'
+      + 'Signals affect every runner within one heartbeat (~60s). Use Resume to clear all active signals at once.'
+      + '</div>';
+    $("ops-controls").innerHTML = html;
+  }
+
+  // ── Phase-3 ADR-008: MovieClaim + WorkDistributor panels ──────────────
+
+  function statRow(label, value, cls){
+    var pillCls = cls ? ' style="color:var(--' + cls + ')"' : '';
+    return '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:4px 0">'
+      + '<span class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:0.04em">' + label + '</span>'
+      + '<span' + pillCls + ' style="font-variant-numeric:tabular-nums;font-weight:500">' + value + '</span>'
+      + '</div>';
+  }
+
+  function renderMovieClaimStats(data){
+    var s = data.movie_claim_stats;
+    var holder = $("movie-claim-stats");
+    var badge = $("movie-claim-badge");
+    if(!s){
+      holder.innerHTML = '<div class="hint">MovieClaim DO unavailable (binding missing or v3 migration not applied).</div>';
+      badge.textContent = "—";
+      return;
+    }
+    var activeClaims = Number(s.claims_active || 0);
+    var staged = Number(s.staged_count || 0);
+    var committed = Number(s.completed_committed_count || 0);
+    var failures = Number(s.failures_count || 0);
+    var cooldown = Number(s.in_cooldown_count || 0);
+    var deadLetter = Number(s.dead_lettered_count || 0);
+    badge.textContent = committed + " ✓";
+    holder.innerHTML = ''
+      + statRow("Active claims (in-flight)", activeClaims, activeClaims > 0 ? "warn" : null)
+      + statRow("Staged (awaiting commit)", staged)
+      + statRow("Committed (today)", committed, committed > 0 ? "ok" : null)
+      + statRow("Failed hrefs", failures, failures > 0 ? "warn" : null)
+      + statRow("In cooldown", cooldown, cooldown > 0 ? "warn" : null)
+      + statRow("Dead-lettered", deadLetter, deadLetter > 0 ? "bad" : null)
+      + '<div class="hint" style="padding:8px 0 0;font-size:11px">'
+      + 'Aggregated across all sub-shards for today\'s date (Asia/Singapore).'
+      + '</div>';
+  }
+
+  function renderWorkStats(data){
+    var s = data.work_stats;
+    var holder = $("work-stats");
+    var badge = $("work-queue-badge");
+    if(!s){
+      holder.innerHTML = '<div class="hint">WorkDistributor DO unavailable (binding missing or v5 migration not applied).</div>';
+      badge.textContent = "—";
+      return;
+    }
+    var queueSize = Number(s.queue_size || 0);
+    var visible = Number(s.visible || 0);
+    var leased = Number(s.leased || 0);
+    var oldestMs = s.oldest_enqueued_at_ms;
+    var oldestAge = (oldestMs && Number.isFinite(oldestMs))
+      ? fmtAge(Number(oldestMs), Date.now())
+      : "—";
+    badge.textContent = queueSize > 0 ? (queueSize + " items") : "empty";
+    var leaseCls = leased > 0 ? "warn" : null;
+    holder.innerHTML = ''
+      + statRow("Total queue size", queueSize, queueSize > 0 ? "warn" : null)
+      + statRow("Visible (claimable)", visible)
+      + statRow("Leased (in-flight)", leased, leaseCls)
+      + statRow("Oldest item age", oldestAge,
+                (oldestMs && (Date.now() - Number(oldestMs)) > 1800_000) ? "bad" : null)
+      + '<div class="hint" style="padding:8px 0 0;font-size:11px">'
+      + 'Spider currently dispatches via MovieClaim DO; this queue is staged for opt-in switchover.'
+      + '</div>';
+  }
+
+  function postJson(url, body){
+    return fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  function patchConfig(values){
+    return fetch("/config", {
+      method: "PATCH",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ values: values }),
+    });
+  }
+
+  // Delegate clicks on op-btn / data-ack-alert / data-proxy-row buttons.
+  document.addEventListener("click", function(ev){
+    var t = ev.target;
+    if(!(t instanceof Element)) return;
+    // Confirm-then-call delegations.
+    var op = t.getAttribute("data-op");
+    if(op === "force-relogin"){
+      if(!confirm("Force invalidate the current login cookie? The next runner will need to re-login.")) return;
+      postJson("/login/invalidate_force", {}).then(refresh);
+      return;
+    }
+    if(op === "pause-pipeline"){
+      var hours = parseInt(t.getAttribute("data-hours") || "1", 10);
+      if(!confirm("Pause new runners for the next " + hours + "h?")) return;
+      var until = Date.now() + hours * 3600 * 1000;
+      var reason = prompt("Optional reason for ops log:", "") || "";
+      patchConfig({
+        pipeline_paused_until: String(until),
+        pipeline_pause_reason: reason,
+      }).then(refresh);
+      return;
+    }
+    if(op === "resume-pipeline"){
+      if(!confirm("Resume the pipeline immediately?")) return;
+      patchConfig({
+        pipeline_paused_until: "",
+        pipeline_pause_reason: "",
+      }).then(refresh);
+      return;
+    }
+    if(op === "test-alert"){
+      postJson("/alerts/test", {}).then(function(r){
+        if(r.status >= 200 && r.status < 300){
+          alert("Test alert recorded — check webhook destination.");
+        } else {
+          alert("Test alert failed: HTTP " + r.status);
+        }
+        refresh();
+      });
+      return;
+    }
+    var ackId = t.getAttribute("data-ack-alert");
+    if(ackId){
+      postJson("/alerts/ack", { id: ackId }).then(refresh);
+      return;
+    }
+    var banPid = t.getAttribute("data-ban-proxy");
+    if(banPid){
+      var ttlH = prompt("Ban " + banPid + " for how many hours? (default: server-side BAN_TTL_MS)", "");
+      if(ttlH === null) return;
+      var body = { proxy_id: banPid, reason: "dashboard manual ban" };
+      var n = parseInt(ttlH, 10);
+      if(Number.isFinite(n) && n > 0) body.ttl_ms = n * 3600 * 1000;
+      postJson("/proxies/ban", body).then(refresh);
+      return;
+    }
+    var unbanPid = t.getAttribute("data-unban-proxy");
+    if(unbanPid){
+      if(!confirm("Lift the ban on " + unbanPid + "?")) return;
+      postJson("/proxies/unban", { proxy_id: unbanPid }).then(refresh);
+      return;
+    }
+    // ── Phase-2: signal mutations ────────────────────────────────────────
+    if(op === "throttle-global"){
+      var factor = parseFloat(t.getAttribute("data-factor") || "2");
+      var ttlMinRaw = prompt(
+        "Throttle every runner ×" + factor + " for how many minutes?",
+        "30"
+      );
+      if(ttlMinRaw === null) return;
+      var ttlMin = parseFloat(ttlMinRaw);
+      if(!Number.isFinite(ttlMin) || ttlMin <= 0){
+        alert("Invalid TTL");
+        return;
+      }
+      var reason = prompt("Optional reason (ops log):", "") || "";
+      postJson("/signal", {
+        kind: "throttle_global",
+        factor: factor,
+        ttl_ms: Math.floor(ttlMin * 60_000),
+        reason: reason,
+      }).then(function(r){
+        if(r.status >= 400) alert("throttle_global failed: HTTP " + r.status);
+        refresh();
+      });
+      return;
+    }
+    if(op === "pause-all"){
+      if(!confirm("Pause EVERY active runner now? They will halt on the next heartbeat (~60s).")) return;
+      var ttlMinRaw2 = prompt("Pause for how many minutes?", "15");
+      if(ttlMinRaw2 === null) return;
+      var ttlMin2 = parseFloat(ttlMinRaw2);
+      if(!Number.isFinite(ttlMin2) || ttlMin2 <= 0){
+        alert("Invalid TTL"); return;
+      }
+      var reason2 = prompt("Optional reason (ops log):", "") || "";
+      postJson("/signal", {
+        kind: "pause_all",
+        ttl_ms: Math.floor(ttlMin2 * 60_000),
+        reason: reason2,
+      }).then(function(r){
+        if(r.status >= 400) alert("pause_all failed: HTTP " + r.status);
+        refresh();
+      });
+      return;
+    }
+    if(op === "resume-signals"){
+      if(!confirm("Clear ALL active signals (throttle, pause_all, ban_proxy) right now?")) return;
+      postJson("/signal", { kind: "resume" }).then(function(r){
+        if(r.status >= 400) alert("resume failed: HTTP " + r.status);
+        refresh();
+      });
+      return;
+    }
+    // ── Phase-2: inline config edit ──────────────────────────────────────
+    var editKey = t.getAttribute("data-edit-config");
+    if(editKey){
+      var curEntry = (data_last_snapshot && data_last_snapshot.config
+                      && data_last_snapshot.config.merged
+                      && data_last_snapshot.config.merged[editKey]) || null;
+      var curValue = curEntry ? String(curEntry.value) : "";
+      var newValue = prompt("New value for " + editKey + " (empty clears override):", curValue);
+      if(newValue === null) return;
+      var reason3 = prompt("Optional audit reason:", "") || "";
+      fetch("/config", {
+        method: "PATCH",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key: editKey, value: newValue, reason: reason3 }),
+      }).then(function(r){
+        if(r.status >= 400){
+          r.text().then(function(body){
+            alert("PATCH /config failed: HTTP " + r.status + "\n" + body);
+          });
+        }
+        refresh();
+      });
+      return;
+    }
+  });
 
   function setBrandLive(live){
     brand.classList.toggle("live", !!live);
@@ -494,9 +962,20 @@ ${commonDashboardStyles()}
   var CHARTS_RANGE_MS = 60 * 60 * 1000;  // last 1h on main view
   var charts = {};  // chart-id → uPlot instance for cleanup
 
-  function chartOptions(seriesDef){
+  // Phase-3 ADR-008 — chart width tracks its container instead of being
+  // hard-coded to 360px. Falls back to 360 when the element is detached
+  // (initial render before mount). Height stays fixed at 180 to keep
+  // the trend strip recognisable on every breakpoint.
+  function chartWidthFor(panelId){
+    var body = $(panelId) && $(panelId).querySelector(".chart-body");
+    if(!body) return 360;
+    var w = body.clientWidth || body.getBoundingClientRect().width || 360;
+    return Math.max(160, Math.floor(w - 16));  // -16 for padding fudge
+  }
+
+  function chartOptions(seriesDef, panelId){
     return {
-      width: 360, height: 180,
+      width: chartWidthFor(panelId), height: 180,
       cursor: { drag: { x: false } },
       legend: { show: false },
       scales: { x: { time: true } },
@@ -507,6 +986,37 @@ ${commonDashboardStyles()}
         { stroke: "#6e7681", grid: { stroke: "#1f2730" } },
       ],
     };
+  }
+
+  // Single ResizeObserver instance shared across all charts. Triggers
+  // chart.setSize on resize; uPlot is cheap to re-size (no re-render
+  // of data, only canvas dimensions update).
+  var _chartResizeObserver = null;
+  function ensureChartResizeObserver(){
+    if(_chartResizeObserver !== null) return _chartResizeObserver;
+    if(typeof ResizeObserver === "undefined") return null;
+    _chartResizeObserver = new ResizeObserver(function(){
+      Object.keys(charts).forEach(function(id){
+        var c = charts[id];
+        if(!c) return;
+        // Map chart key -> panel id. Main charts use the "chart-XXX"
+        // pattern; drawer charts use their own DOM nodes and don't
+        // appear in the charts dict so they don't need this.
+        var panelId = "chart-" + id;
+        var w = chartWidthFor(panelId);
+        try { c.setSize({ width: w, height: 180 }); } catch(e) {}
+      });
+    });
+    return _chartResizeObserver;
+  }
+
+  function attachChartResize(panelId){
+    var obs = ensureChartResizeObserver();
+    if(!obs) return;
+    var body = $(panelId) && $(panelId).querySelector(".chart-body");
+    if(body) {
+      try { obs.observe(body); } catch(e) {}
+    }
   }
 
   function destroyChart(id){
@@ -533,10 +1043,11 @@ ${commonDashboardStyles()}
     if(ts.length === 0){ body.innerHTML = '<div class="empty">no data</div>'; return; }
     body.innerHTML = "";  // clear before uPlot mounts
     charts["runners"] = new uPlot(
-      chartOptions([{}, { label: "active", stroke: "#4ade80", width: 2 }]),
+      chartOptions([{}, { label: "active", stroke: "#4ade80", width: 2 }], "chart-runners"),
       [ts, vals],
       body
     );
+    attachChartResize("chart-runners");
   }
 
   function renderChartQueue(snapshots){
@@ -552,10 +1063,11 @@ ${commonDashboardStyles()}
         {},
         { label: "queued", stroke: "#38bdf8", width: 2 },
         { label: "in_flight", stroke: "#fbbf24", width: 2 },
-      ]),
+      ], "chart-queue"),
       [ts, queued, inFlight],
       body
     );
+    attachChartResize("chart-queue");
   }
 
   function renderChartCfBypass(snapshots){
@@ -620,10 +1132,11 @@ ${commonDashboardStyles()}
       return { label: id, stroke: colorForProxy(id), width: 1.5 };
     }));
     charts["latency"] = new uPlot(
-      chartOptions(seriesDef),
+      chartOptions(seriesDef, "chart-latency"),
       [ts].concat(series),
       body
     );
+    attachChartResize("chart-latency");
   }
 
   function renderChartHealth(snapshots){
@@ -646,10 +1159,11 @@ ${commonDashboardStyles()}
       return { label: id, stroke: colorForProxy(id), width: 1.5 };
     }));
     charts["health"] = new uPlot(
-      chartOptions(seriesDef),
+      chartOptions(seriesDef, "chart-health"),
       [ts].concat(series),
       body
     );
+    attachChartResize("chart-health");
   }
 
   // ── Phase 4: drawer state machine ───────────────────────────────────
@@ -974,6 +1488,11 @@ ${commonDashboardStyles()}
     }, [ts, wait], container);
   }
 
+  // Phase-2 — last /ops/snapshot payload captured for click delegators.
+  // The inline config editor reads merged values from here so the
+  // prompt opens with the current value pre-filled.
+  var data_last_snapshot = null;
+
   function refresh(){
     $("state").textContent = "polling…";
     return Promise.all([
@@ -987,16 +1506,23 @@ ${commonDashboardStyles()}
         .catch(function(){ return { rows: [] }; }),
     ]).then(function(results){
       var data = results[0];
+      data_last_snapshot = data;
       var snapshots = (results[1].rows || []);
       var nowMs = data.server_time || Date.now();
 
       renderStats(data, nowMs);
       renderBanners(data);
+      renderAlertsBanner(data);
+      renderPipelinePauseBanner(data);
       renderRunners(data, nowMs);
       renderSignals(data, nowMs);
       renderLoginState(data);
       renderConfig(data);
       renderProxies(data);
+      renderSessions(data, nowMs);
+      renderOpsControls(data);
+      renderMovieClaimStats(data);
+      renderWorkStats(data);
 
       renderChartRunners(snapshots);
       renderChartQueue(snapshots);
