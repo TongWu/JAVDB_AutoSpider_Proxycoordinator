@@ -121,6 +121,7 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/signals",
   "/dashboard",
   "/ops/snapshot",
+  "/recommend_proxy",
 ]);
 
 /** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
@@ -357,6 +358,10 @@ export default {
           });
         case "/ops/snapshot":
           return await aggregateOpsSnapshot(env, url);
+        // W5.5 — cross-DO health aggregation; returns proxy IDs ranked
+        // by their most-recent ProxyCoordinator health snapshot.
+        case "/recommend_proxy":
+          return await recommendProxies(env, url);
         // W5.4 — operator-pushed active signals (live in RunnerRegistry DO)
         case "/signal": {
           const body = await request.json();
@@ -815,6 +820,124 @@ async function snapshotProxies(
     }),
   );
   return results;
+}
+
+/**
+ * W5.5 — rank the supplied proxy IDs by their most-recent
+ * ProxyCoordinator health snapshot and return the top-N for selection.
+ *
+ * Query params:
+ *   proxy_ids (required) — comma-separated list, capped at 32.
+ *   top_n (optional)     — return only the top N; default = all.
+ *   include_unhealthy    — set to "1" to include banned / errored
+ *                          proxies in the response (still ranked last).
+ *                          Default omits them so the caller can blindly
+ *                          take recommendations[0] without checking.
+ *
+ * Ranking:
+ *   1. health.score descending (higher = better)
+ *   2. health.latency_ema_ms ascending (faster = better) for ties
+ *   3. proxy_id ascending for fully-stable tie-break
+ *
+ * Returns ``recommendations: []`` (not a 400) when no proxy_ids are
+ * supplied so a misconfigured client fails open. Unreachable DOs / no
+ * health data yet → score defaults to 0.5 (neutral) so an
+ * unseen-but-configured proxy gets some traffic instead of being
+ * excluded entirely.
+ */
+async function recommendProxies(env: Env, url: URL): Promise<Response> {
+  const rawIds = (url.searchParams.get("proxy_ids") ?? "").trim();
+  const proxyIds = rawIds
+    ? rawIds
+        .split(",")
+        .map((s) => normalizeProxyId(s.trim()))
+        .filter((s) => s !== "")
+        .slice(0, 32)
+    : [];
+  const topNRaw = parseInt(url.searchParams.get("top_n") ?? "", 10);
+  const topN =
+    Number.isFinite(topNRaw) && topNRaw > 0 ? topNRaw : proxyIds.length;
+  const includeUnhealthy = url.searchParams.get("include_unhealthy") === "1";
+
+  if (proxyIds.length === 0) {
+    return jsonResponse({
+      recommendations: [],
+      queried_proxy_ids: [],
+      server_time: Date.now(),
+    });
+  }
+
+  const states = await snapshotProxies(env, proxyIds);
+
+  interface Recommendation {
+    proxy_id: string;
+    score: number;
+    latency_ema_ms: number;
+    success_count: number;
+    failure_count: number;
+    banned: boolean;
+    requires_cf_bypass: boolean;
+    available: boolean;
+  }
+
+  const ranked: Recommendation[] = states.map((s) => {
+    const banned = Boolean(s.banned);
+    const requires_cf_bypass = Boolean(s.requires_cf_bypass);
+    const healthy = !s.error && !banned;
+    // ``health`` is the ProxyHealthSnapshot computed by the DO; missing
+    // when the proxy has not yet been leased or returned an error.
+    const h =
+      typeof s.health === "object" && s.health !== null
+        ? (s.health as {
+            score?: number;
+            latency_ema_ms?: number;
+            success_count?: number;
+            failure_count?: number;
+          })
+        : null;
+    const score = clampNumber(h?.score, 0.5, 0, 1);
+    return {
+      proxy_id: String(s.proxy_id),
+      score: banned ? -1 : score,
+      latency_ema_ms: clampNumber(h?.latency_ema_ms, 0, 0, 60_000),
+      success_count: clampNumber(h?.success_count, 0, 0, Number.MAX_SAFE_INTEGER),
+      failure_count: clampNumber(h?.failure_count, 0, 0, Number.MAX_SAFE_INTEGER),
+      banned,
+      requires_cf_bypass,
+      available: healthy,
+    };
+  });
+
+  ranked.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score;
+    if (a.latency_ema_ms !== b.latency_ema_ms) {
+      return a.latency_ema_ms - b.latency_ema_ms;
+    }
+    return a.proxy_id.localeCompare(b.proxy_id);
+  });
+
+  const filtered = includeUnhealthy
+    ? ranked
+    : ranked.filter((r) => r.available);
+
+  return jsonResponse({
+    recommendations: filtered.slice(0, topN),
+    queried_proxy_ids: proxyIds,
+    server_time: Date.now(),
+  });
+}
+
+function clampNumber(
+  raw: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
 }
 
 /**
