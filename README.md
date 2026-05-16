@@ -4,15 +4,25 @@ Cloudflare Worker + Durable Objects that coordinate **per-proxy request
 pacing** *and* **shared JavDB login state** across multiple GitHub Actions
 runners for the JavDB spider.
 
-Two cooperating Durable Object classes live behind the same Worker and
+Five cooperating Durable Object classes live behind the same Worker and
 the same bearer token:
 
 - `ProxyCoordinator` (per-proxy DO, addressed by `idFromName(proxy_id)`):
   global `next_available_at` + three-window throttle + CF/failure penalty.
-- `GlobalLoginState` (singleton DO, addressed by `idFromName("global")`):
+- `GlobalLoginState` (singleton, `idFromName("global")`):
   the at-most-one logged-in proxy + its encrypted session cookie + a
   re-login mutex (`lease`) so only one runner ever performs the actual
   login at a time.
+- `MovieClaimState` (per-day-sharded, `idFromName("YYYY-MM-DD[-N]")`):
+  cross-runner mutex on detail-page fetches; prevents two runners from
+  scraping the same `/v/<id>` page concurrently.
+- `RunnerRegistry` (singleton, `idFromName("runners")`):
+  registry of live spider runners for ops visibility +
+  `proxy_pool_hash` drift detection. Also stores **operator signals**
+  (W5.4) — see [Active signals](#active-signals-w54).
+- `ConfigState` (singleton, `idFromName("global-config")`):
+  W5.3 — versioned snapshot of operator-tunable runtime parameters that
+  runners pull on every heartbeat without a redeploy.
 
 ## Why
 
@@ -50,31 +60,47 @@ end-to-end design.
 ## Architecture
 
 ```
-                                ┌──> ProxyCoordinator(proxy_A)
-                                │     /lease + /report
-Runner 1 ─┐                     ├──> ProxyCoordinator(proxy_B)
-Runner 2 ─┼──> Worker (auth) ───┤        ...one DO per proxy_id
-Runner N ─┘                     │
-                                └──> GlobalLoginState (singleton)
-                                      /login_state{,/acquire_lease,
-                                       /publish,/invalidate,/release_lease}
+                                ┌──> ProxyCoordinator(proxy_A)   one DO per proxy_id
+                                │     /lease + /report + /state
+                                │
+Runner 1 ─┐                     ├──> GlobalLoginState (singleton)
+Runner 2 ─┼──> Worker ──────────┤     /login_state*
+Runner N ─┘   (auth +           │
+               rate-limit)      ├──> MovieClaimState(YYYY-MM-DD[-N])  one DO per day-shard
+                                │     /claim_movie + /complete_movie + ...
+                                │
+                                ├──> RunnerRegistry (singleton)
+                                │     /register + /heartbeat + /unregister
+                                │     /signal + /signals               (W5.4)
+                                │
+                                └──> ConfigState (singleton)            (W5.3)
+                                      /config (GET, PATCH)
 ```
 
-`/login_state` and `/lease` operate on **different DO classes** with
-**separate bindings** and **separate storage**: rotating one cannot
-disrupt the other.
+Every DO class has **separate bindings** and **separate storage**:
+rotating one cannot disrupt the others.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `wrangler.toml` | Worker + DO + Analytics Engine bindings; v1 / v2 SQLite migrations; tunable throttle constants in `[vars]` |
-| `src/index.ts` | Worker entry: routes `/lease`, `/report`, `/state`, `/login_state*`, `/health`; bearer-token auth |
+| `wrangler.toml` | Worker + DO + Analytics Engine bindings; v1 → v4 SQLite migrations; tunable throttle constants in `[vars]` |
+| `src/index.ts` | Worker entry: routes for every DO + `/health`; Bearer auth + W5.6 rate limit |
 | `src/proxy_coordinator.ts` | `ProxyCoordinator` per-proxy DO: `next_available_at` + 3 windows + CF events |
 | `src/global_login_state.ts` | `GlobalLoginState` singleton DO: cookie (AES-GCM at rest), version, lease mutex |
-| `src/types.ts` | Env / payload type definitions for both DOs |
-| `test/proxy_coordinator.test.ts` | Vitest suite (15 tests) — DO state, throttle math, auth |
-| `test/global_login_state.test.ts` | Vitest suite (31 tests) — lease, publish, invalidate, encryption, isolation |
+| `src/movie_claim_state.ts` | `MovieClaimState` per-day DO: cross-runner detail-page mutex (P1-B), failure cooldown (P2-A), staged-commit (Phase-1) |
+| `src/runner_registry.ts` | `RunnerRegistry` singleton DO: live runner list + drift detection + W5.4 operator signals |
+| `src/config_state.ts` | `ConfigState` singleton DO (W5.3): versioned snapshot of operator-tunable runtime config |
+| `src/types.ts` | Env / payload / response type definitions for every DO |
+| `test/proxy_coordinator.test.ts` | Vitest suite (43 tests) — throttle math, auth, P2-D health snapshots |
+| `test/global_login_state.test.ts` | Vitest suite (46 tests) — lease, publish, invalidate, encryption, isolation |
+| `test/movie_claim_state.test.ts` | Vitest suite (62 tests) — claim / complete / stage / rollback / sweep |
+| `test/runner_registry.test.ts` | Vitest suite (34 tests) — register / heartbeat / drift summary |
+| `test/config_state.test.ts` | Vitest suite (11 tests, W5.3) — GET / PATCH / heartbeat embedding |
+| `test/signals.test.ts` | Vitest suite (10 tests, W5.4) — POST /signal validation + register/heartbeat embedding |
+| `test/rate_limit.test.ts` | Vitest suite (10 tests, W5.6) — token-bucket math + fetch-handler integration |
+
+Total: **216 tests** across 7 files.
 
 ## Auth
 
@@ -128,7 +154,7 @@ GitHub repo Variables as `PROXY_COORDINATOR_URL`.
 ```bash
 npm install
 npx wrangler dev          # http://localhost:8787
-npx vitest run            # 15 unit tests
+npx vitest run            # 216 unit tests
 npx tsc --noEmit          # type-check
 ```
 
@@ -206,17 +232,151 @@ eval curl -s -X POST http://localhost:8787/login_state/release_lease $H \
   -d "'{\"holder_id\":\"runner-A\"}'"
 ```
 
+## Runner registry endpoints
+
+`RunnerRegistry` is the singleton DO that tracks which spider runners are
+alive right now. Every register / heartbeat response carries a snapshot
+of the live cohort and (when the v3 + v4 migrations are applied) the
+W5.3 config snapshot and W5.4 active signals.
+
+| Method + path | Body | Purpose |
+|---|---|---|
+| `POST /register` | `{holder_id, workflow_run_id?, workflow_name?, started_at?, proxy_pool_hash?, page_range?}` | Idempotent register. Re-registers with the same `holder_id` keep the original `started_at` and act as a heartbeat refresh. Response carries `active_runners[]`, `pool_hash_summary[]`, `movie_claim_recommended`, `config?` (W5.3), `active_signals?` (W5.4). |
+| `POST /heartbeat` | `{holder_id}` | Refresh `last_heartbeat`. Returns `alive=false` (not 404) for evicted holders so the client can re-register without treating it as fatal. Same `config` / `active_signals` embedding as `/register`. |
+| `POST /unregister` | `{holder_id}` | atexit cleanup. Idempotent — unknown holder returns `unregistered=false`. |
+| `GET /active_runners` | — | Read-only snapshot for ops dashboards. Does not refresh any heartbeat. |
+
+## Dynamic config (W5.3)
+
+`ConfigState` lets operators tune runtime parameters (throttle windows,
+ban TTLs, heartbeat cadence, ...) without redeploying the Worker. The
+new values flow to every runner within one heartbeat interval via the
+`config` field embedded in `/register` and `/heartbeat` responses.
+
+Allowed keys (closed allowlist — PATCH with anything outside this set
+returns HTTP 400): `short_window_sec`, `short_max`, `long_window_sec`,
+`long_max`, `extra_window_sec`, `extra_max`, `penalty_window_sec`,
+`jitter_max_ms`, `ban_ttl_ms`, `movie_claim_ttl_ms`,
+`runner_stale_ttl_ms`, `movie_claim_min_runners`,
+`login_cooldown_threshold`, `login_cooldown_window_sec`,
+`login_cooldown_duration_ms`, `heartbeat_interval_sec`.
+
+| Method + path | Body | Purpose |
+|---|---|---|
+| `GET /config` | — | Read the current snapshot: `{version, updated_at, values, server_time}`. `values` is a partial map of operator-set overrides (unset keys fall back to the env-var defaults in `wrangler.toml [vars]`). |
+| `PATCH /config` | `{values: {key: stringValue, ...}}` | Partial update. Bumps `version` and `updated_at`. All values are stored / transported as strings — pass `""` to clear an override. Unknown keys return 400. |
+
+```bash
+# View
+curl -H "Authorization: Bearer $TOKEN" https://your.worker.dev/config
+
+# Tighten the short-window throttle (e.g. response to anti-bot escalation)
+curl -X PATCH https://your.worker.dev/config \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"values": {"short_max": "2", "long_max": "20"}}'
+
+# Clear that override (revert to env-var default)
+curl -X PATCH https://your.worker.dev/config \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"values": {"short_max": "", "long_max": ""}}'
+```
+
+**Note:** The current MVP delivers the **distribution mechanism only**.
+Worker DOs (ProxyCoordinator, MovieClaim, RunnerRegistry) still read
+their tuning values from env vars on each request; the Python spider
+client receives the snapshot in `HeartbeatResult.config` but does not
+yet apply it to `MovieSleepManager` / `TripleWindowThrottle`. Migrating
+consumers to read from `ConfigState` is a separate follow-up; until
+then, PATCH /config is observable but not yet load-bearing.
+
+## Active signals (W5.4)
+
+`RunnerRegistry` carries an operator-pushed signal list that runners
+reconcile on every heartbeat. Signals are **state, not events**: the
+heartbeat response always returns the full active set, so a runner
+arriving mid-flight observes the same posture as everyone else.
+
+Signal kinds (closed allowlist):
+
+| Kind | Purpose | Required payload |
+|---|---|---|
+| `throttle_global` | Multiply every runner's local sleep / throttle by `factor`. Use during cohort-wide cool-down. | `factor` ∈ [1.0, 100.0], `ttl_ms` |
+| `ban_proxy` | Emergency drop of one proxy from every runner's local pool. Independent from the per-proxy Worker-side ban. | `proxy_id`, `ttl_ms` |
+| `pause_all` | Runners stop dispatching new tasks; in-flight requests run to completion. | `ttl_ms` |
+| `resume` | Operator override — clears every other active signal in one go. | *(none)* |
+
+| Method + path | Body | Purpose |
+|---|---|---|
+| `POST /signal` | `{kind, ttl_ms?, factor?, proxy_id?, reason?, id?}` | Push a signal. Idempotent on `id` (operator retry replaces the same entry). Server clamps `ttl_ms` to [1 s, 24 h] and `factor` to [1, 100]. |
+| `GET /signals` | — | List currently-active signals (already filtered for expired entries). |
+
+```bash
+# Emergency global throttle (3× pace, 30 min)
+curl -X POST https://your.worker.dev/signal \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"kind":"throttle_global","factor":3.0,"ttl_ms":1800000,"reason":"WAF flap"}'
+
+# Drop a misbehaving proxy from every runner for 1 hour
+curl -X POST https://your.worker.dev/signal \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"kind":"ban_proxy","proxy_id":"Proxy-3","ttl_ms":3600000,"reason":"timeouts > 80%"}'
+
+# Pause everyone for 5 min while you investigate
+curl -X POST https://your.worker.dev/signal \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"kind":"pause_all","ttl_ms":300000,"reason":"manual ops"}'
+
+# Clear all signals (operator override)
+curl -X POST https://your.worker.dev/signal \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"kind":"resume"}'
+
+# What's active right now?
+curl -H "Authorization: Bearer $TOKEN" https://your.worker.dev/signals
+```
+
+Signals are **time-bounded**: every signal auto-expires at `expires_at_ms`
+and the GC alarm prunes the storage every 5 min. The Python client
+parses `HeartbeatResult.active_signals` into a typed `Signal` list but
+**does not yet apply** the effects to `MovieSleepManager` / `ProxyPool`;
+same scope decision as W5.3 — distribution mechanism first, consumer
+integration in a follow-up.
+
+## Rate limit (W5.6)
+
+Every authenticated request runs through a per-Bearer-token token-bucket
+gate after auth and before the route switch. Defaults to **1000
+requests / minute / token**; depleted buckets return HTTP 429.
+
+The bucket lives in the Worker isolate and resets on cold start, so this
+is best-effort burst protection rather than strict SLO enforcement.
+Configure via `WORKER_RATE_LIMIT_PER_MIN` in `wrangler.toml [vars]`;
+set `"0"` to disable (e.g. for load tests).
+
+`/health` bypasses both auth and rate limiting so an unauthenticated
+probe can still verify the Worker is reachable.
+
 ## DO migrations
 
-`wrangler.toml` declares two migration tags:
+`wrangler.toml` declares four migration tags:
 
 - `v1`: introduces `ProxyCoordinator` (per-proxy throttle DO).
 - `v2`: introduces `GlobalLoginState` (singleton login state DO).
+- `v3`: introduces `MovieClaimState` (per-day claim DO) + `RunnerRegistry`
+  (singleton ops/drift DO) in one atomic deploy.
+- `v4`: introduces `ConfigState` (singleton W5.3 config DO).
 
 Migrations are applied in tag order on every `wrangler deploy`; do **not**
 reorder or delete an earlier tag — that would re-create its DO class
 from scratch and lose the persisted SQLite state.  Adding a new DO class
-later is always safe: append a new `[[migrations]] tag = "v3"` block.
+later is always safe: append a new `[[migrations]]` block with the next
+tag.
 
 ## Free-tier sizing
 
