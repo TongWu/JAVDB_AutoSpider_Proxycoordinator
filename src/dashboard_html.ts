@@ -107,6 +107,11 @@ export function renderDashboardHtml(_url: URL): string {
   details .config-grid { padding: 0 0 16px; display: grid; grid-template-columns: minmax(220px, auto) 1fr; gap: 4px 16px; font-size: 12.5px; }
   details .config-grid .k { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   details .config-grid .v { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .chip-btn { background: var(--input-bg); color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px; cursor: pointer; font-size: 10px; }
+  .chip-btn:hover { color: var(--text); }
+  .chip { display: inline-block; padding: 2px 10px; margin: 2px; font-size: 11px; border-radius: 999px; cursor: pointer; background: var(--input-bg); color: var(--muted); border: 1px solid var(--border); user-select: none; transition: all .12s; }
+  .chip.active { background: var(--accent-dim); color: #0a0e14; border-color: var(--accent); }
+  .chip .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
 </style></head>
 <body>
 <div class="topbar">
@@ -133,8 +138,18 @@ export function renderDashboardHtml(_url: URL): string {
       <div class="body" id="signals"></div>
     </div>
     <div class="panel full">
-      <header>Per-proxy state <span class="badge" id="proxy-count">0</span></header>
-      <div class="body" id="proxies"></div>
+      <header>
+        Per-proxy state <span class="badge" id="proxy-count">0</span>
+        <span style="margin-left:12px;font-size:10px;color:var(--muted)">
+          <button data-chip-action="all" class="chip-btn">all</button>
+          <button data-chip-action="none" class="chip-btn">none</button>
+          <button data-chip-action="invert" class="chip-btn">invert</button>
+        </span>
+      </header>
+      <div class="body">
+        <div id="proxy-chips" style="padding:10px 16px;border-bottom:1px solid var(--border)"></div>
+        <div id="proxies"></div>
+      </div>
     </div>
     <div class="panel full">
       <header>Config snapshot</header>
@@ -161,6 +176,64 @@ export function renderDashboardHtml(_url: URL): string {
   function fmtAge(ms, nowMs){ if(!ms) return "—"; var s = Math.max(0,(nowMs-ms)/1000); if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
   function fmtDur(ms){ if(ms<=0) return "—"; var s = ms/1000; if(s<60) return s.toFixed(0)+"s"; if(s<3600) return (s/60).toFixed(1)+"m"; return (s/3600).toFixed(1)+"h"; }
   function esc(s){ return String(s).replace(/[&<>"']/g, function(c){ return ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c]; }); }
+
+  // ── Phase 3: chip-filter state ──────────────────────────────────────
+  var PROXY_FILTER_KEY = "dashboard.proxyFilter";
+  // Stores the set of EXCLUDED proxy IDs. Empty set = show all.
+  var proxyFilter = loadProxyFilter();
+
+  function loadProxyFilter() {
+    try {
+      var raw = localStorage.getItem(PROXY_FILTER_KEY);
+      if (!raw) return new Set();
+      return new Set(JSON.parse(raw));
+    } catch (e) { return new Set(); }
+  }
+  function saveProxyFilter() {
+    try { localStorage.setItem(PROXY_FILTER_KEY, JSON.stringify(Array.from(proxyFilter))); } catch (e) {}
+  }
+  function colorForProxy(id) {
+    // Stable HSL hash so the same proxy always gets the same colour.
+    var h = 0;
+    for (var i = 0; i < id.length; i++) h = ((h << 5) - h + id.charCodeAt(i)) | 0;
+    return "hsl(" + (Math.abs(h) % 360) + ", 65%, 60%)";
+  }
+  function renderProxyChips(data) {
+    var rows = data.proxies || [];
+    var html = "";
+    rows.forEach(function(p){
+      var col = colorForProxy(p.proxy_id);
+      var on = !proxyFilter.has(p.proxy_id);
+      html += '<span class="chip ' + (on ? "active" : "") + '" data-proxy-id="' + esc(p.proxy_id) + '">'
+        + '<span class="dot" style="background:' + col + '"></span>'
+        + esc(p.proxy_id) + '</span>';
+    });
+    $("proxy-chips").innerHTML = html;
+  }
+  document.addEventListener("click", function(e){
+    var chip = e.target.closest && e.target.closest(".chip");
+    if (chip) {
+      var id = chip.getAttribute("data-proxy-id");
+      if (proxyFilter.has(id)) proxyFilter.delete(id); else proxyFilter.add(id);
+      saveProxyFilter();
+      refresh();
+      return;
+    }
+    var btn = e.target.closest && e.target.closest("[data-chip-action]");
+    if (btn) {
+      var action = btn.getAttribute("data-chip-action");
+      var allIds = Array.from(document.querySelectorAll("#proxy-chips .chip")).map(function(c){ return c.getAttribute("data-proxy-id"); });
+      if (action === "all") proxyFilter = new Set();
+      else if (action === "none") proxyFilter = new Set(allIds);
+      else if (action === "invert") {
+        var inv = new Set();
+        allIds.forEach(function(id){ if (!proxyFilter.has(id)) inv.add(id); });
+        proxyFilter = inv;
+      }
+      saveProxyFilter();
+      refresh();
+    }
+  });
 
   function statTile(label, value, cls){
     return '<div class="stat-card '+(cls||"")+'"><div class="label">'+label+'</div><div class="value">'+esc(String(value))+'</div></div>';
@@ -266,10 +339,17 @@ export function renderDashboardHtml(_url: URL): string {
   }
 
   function renderProxies(data){
-    var rows = data.proxies || [];
-    $("proxy-count").textContent = String(rows.length);
-    if(rows.length === 0){
-      $("proxies").innerHTML = '<div class="hint">No proxies queried. Append <code>?proxy_ids=Proxy-1,Proxy-2</code> to this URL to enumerate per-proxy throttle state.</div>';
+    renderProxyChips(data);  // Phase 3 — always render the chip strip from the full pool
+    var allRows = data.proxies || [];
+    if (allRows.length === 0) {
+      $("proxy-count").textContent = "0";
+      $("proxies").innerHTML = '<div class="hint">No proxies seen yet — the first runner register (with proxy_pool payload) will populate this list automatically.</div>';
+      return;
+    }
+    var rows = allRows.filter(function(p){ return !proxyFilter.has(p.proxy_id); });
+    $("proxy-count").textContent = rows.length + " / " + allRows.length;
+    if (rows.length === 0) {
+      $("proxies").innerHTML = '<div class="hint">All proxies hidden by chip filter. Click <strong>all</strong> above to show them.</div>';
       return;
     }
     var html = '<table><tr><th>Proxy</th><th>Status</th><th>Health</th><th>Latency</th><th>Wins / Losses</th><th>Wait</th></tr>';

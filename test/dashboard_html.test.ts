@@ -74,3 +74,35 @@ describe("Phase 3 — Config panel always shows merged config", () => {
     expect(html).not.toContain("No operator overrides");
   });
 });
+
+describe("Phase 3 — per-proxy chip filter", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("has a chip-filter container above the proxy table", () => {
+    expect(html).toContain('id="proxy-chips"');
+  });
+
+  it("declares localStorage key for filter state", () => {
+    expect(html).toContain('PROXY_FILTER_KEY = "dashboard.proxyFilter"');
+  });
+
+  it("renders all / none / invert toggle buttons", () => {
+    expect(html).toContain('data-chip-action="all"');
+    expect(html).toContain('data-chip-action="none"');
+    expect(html).toContain('data-chip-action="invert"');
+  });
+
+  it("renderProxyChips function is defined", () => {
+    expect(html).toContain("function renderProxyChips(");
+  });
+
+  it("colorForProxy generates stable HSL colours", () => {
+    expect(html).toContain("function colorForProxy(");
+    expect(html).toContain("hsl(");
+  });
+
+  it("uses localStorage for chip filter persistence", () => {
+    expect(html).toContain("localStorage.getItem(PROXY_FILTER_KEY)");
+    expect(html).toContain("localStorage.setItem(PROXY_FILTER_KEY");
+  });
+});
