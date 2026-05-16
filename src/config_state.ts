@@ -1,8 +1,10 @@
 import {
   CONFIG_ALLOWED_KEYS,
   ConfigKey,
+  ConfigMergedEntry,
   ConfigPatchRequest,
   ConfigResponse,
+  ConfigResponseWithMerged,
   ConfigSnapshot,
   Env,
 } from "./types";
@@ -115,7 +117,7 @@ export class ConfigState implements DurableObject {
 
   private async handleGet(): Promise<Response> {
     const snap = await this.loadSnapshot();
-    return jsonResponse(toResponse(snap));
+    return jsonResponse(toResponse(snap, this.env));
   }
 
   /**
@@ -222,7 +224,7 @@ export class ConfigState implements DurableObject {
       );
     }
 
-    return jsonResponse(toResponse(merged));
+    return jsonResponse(toResponse(merged, this.env));
   }
 
   /**
@@ -282,8 +284,23 @@ export class ConfigState implements DurableObject {
   }
 }
 
-function toResponse(snap: ConfigSnapshot): ConfigResponse {
-  return { ...snap, server_time: Date.now() };
+function toResponse(snap: ConfigSnapshot, env: Env): ConfigResponseWithMerged {
+  const merged: Partial<Record<ConfigKey, ConfigMergedEntry>> = {};
+  for (const key of CONFIG_ALLOWED_KEYS) {
+    if (key in snap.values) {
+      merged[key] = { value: String(snap.values[key]), source: "override" };
+    } else {
+      // Map ConfigKey (lowercase) to env var (uppercase) and read default.
+      const envKey = key.toUpperCase() as keyof Env;
+      const envValue = env[envKey];
+      if (envValue !== undefined && envValue !== null && envValue !== "") {
+        merged[key] = { value: String(envValue), source: "default" };
+      }
+      // If the env var is not set, omit the key from merged.
+      // Dashboard renders only what's present.
+    }
+  }
+  return { ...snap, server_time: Date.now(), merged };
 }
 
 function jsonResponse(body: unknown, status = 200): Response {

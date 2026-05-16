@@ -56,3 +56,21 @@ describe("Phase 3 — browser timezone formatting", () => {
     expect(html).toMatch(/\$\("ts"\)\.innerHTML\s*=/);
   });
 });
+
+describe("Phase 3 — Config panel always shows merged config", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("renderConfig iterates over data.config.merged (not just values)", () => {
+    expect(html).toContain("data.config.merged");
+  });
+
+  it("renderConfig branches on entry.source === 'override'", () => {
+    expect(html).toMatch(/entry\.source === ['"]override['"]/);
+  });
+
+  it("renderConfig does NOT depend on data.config.values anymore", () => {
+    // The old code path checked entries.length on data.config.values and
+    // showed the "No operator overrides" hint. Confirm we don't still do that.
+    expect(html).not.toContain("No operator overrides");
+  });
+});

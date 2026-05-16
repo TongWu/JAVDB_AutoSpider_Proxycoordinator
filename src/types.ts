@@ -1177,3 +1177,15 @@ export interface ConfigPatchRequest {
 export interface ConfigResponse extends ConfigSnapshot {
   server_time: number;
 }
+
+/** Phase 3 — single merged entry for the dashboard. */
+export interface ConfigMergedEntry {
+  value: string;
+  source: "default" | "override";
+}
+
+/** Phase 3 — extended response carrying the full merged view alongside
+ *  the legacy `values` (overrides-only) field. */
+export interface ConfigResponseWithMerged extends ConfigResponse {
+  merged: Partial<Record<ConfigKey, ConfigMergedEntry>>;
+}

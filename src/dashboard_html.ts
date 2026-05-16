@@ -244,15 +244,22 @@ export function renderDashboardHtml(_url: URL): string {
   }
 
   function renderConfig(data){
-    if(!data.config){ $("config").innerHTML = '<div class="empty">config-state DO unavailable</div>'; return; }
-    var entries = Object.entries(data.config.values || {});
+    if(!data.config || !data.config.merged){ $("config").innerHTML = '<div class="empty">config-state DO unavailable</div>'; return; }
+    var entries = Object.entries(data.config.merged);
     if(entries.length === 0){
-      $("config").innerHTML = '<div class="hint">No operator overrides — all values use env-var defaults from <code>wrangler.toml</code>. Snapshot version <code>'+esc(String(data.config.version||0))+'</code>.</div>';
+      $("config").innerHTML = '<div class="hint">No config keys returned. Check that <code>CONFIG_STATE_DO</code> is bound.</div>';
       return;
     }
-    var html = '<details open><summary>'+entries.length+' override(s) · version <code style="text-transform:none;letter-spacing:0">'+esc(String(data.config.version||0))+'</code></summary><div class="config-grid">';
-    entries.forEach(function(kv){
-      html += '<div class="k">'+esc(kv[0])+'</div><div class="v">'+esc(kv[1])+'</div>';
+    var overrideCount = entries.filter(function(kv){ return kv[1].source === "override"; }).length;
+    var hdr = entries.length + ' key(s) · ' + overrideCount + ' override(s) · version <code style="text-transform:none;letter-spacing:0">' + esc(String(data.config.version||0)) + '</code>';
+    var html = '<details open><summary>'+hdr+'</summary><div class="config-grid">';
+    entries.sort(function(a, b){ return a[0].localeCompare(b[0]); }).forEach(function(kv){
+      var k = kv[0];
+      var entry = kv[1];
+      var srcPill = entry.source === "override"
+        ? '<span class="pill warn" style="margin-left:8px;font-size:9px;vertical-align:1px">override</span>'
+        : '';
+      html += '<div class="k">'+esc(k)+srcPill+'</div><div class="v">'+esc(String(entry.value))+'</div>';
     });
     html += '</div></details>';
     $("config").innerHTML = html;
