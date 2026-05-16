@@ -171,3 +171,39 @@ describe("Phase 3 — 5 priority charts", () => {
     expect(html).toMatch(/CHARTS_RANGE_MS\s*=\s*60\s*\*\s*60\s*\*\s*1000/);
   });
 });
+
+describe("Phase 4 — drawer shell", () => {
+  const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
+
+  it("has a drawer overlay container in the DOM", () => {
+    expect(html).toContain('id="drawer-overlay"');
+    expect(html).toContain('id="drawer"');
+  });
+
+  it("has all 7 time-range buttons", () => {
+    ["Now", "10min", "30min", "1h", "6h", "24h", "7d", "30d"].forEach((label) => {
+      expect(html).toContain('data-range="' + label + '"');
+    });
+  });
+
+  it("has a close button + ESC handler", () => {
+    expect(html).toContain('id="drawer-close"');
+    expect(html).toMatch(/key === ['"]Escape['"]/);
+  });
+
+  it("supports closing via overlay click", () => {
+    expect(html).toContain("closeDrawer");
+  });
+
+  it("openDrawer function is defined and resets to Now on each open", () => {
+    expect(html).toContain("function openDrawer(");
+    // grill-me Q6c: drill-down resets to "Now" per open (state NOT persisted)
+    expect(html).toMatch(/drawerSelectedRange\s*=\s*['"]Now['"]/);
+  });
+
+  it("defines RANGE_MS lookup for the 7 ranges", () => {
+    expect(html).toContain('"10min"');
+    expect(html).toContain('"30d"');
+    expect(html).toContain("RANGE_MS");
+  });
+});

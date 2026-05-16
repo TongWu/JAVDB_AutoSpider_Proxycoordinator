@@ -121,6 +121,33 @@ ${commonDashboardStyles()}
   @media (max-width: 700px) { .charts { grid-template-columns: 1fr; } }
   .chart-panel .chart-body { padding: 8px 12px 12px; min-height: 180px; }
   .chart-panel header { font-size: 11px; }
+
+  .drawer-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    z-index: 100; opacity: 1; transition: opacity .15s;
+  }
+  .drawer-overlay.hidden { display: none; opacity: 0; }
+  .drawer {
+    position: absolute; top: 0; right: 0; height: 100vh;
+    width: min(640px, 42vw); min-width: 360px;
+    background: var(--card-bg); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    transform: translateX(0%); transition: transform .18s ease-out;
+    box-shadow: -20px 0 60px rgba(0,0,0,0.6);
+  }
+  .drawer-overlay.hidden .drawer { transform: translateX(100%); }
+  .drawer-header { display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .drawer-title { font-size: 13px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text); }
+  .drawer-close { background: transparent; color: var(--muted); border: 0; font-size: 22px; cursor: pointer; line-height: 1; }
+  .drawer-close:hover { color: var(--text); }
+  .drawer-range { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 4px; }
+  .range-btn { background: var(--input-bg); color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 10px; font-size: 11px; cursor: pointer; }
+  .range-btn:hover { color: var(--text); }
+  .range-btn.active { background: var(--accent-dim); color: #0a0e14; border-color: var(--accent); }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 16px 18px; }
+  @media (max-width: 700px) { .drawer { width: 100vw; } }
 </style></head>
 <body>
 <div class="topbar">
@@ -174,6 +201,25 @@ ${commonDashboardStyles()}
   </div>
 </main>
 <script>${UPLOT_MIN_JS}</script>
+<div id="drawer-overlay" class="drawer-overlay hidden" aria-hidden="true">
+  <aside id="drawer" class="drawer" role="dialog" aria-label="History detail">
+    <header class="drawer-header">
+      <span id="drawer-title" class="drawer-title">History</span>
+      <button id="drawer-close" class="drawer-close" aria-label="Close">×</button>
+    </header>
+    <div class="drawer-range">
+      <button data-range="Now" class="range-btn active">Now</button>
+      <button data-range="10min" class="range-btn">10min</button>
+      <button data-range="30min" class="range-btn">30min</button>
+      <button data-range="1h" class="range-btn">1h</button>
+      <button data-range="6h" class="range-btn">6h</button>
+      <button data-range="24h" class="range-btn">24h</button>
+      <button data-range="7d" class="range-btn">7d</button>
+      <button data-range="30d" class="range-btn">30d</button>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+</div>
 <script>
 (function(){
   var $ = function(id){ return document.getElementById(id); };
@@ -563,6 +609,70 @@ ${commonDashboardStyles()}
       body
     );
   }
+
+  // ── Phase 4: drawer state machine ───────────────────────────────────
+  var drawerOpen = false;
+  var drawerSelectedRange = "Now";
+  var drawerRenderer = null;   // function(rangeMs, ctxArgs)
+  var drawerCtx = {};          // free-form context (e.g., proxy_id when opened from per-proxy panel)
+
+  var RANGE_MS = {
+    "Now": 0,
+    "10min": 600000,
+    "30min": 1800000,
+    "1h": 3600000,
+    "6h": 21600000,
+    "24h": 86400000,
+    "7d": 604800000,
+    "30d": 2592000000,
+  };
+
+  function openDrawer(title, renderer, ctxArgs){
+    drawerOpen = true;
+    drawerSelectedRange = "Now";  // grill-me Q6c: drill-down resets per open
+    drawerRenderer = renderer;
+    drawerCtx = ctxArgs || {};
+    $("drawer-title").textContent = title;
+    document.querySelectorAll(".range-btn").forEach(function(b){
+      b.classList.toggle("active", b.getAttribute("data-range") === "Now");
+    });
+    $("drawer-overlay").classList.remove("hidden");
+    $("drawer-overlay").setAttribute("aria-hidden", "false");
+    renderDrawer();
+  }
+
+  function closeDrawer(){
+    drawerOpen = false;
+    $("drawer-overlay").classList.add("hidden");
+    $("drawer-overlay").setAttribute("aria-hidden", "true");
+    $("drawer-body").innerHTML = "";
+    drawerRenderer = null;
+  }
+
+  function renderDrawer(){
+    if (!drawerRenderer) return;
+    var rangeMs = RANGE_MS[drawerSelectedRange];
+    drawerRenderer(rangeMs, drawerCtx);
+  }
+
+  // Wire drawer events
+  $("drawer-close").addEventListener("click", closeDrawer);
+  $("drawer-overlay").addEventListener("click", function(e){
+    // Click on backdrop (not on the panel itself) closes.
+    if (e.target === $("drawer-overlay")) closeDrawer();
+  });
+  document.addEventListener("keydown", function(e){
+    if (e.key === "Escape" && drawerOpen) closeDrawer();
+  });
+  document.querySelectorAll(".range-btn").forEach(function(b){
+    b.addEventListener("click", function(){
+      drawerSelectedRange = b.getAttribute("data-range");
+      document.querySelectorAll(".range-btn").forEach(function(x){
+        x.classList.toggle("active", x === b);
+      });
+      renderDrawer();
+    });
+  });
 
   function refresh(){
     $("state").textContent = "polling…";
