@@ -1,6 +1,8 @@
 import {
   AcquireLeaseRequest,
   AcquireLeaseResponse,
+  AlertEvent,
+  ALERT_SUMMARY_MAX_LEN,
   DEFAULT_LOGIN_COOLDOWN_DURATION_MS,
   DEFAULT_LOGIN_COOLDOWN_THRESHOLD,
   DEFAULT_LOGIN_COOLDOWN_WINDOW_SEC,
@@ -20,6 +22,7 @@ import {
   ReleaseLeaseResponse,
 } from "./types";
 import { pruneLogTable } from "./event_log_helpers";
+import { recordAndDispatch } from "./alert_dispatcher";
 
 /**
  * GlobalLoginState — singleton DO that arbitrates a single shared JavDB
@@ -394,6 +397,38 @@ export class GlobalLoginState implements DurableObject {
       failureCount >= cfg.threshold
         ? computeCooldownUntilMs(pruned, now, cfg.durationMs)
         : 0;
+
+    // Phase-1 ADR-008 — emit a login_cooldown alert when we just entered
+    // cooldown. Idempotency key is the cooldown_until timestamp so each
+    // new window emits exactly one alert (recurring spikes inside the
+    // same window deduplicate via the alert_history primary key).
+    if (cooldownUntilMs > now && outcome === "failure") {
+      const alert: AlertEvent = {
+        id: `logincd-${cooldownUntilMs}`,
+        kind: "login_cooldown",
+        ts: now,
+        severity: "warning",
+        summary: (
+          `Login cooldown engaged: ${failureCount} recent failures crossed ` +
+          `threshold ${cfg.threshold}; cooldown until ${new Date(cooldownUntilMs).toISOString()}`
+        ).slice(0, ALERT_SUMMARY_MAX_LEN),
+        details: {
+          recent_failure_count: failureCount,
+          recent_attempt_count: pruned.length,
+          threshold: cfg.threshold,
+          window_sec: cfg.windowSec,
+          cooldown_until_ms: cooldownUntilMs,
+          last_proxy_name: proxyName,
+        },
+      };
+      try {
+        await recordAndDispatch(this.env, alert);
+      } catch (err) {
+        console.warn("login_cooldown alert dispatch error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     const response: RecordAttemptResponse = {
       recent_attempt_count: pruned.length,

@@ -1,4 +1,8 @@
 import {
+  ALERT_SUMMARY_MAX_LEN,
+  AlertEvent,
+  BAN_SPIKE_WINDOW_MS,
+  DEFAULT_BAN_SPIKE_THRESHOLD,
   DEFAULT_BAN_TTL_MS,
   Env,
   LeaseRequest,
@@ -10,6 +14,7 @@ import {
   ThrottleConfig,
   loadThrottleConfig,
 } from "./types";
+import { recordAndDispatch } from "./alert_dispatcher";
 
 /**
  * Per-proxy coordination state persisted in DO storage.
@@ -74,6 +79,23 @@ interface CoordinatorState {
    * failure latencies both influence the EMA.
    */
   latencyEma: number;
+  /**
+   * Phase-1 ADR-008 — wall-clock ms epochs of every `ban` event accepted
+   * by `handleReport`. Pruned against {@link BAN_SPIKE_WINDOW_MS} on
+   * every `loadState` so the buffer stays bounded by 1h of activity.
+   * Drives the `ban_spike` alert: when the count crosses
+   * `ban_spike_threshold` (config DO override, default
+   * {@link DEFAULT_BAN_SPIKE_THRESHOLD}) the DO emits one alert per
+   * hour-bucket via {@link recordAndDispatch}.
+   */
+  banEvents: number[];
+  /**
+   * Phase-1 ADR-008 — last hour-bucket (`floor(now / BAN_SPIKE_WINDOW_MS)`)
+   * for which we already emitted a `ban_spike` alert. Prevents alert
+   * flapping while the rolling count stays above threshold; the next
+   * bucket gets a fresh alert if the spike persists.
+   */
+  banSpikeAlertedBucket: number;
 }
 
 /** Read `BAN_TTL_MS` from env vars; falls back to 3 days. */
@@ -82,6 +104,18 @@ function loadBanTtlMs(env: Env): number {
   if (v === undefined || v === "") return DEFAULT_BAN_TTL_MS;
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_BAN_TTL_MS;
+}
+
+/** Phase-1 ADR-008 — read the ban-spike threshold. Currently sourced from
+ *  the wrangler `BAN_SPIKE_THRESHOLD` env var; the ConfigState override
+ *  (key `ban_spike_threshold`) is applied at the dispatcher level by
+ *  reading ConfigState — but for the hot per-proxy ban path we use the
+ *  env-var default to avoid an extra DO round-trip on every ban report. */
+function loadBanSpikeThreshold(env: Env): number {
+  const raw = (env as { BAN_SPIKE_THRESHOLD?: string }).BAN_SPIKE_THRESHOLD;
+  if (raw === undefined || raw === "") return DEFAULT_BAN_SPIKE_THRESHOLD;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_BAN_SPIKE_THRESHOLD;
 }
 
 const PENALTY_TIERS: Array<[number, number]> = [
@@ -322,6 +356,9 @@ export class ProxyCoordinator implements DurableObject {
         state.bannedUntil !== null && state.bannedUntil > newBannedUntil
           ? state.bannedUntil
           : newBannedUntil;
+      // Phase-1 ADR-008 — record the ban event for spike detection.
+      state.banEvents.push(now);
+      await this.maybeEmitBanSpikeAlert(proxyId, state, now, body.reason);
     } else if (rawKind === "unban") {
       kind = "unban";
       state.bannedUntil = null;
@@ -412,6 +449,49 @@ export class ProxyCoordinator implements DurableObject {
     });
   }
 
+  /**
+   * Phase-1 ADR-008 — emit a `ban_spike` alert when the rolling 1h ban
+   * count for this proxy crosses the configured threshold. Idempotent
+   * per hour-bucket: a sustained spike emits one alert per hour, not
+   * once per ban.
+   */
+  private async maybeEmitBanSpikeAlert(
+    proxyId: string,
+    state: CoordinatorState,
+    now: number,
+    reason: string | undefined,
+  ): Promise<void> {
+    const threshold = loadBanSpikeThreshold(this.env);
+    if (state.banEvents.length < threshold) return;
+    const bucket = Math.floor(now / BAN_SPIKE_WINDOW_MS);
+    if (state.banSpikeAlertedBucket === bucket) return;
+    state.banSpikeAlertedBucket = bucket;
+    const alert: AlertEvent = {
+      id: `banspike-${proxyId}-${bucket}`,
+      kind: "ban_spike",
+      ts: now,
+      severity: "warning",
+      summary: (
+        `Proxy ${proxyId} ban spike: ${state.banEvents.length} bans in last 1h ` +
+        `(threshold ${threshold})`
+      ).slice(0, ALERT_SUMMARY_MAX_LEN),
+      details: {
+        proxy_id: proxyId,
+        ban_count_1h: state.banEvents.length,
+        threshold,
+        latest_reason: reason ?? "",
+      },
+    };
+    try {
+      await recordAndDispatch(this.env, alert);
+    } catch (err) {
+      console.warn("ban_spike alert dispatch error", {
+        proxy_id: proxyId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // ---- state helpers -----------------------------------------------------
 
   private async loadState(): Promise<CoordinatorState> {
@@ -430,6 +510,8 @@ export class ProxyCoordinator implements DurableObject {
       successEvents: stored?.successEvents ?? [],
       failureEvents: stored?.failureEvents ?? [],
       latencyEma: stored?.latencyEma ?? 0,
+      banEvents: stored?.banEvents ?? [],
+      banSpikeAlertedBucket: stored?.banSpikeAlertedBucket ?? 0,
     };
     return this.cached;
   }
@@ -466,6 +548,11 @@ export class ProxyCoordinator implements DurableObject {
     }
     while (state.failureEvents.length > 0 && state.failureEvents[0] < cfCutoff) {
       state.failureEvents.shift();
+    }
+    // Phase-1 ADR-008 — prune ban events outside the spike detection window.
+    const banCutoff = now - BAN_SPIKE_WINDOW_MS;
+    while (state.banEvents.length > 0 && state.banEvents[0] < banCutoff) {
+      state.banEvents.shift();
     }
   }
 

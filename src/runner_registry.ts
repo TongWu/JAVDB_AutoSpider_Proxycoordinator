@@ -1,5 +1,9 @@
 import {
   ActiveRunnersResponse,
+  AlertEvent,
+  AlertRow,
+  ALERT_HISTORY_RETENTION_MS,
+  ALERT_SUMMARY_MAX_LEN,
   DEFAULT_MOVIE_CLAIM_MIN_RUNNERS,
   DEFAULT_RUNNER_STALE_TTL_MS,
   Env,
@@ -11,12 +15,20 @@ import {
   RegisterRunnerRequest,
   RegisterRunnerResponse,
   RunnerInfo,
+  SESSION_FAILURE_REASON_MAX_LEN,
+  SESSION_RETENTION_MS,
+  SessionInfo,
+  SessionRecord,
+  SessionStatus,
+  SessionWriteMode,
+  SessionsResponse,
   Signal,
   SignalsResponse,
   UnregisterRunnerRequest,
   UnregisterRunnerResponse,
 } from "./types";
 import { pruneLogTable } from "./event_log_helpers";
+import { dispatchAlert, recordAlert } from "./alert_dispatcher";
 
 /**
  * RunnerRegistry — singleton DO that tracks live spider runners across
@@ -132,6 +144,57 @@ export class RunnerRegistry implements DurableObject {
        ON runners_event_log(holder_id, ts);`,
     );
 
+    // Phase-1 ADR-008 — sessions: runner-reported session lifecycle. Keyed
+    // by session_id (TEXT, application-generated) and pruned by the same
+    // alarm that GCs runners. Single row per session — heartbeats update
+    // status / write_mode / failure_reason in place rather than appending.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        holder_id TEXT NOT NULL,
+        workflow_run_id TEXT NOT NULL DEFAULT '',
+        workflow_name TEXT NOT NULL DEFAULT '',
+        report_type TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        write_mode TEXT NOT NULL DEFAULT 'unknown',
+        failure_reason TEXT NOT NULL DEFAULT '',
+        started_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_sessions_status_started
+       ON sessions(status, started_at);`,
+    );
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_sessions_holder
+       ON sessions(holder_id);`,
+    );
+
+    // Phase-1 ADR-008 — alert_history: every alert AlertDispatcher emits
+    // is recorded here (independent of webhook delivery success). Cron
+    // sweep prunes rows older than ALERT_HISTORY_RETENTION_MS.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS alert_history (
+        id TEXT PRIMARY KEY,
+        ts INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        details_json TEXT,
+        ack INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_alert_history_ts
+       ON alert_history(ts);`,
+    );
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_alert_history_kind_ts
+       ON alert_history(kind, ts);`,
+    );
+
     // Phase 2 follow-up — unconditionally arm the alarm in the constructor
     // so retention sweeps run even when no register/signal traffic ever
     // arrives. Matches the pattern in ConfigState/GlobalLoginState/MetricsState.
@@ -174,6 +237,25 @@ export class RunnerRegistry implements DurableObject {
         case "/do/runners/history":
           if (request.method === "GET") {
             return this.handleRunnersHistory(url);
+          }
+          return new Response("Method Not Allowed", { status: 405 });
+        // Phase-1 ADR-008 — sessions + alerts.
+        case "/do/sessions":
+          if (request.method === "GET") {
+            return this.handleListSessions(url);
+          }
+          return new Response("Method Not Allowed", { status: 405 });
+        case "/do/alerts":
+          if (request.method === "GET") {
+            return this.handleListAlerts(url);
+          }
+          if (request.method === "POST") {
+            return await this.handleRecordAlert(request);
+          }
+          return new Response("Method Not Allowed", { status: 405 });
+        case "/do/alerts/ack":
+          if (request.method === "POST") {
+            return await this.handleAckAlert(request);
           }
           return new Response("Method Not Allowed", { status: 405 });
         default:
@@ -233,6 +315,18 @@ export class RunnerRegistry implements DurableObject {
     const runnersRetentionMs = parseInt(this.env.RUNNERS_EVENT_LOG_RETENTION_DAYS ?? "90", 10) * 86_400_000;
     pruneLogTable(this.sql, "signals_event_log", signalsRetentionMs, 100_000, now2);
     pruneLogTable(this.sql, "runners_event_log", runnersRetentionMs, 100_000, now2);
+
+    // Phase-1 ADR-008 — prune ended sessions past retention horizon
+    // (in-progress sessions are kept indefinitely; runner crash/eviction
+    // converts them via the runners_event_log "crashed" path).
+    const sessionCutoff = now2 - SESSION_RETENTION_MS;
+    this.sql.exec(
+      `DELETE FROM sessions WHERE ended_at > 0 AND ended_at <= ?`,
+      sessionCutoff,
+    );
+    // Phase-1 ADR-008 — prune alert_history past retention horizon.
+    const alertCutoff = now2 - ALERT_HISTORY_RETENTION_MS;
+    this.sql.exec(`DELETE FROM alert_history WHERE ts <= ?`, alertCutoff);
     // Re-arm when EITHER runners or signals remain — both are
     // time-bounded state worth GC'ing.
     if (
@@ -334,6 +428,15 @@ export class RunnerRegistry implements DurableObject {
     await this.persistState(data);
     await this.scheduleAlarm();
 
+    // Phase-1 ADR-008 — apply session payload after the runner write so
+    // the upsert can reference the canonical holder metadata.
+    const sessionApply =
+      body.session !== undefined ? parseSessionInfo(body.session) : null;
+    if (sessionApply !== null) {
+      const applied = applySessionUpsert(this.sql, info, sessionApply, now);
+      await this.maybeEmitSessionFailedAlert(applied);
+    }
+
     const activeRunners = snapshotRunners(data.runners);
     const summary = summarizePoolHashes(data.runners);
     const minRunners = loadMovieClaimMinRunners(this.env);
@@ -362,6 +465,21 @@ export class RunnerRegistry implements DurableObject {
     pruneStale(data, this.env, now);
     const minRunners = loadMovieClaimMinRunners(this.env);
     const existing = data.runners[holderId];
+    // Phase-1 ADR-008 — heartbeat session updates are accepted even for an
+    // evicted holder so a slow runner can still flag a `failed` status on
+    // the way out. The DB row carries holder metadata regardless of live
+    // registry presence.
+    const sessionFromBody =
+      body.session !== undefined ? parseSessionInfo(body.session) : null;
+    if (sessionFromBody !== null) {
+      const applied = applySessionUpsert(
+        this.sql,
+        existing ?? holderInfoFromRequest(holderId, {}),
+        sessionFromBody,
+        now,
+      );
+      await this.maybeEmitSessionFailedAlert(applied);
+    }
     if (existing === undefined) {
       // Evicted holder: surface the live cohort size sans the unknown
       // caller so the client still gets a defensible recommendation
@@ -415,20 +533,34 @@ export class RunnerRegistry implements DurableObject {
     const data = await this.loadState();
     pruneStale(data, this.env, now);
     const existed = data.runners[holderId] !== undefined;
+    const holderRecord = data.runners[holderId];
     if (existed) {
       // Phase 2 / ADR-002 — runners_event_log unregister event
-      const existingRunner = data.runners[holderId];
       this.sql.exec(
         `INSERT OR IGNORE INTO runners_event_log
          (ts, event_kind, holder_id, workflow_run_id, workflow_name, final_status)
          VALUES (?, 'unregister', ?, ?, ?, 'completed')`,
         now,
         holderId,
-        existingRunner.workflow_run_id ?? "",
-        existingRunner.workflow_name ?? "",
+        holderRecord.workflow_run_id ?? "",
+        holderRecord.workflow_name ?? "",
       );
       delete data.runners[holderId];
       await this.persistState(data);
+    }
+    // Phase-1 ADR-008 — record terminal session state even when the
+    // runner was already evicted (slow shutdowns sometimes lose the live
+    // record before atexit fires).
+    const session =
+      body.session !== undefined ? parseSessionInfo(body.session) : null;
+    if (session !== null) {
+      const applied = applySessionUpsert(
+        this.sql,
+        holderRecord ?? holderInfoFromRequest(holderId, {}),
+        session,
+        now,
+      );
+      await this.maybeEmitSessionFailedAlert(applied);
     }
     const response: UnregisterRunnerResponse = {
       unregistered: existed,
@@ -660,6 +792,227 @@ export class RunnerRegistry implements DurableObject {
     data.signals = data.signals.filter(
       (s) => s.expires_at_ms === 0 || s.expires_at_ms > now,
     );
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase-1 ADR-008 — sessions + alerts
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Handle `GET /do/sessions?since_ms=...&limit=...`. Returns three
+   *  buckets: `active`, `recent_failed`, `recent_committed`. */
+  private handleListSessions(url: URL): Response {
+    const now = Date.now();
+    const sinceRaw = parseInt(url.searchParams.get("since_ms") ?? "", 10);
+    const since = Number.isFinite(sinceRaw) && sinceRaw > 0
+      ? sinceRaw
+      : now - SESSION_RETENTION_MS;
+    const limitRaw = parseInt(url.searchParams.get("limit") ?? "", 10);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(limitRaw, 200)
+      : 50;
+    const active = this.querySessions(
+      `status IN ('in_progress', 'finalizing') AND updated_at >= ?`,
+      [since],
+      "started_at ASC",
+      limit,
+    );
+    const recentFailed = this.querySessions(
+      `status IN ('failed', 'cancelled') AND updated_at >= ?`,
+      [since],
+      "updated_at DESC",
+      limit,
+    );
+    const recentCommitted = this.querySessions(
+      `status = 'committed' AND updated_at >= ?`,
+      [since],
+      "updated_at DESC",
+      limit,
+    );
+    const response: SessionsResponse = {
+      active: active.map(serializeSessionRow),
+      recent_failed: recentFailed.map(serializeSessionRow),
+      recent_committed: recentCommitted.map(serializeSessionRow),
+      server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  private querySessions(
+    where: string,
+    args: Array<string | number>,
+    orderBy: string,
+    limit: number,
+  ): SessionRecord[] {
+    const sql =
+      `SELECT session_id, holder_id, workflow_run_id, workflow_name,
+              report_type, status, write_mode, failure_reason,
+              started_at, updated_at, ended_at
+         FROM sessions
+        WHERE ${where}
+        ORDER BY ${orderBy}
+        LIMIT ?`;
+    return Array.from(
+      this.sql.exec<{
+        session_id: string;
+        holder_id: string;
+        workflow_run_id: string;
+        workflow_name: string;
+        report_type: string;
+        status: string;
+        write_mode: string;
+        failure_reason: string;
+        started_at: number;
+        updated_at: number;
+        ended_at: number;
+      }>(sql, ...args, limit),
+    ).map((r) => ({
+      session_id: r.session_id,
+      holder_id: r.holder_id,
+      workflow_run_id: r.workflow_run_id,
+      workflow_name: r.workflow_name,
+      report_type: r.report_type,
+      status: r.status as SessionStatus,
+      write_mode: r.write_mode as SessionWriteMode,
+      failure_reason: r.failure_reason,
+      started_at: r.started_at,
+      updated_at: r.updated_at,
+      ended_at: r.ended_at,
+    }));
+  }
+
+  /** Emit a `session_failed` alert iff the apply transitioned to `failed`
+   *  and we hadn't already alerted for this session. Idempotent — the
+   *  alert id is derived from the session_id so re-applying a failure
+   *  payload doesn't multiply alerts. */
+  private async maybeEmitSessionFailedAlert(
+    applied: SessionApplyResult,
+  ): Promise<void> {
+    if (applied.newStatus !== "failed") return;
+    if (applied.prevStatus === "failed") return;
+    const rec = applied.record;
+    const alertId = `sessfail-${rec.session_id}`;
+    const summary =
+      `Session ${rec.session_id} failed (workflow=${rec.workflow_name || "?"}, ` +
+      `write_mode=${rec.write_mode}, holder=${rec.holder_id})`;
+    const alert: AlertEvent = {
+      id: alertId,
+      kind: "session_failed",
+      ts: Date.now(),
+      severity: "warning",
+      summary: summary.slice(0, ALERT_SUMMARY_MAX_LEN),
+      details: {
+        session_id: rec.session_id,
+        workflow_run_id: rec.workflow_run_id,
+        workflow_name: rec.workflow_name,
+        report_type: rec.report_type,
+        write_mode: rec.write_mode,
+        failure_reason: rec.failure_reason,
+        holder_id: rec.holder_id,
+      },
+    };
+    recordAlert(this.sql, alert);
+    // Webhook dispatch is awaited so the DO request fully owns the
+    // async work — prevents storage-frame leaks in vitest-pool-workers
+    // and bounds the latency by AlertDispatcher's own per-webhook
+    // timeouts (10s + 2 retries with back-off, parallel across
+    // webhooks). At register/heartbeat cadence (60s) this is acceptable.
+    try {
+      await dispatchAlert(this.env, alert);
+    } catch (err) {
+      console.warn("session_failed alert dispatch error", {
+        session_id: rec.session_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** Handle `POST /do/alerts` — internal endpoint used by other DOs
+   *  (e.g. ProxyCoordinator, GlobalLoginState) to record an alert in the
+   *  history table without going through HTTP. Currently unused on the
+   *  client side; ProxyCoordinator + GlobalLoginState write directly via
+   *  the `recordAlert(sql, alert)` helper exported from alert_dispatcher. */
+  private async handleRecordAlert(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<AlertEvent>;
+    if (
+      typeof body?.id !== "string" ||
+      typeof body?.kind !== "string" ||
+      typeof body?.ts !== "number" ||
+      typeof body?.summary !== "string"
+    ) {
+      return jsonResponse({ error: "invalid_alert_payload" }, 400);
+    }
+    const alert: AlertEvent = {
+      id: body.id,
+      kind: body.kind as AlertEvent["kind"],
+      ts: body.ts,
+      severity: "warning",
+      summary: body.summary.slice(0, ALERT_SUMMARY_MAX_LEN),
+      details:
+        typeof body.details === "object" && body.details !== null
+          ? (body.details as Record<string, unknown>)
+          : {},
+    };
+    recordAlert(this.sql, alert);
+    try {
+      await dispatchAlert(this.env, alert);
+    } catch {
+      /* recorded in alert_history regardless */
+    }
+    return jsonResponse({ recorded: true, alert_id: alert.id });
+  }
+
+  /** Handle `GET /do/alerts?since_ms=...`. Returns recent rows DESC. */
+  private handleListAlerts(url: URL): Response {
+    const now = Date.now();
+    const sinceRaw = parseInt(url.searchParams.get("since_ms") ?? "", 10);
+    const since = Number.isFinite(sinceRaw) && sinceRaw > 0
+      ? sinceRaw
+      : now - ALERT_HISTORY_RETENTION_MS;
+    const limitRaw = parseInt(url.searchParams.get("limit") ?? "", 10);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(limitRaw, 200)
+      : 50;
+    const rows = Array.from(
+      this.sql.exec<{
+        id: string;
+        ts: number;
+        kind: string;
+        severity: string;
+        summary: string;
+        details_json: string | null;
+        ack: number;
+      }>(
+        `SELECT id, ts, kind, severity, summary, details_json, ack
+           FROM alert_history
+          WHERE ts >= ?
+          ORDER BY ts DESC
+          LIMIT ?`,
+        since,
+        limit,
+      ),
+    );
+    const alerts: AlertRow[] = rows.map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      kind: r.kind as AlertEvent["kind"],
+      severity: "warning",
+      summary: r.summary,
+      details: parseJsonObject(r.details_json),
+      ack: r.ack,
+    }));
+    return jsonResponse({ alerts, server_time: now });
+  }
+
+  /** Handle `POST /do/alerts/ack` — body `{ id }` toggles ack flag. */
+  private async handleAckAlert(request: Request): Promise<Response> {
+    const body = (await request.json()) as { id?: unknown };
+    const id = typeof body?.id === "string" ? body.id : "";
+    if (!id) return jsonResponse({ error: "missing_id" }, 400);
+    this.sql.exec(
+      `UPDATE alert_history SET ack = 1 WHERE id = ?`,
+      id,
+    );
+    return jsonResponse({ acked: true });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -902,4 +1255,216 @@ function generateSignalId(): string {
   // Workers runtime ships ``crypto.randomUUID()``; use the first 8
   // hex chars after stripping dashes for compactness.
   return crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase-1 ADR-008 — session payload helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VALID_SESSION_STATUSES = new Set<SessionStatus>([
+  "in_progress",
+  "finalizing",
+  "committed",
+  "failed",
+  "cancelled",
+]);
+const VALID_SESSION_WRITE_MODES = new Set<SessionWriteMode>([
+  "audit",
+  "pending",
+  "unknown",
+]);
+
+/** Parse + validate a session payload from a runner request body. Returns
+ *  `null` for any malformed entry — callers fall open (no DB write) so a
+ *  buggy client can't break the rest of the register / heartbeat flow. */
+export function parseSessionInfo(raw: unknown): SessionInfo | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const sessionId = typeof obj.session_id === "string" ? obj.session_id.trim() : "";
+  if (!sessionId || sessionId.length > 128) return null;
+  const status =
+    typeof obj.status === "string" ? (obj.status.trim() as SessionStatus) : undefined;
+  if (!status || !VALID_SESSION_STATUSES.has(status)) return null;
+  const writeMode =
+    typeof obj.write_mode === "string"
+      ? (obj.write_mode.trim() as SessionWriteMode)
+      : undefined;
+  const reportType =
+    typeof obj.report_type === "string" ? obj.report_type.trim() : undefined;
+  const failureReasonRaw =
+    typeof obj.failure_reason === "string" ? obj.failure_reason : undefined;
+  return {
+    session_id: sessionId,
+    status,
+    write_mode:
+      writeMode !== undefined && VALID_SESSION_WRITE_MODES.has(writeMode)
+        ? writeMode
+        : "unknown",
+    report_type: reportType ? reportType.slice(0, 64) : undefined,
+    failure_reason:
+      failureReasonRaw !== undefined
+        ? failureReasonRaw.slice(0, SESSION_FAILURE_REASON_MAX_LEN)
+        : undefined,
+  };
+}
+
+/** Read existing session row, if any. */
+function readSessionRow(
+  sql: SqlStorage,
+  sessionId: string,
+): SessionRecord | null {
+  const rows = Array.from(
+    sql.exec<{
+      session_id: string;
+      holder_id: string;
+      workflow_run_id: string;
+      workflow_name: string;
+      report_type: string;
+      status: string;
+      write_mode: string;
+      failure_reason: string;
+      started_at: number;
+      updated_at: number;
+      ended_at: number;
+    }>(
+      `SELECT session_id, holder_id, workflow_run_id, workflow_name,
+              report_type, status, write_mode, failure_reason,
+              started_at, updated_at, ended_at
+         FROM sessions WHERE session_id = ?`,
+      sessionId,
+    ),
+  );
+  if (rows.length === 0) return null;
+  const r = rows[0];
+  return {
+    session_id: r.session_id,
+    holder_id: r.holder_id,
+    workflow_run_id: r.workflow_run_id,
+    workflow_name: r.workflow_name,
+    report_type: r.report_type,
+    status: r.status as SessionStatus,
+    write_mode: r.write_mode as SessionWriteMode,
+    failure_reason: r.failure_reason,
+    started_at: r.started_at,
+    updated_at: r.updated_at,
+    ended_at: r.ended_at,
+  };
+}
+
+interface SessionApplyResult {
+  prevStatus: SessionStatus | null;
+  newStatus: SessionStatus;
+  isTerminal: boolean;
+  record: SessionRecord;
+}
+
+const TERMINAL_STATUSES: ReadonlySet<SessionStatus> = new Set([
+  "committed",
+  "failed",
+  "cancelled",
+]);
+
+/** Upsert a session row from a register/heartbeat/unregister payload.
+ *  Returns the prev / new status + the final record so callers can decide
+ *  whether to dispatch a `session_failed` alert. */
+function applySessionUpsert(
+  sql: SqlStorage,
+  holderInfo: RunnerInfo,
+  session: SessionInfo,
+  now: number,
+): SessionApplyResult {
+  const existing = readSessionRow(sql, session.session_id);
+  const newStatus = session.status;
+  const isTerminal = TERMINAL_STATUSES.has(newStatus);
+  const startedAt = existing ? existing.started_at : now;
+  const reportType = session.report_type ?? existing?.report_type ?? "";
+  const writeMode = session.write_mode ?? existing?.write_mode ?? "unknown";
+  const failureReason =
+    session.failure_reason ?? existing?.failure_reason ?? "";
+  const endedAt = isTerminal
+    ? existing?.ended_at && existing.ended_at > 0
+      ? existing.ended_at
+      : now
+    : 0;
+  sql.exec(
+    `INSERT INTO sessions
+      (session_id, holder_id, workflow_run_id, workflow_name,
+       report_type, status, write_mode, failure_reason,
+       started_at, updated_at, ended_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(session_id) DO UPDATE SET
+       holder_id = excluded.holder_id,
+       workflow_run_id = excluded.workflow_run_id,
+       workflow_name = excluded.workflow_name,
+       report_type = CASE WHEN excluded.report_type = ''
+                          THEN sessions.report_type
+                          ELSE excluded.report_type END,
+       status = excluded.status,
+       write_mode = CASE WHEN excluded.write_mode = 'unknown'
+                          THEN sessions.write_mode
+                          ELSE excluded.write_mode END,
+       failure_reason = CASE WHEN excluded.failure_reason = ''
+                              THEN sessions.failure_reason
+                              ELSE excluded.failure_reason END,
+       updated_at = excluded.updated_at,
+       ended_at = CASE WHEN excluded.ended_at > 0
+                        THEN excluded.ended_at
+                        ELSE sessions.ended_at END`,
+    session.session_id,
+    holderInfo.holder_id,
+    holderInfo.workflow_run_id,
+    holderInfo.workflow_name,
+    reportType,
+    newStatus,
+    writeMode,
+    failureReason,
+    startedAt,
+    now,
+    endedAt,
+  );
+  const refreshed = readSessionRow(sql, session.session_id);
+  return {
+    prevStatus: existing?.status ?? null,
+    newStatus,
+    isTerminal,
+    record: refreshed!,
+  };
+}
+
+/** Build the canonical RunnerInfo subset used as the holder context for
+ *  session upserts. Inline helper so register/heartbeat/unregister can
+ *  share one call-site even though their RunnerInfo source differs. */
+function holderInfoFromRequest(
+  holderId: string,
+  body: { workflow_run_id?: string; workflow_name?: string },
+): RunnerInfo {
+  return {
+    holder_id: holderId,
+    workflow_run_id: clipString(body.workflow_run_id ?? ""),
+    workflow_name: clipString(body.workflow_name ?? ""),
+    started_at: 0,
+    last_heartbeat: 0,
+    proxy_pool_hash: "",
+    page_range: null,
+  };
+}
+
+/** Convert a SessionRecord into a transport-shaped row for `/do/sessions`. */
+function serializeSessionRow(rec: SessionRecord): SessionRecord {
+  return rec;
+}
+
+/** Defensive JSON.parse — returns `{}` on any structural / parse error
+ *  so a corrupt `details_json` cell never crashes a list endpoint. */
+function parseJsonObject(raw: string | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* fall through */
+  }
+  return {};
 }

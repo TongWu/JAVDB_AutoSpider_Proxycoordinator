@@ -101,6 +101,12 @@ export interface Env {
    *  (28800). The cookie is HMAC-signed against ``PROXY_COORDINATOR_TOKEN``
    *  so an operator re-login is the only way to refresh it. */
   DASHBOARD_SESSION_TTL_SEC?: string;
+  /** Phase-1 ADR-008 — env-var fallback for the per-proxy ban spike
+   *  threshold used in {@link ProxyCoordinator.maybeEmitBanSpikeAlert}.
+   *  Operators can also override via the `ban_spike_threshold`
+   *  ConfigState key (preferred — no redeploy). Default
+   *  {@link DEFAULT_BAN_SPIKE_THRESHOLD}. */
+  BAN_SPIKE_THRESHOLD?: string;
 }
 
 /** Default ban duration when the client doesn't pass `ttl_ms`. 3 days = 259_200_000 ms. */
@@ -805,6 +811,62 @@ export interface RunnerInfo {
   page_range: string | null;
 }
 
+/**
+ * Phase-1 ADR-008 — runner-reported session lifecycle.
+ *
+ * Surfaced on the dashboard so an operator can see what a runner was doing
+ * when it failed (write_mode, status, failure_reason) without cross-
+ * referencing GitHub Actions logs. Optional on every register/heartbeat/
+ * unregister payload; old clients omit it and the dashboard renders
+ * "no session info" for that runner.
+ */
+export type SessionStatus =
+  | "in_progress"
+  | "finalizing"
+  | "committed"
+  | "failed"
+  | "cancelled";
+
+export type SessionWriteMode = "audit" | "pending" | "unknown";
+
+export interface SessionInfo {
+  /** Application-generated session id (TEXT, format
+   *  `YYYYMMDDTHHMMSS.ffffffZ-TTTT-SSSS` — see CONTEXT.md). */
+  session_id: string;
+  /** `daily` / `adhoc` / `dedup` / ... — free-form caller-meaningful tag. */
+  report_type?: string;
+  status: SessionStatus;
+  write_mode?: SessionWriteMode;
+  /** Free-form failure summary surfaced verbatim on the dashboard. Capped
+   *  server-side to {@link SESSION_FAILURE_REASON_MAX_LEN} characters. */
+  failure_reason?: string;
+}
+
+/** Phase-1 ADR-008 — server-side cap on `failure_reason`. */
+export const SESSION_FAILURE_REASON_MAX_LEN = 1000;
+
+/** Phase-1 ADR-008 — auto-prune sessions whose `ended_at` is older than
+ *  this on every alarm tick. 24h is enough to cover one ingestion cycle
+ *  + manual investigation; longer histories belong in CICD repo D1. */
+export const SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+export interface SessionRecord extends SessionInfo {
+  holder_id: string;
+  workflow_run_id: string;
+  workflow_name: string;
+  started_at: number;
+  updated_at: number;
+  /** `0` when the session has not ended yet. */
+  ended_at: number;
+}
+
+export interface SessionsResponse {
+  active: SessionRecord[];
+  recent_failed: SessionRecord[];
+  recent_committed: SessionRecord[];
+  server_time: number;
+}
+
 export interface RegisterRunnerRequest {
   holder_id: string;
   workflow_run_id?: string;
@@ -818,6 +880,8 @@ export interface RegisterRunnerRequest {
    *  backup) without each operator passing ?proxy_ids=... manually.
    *  Items contain ONLY `id` and `name` — no URLs / no credentials. */
   proxy_pool?: Array<{ id: string; name: string }>;
+  /** Phase-1 ADR-008 — runner-reported session lifecycle (optional). */
+  session?: SessionInfo;
 }
 
 export interface RegisterRunnerResponse {
@@ -864,11 +928,21 @@ export interface RegisterRunnerResponse {
    *  reconcile against this set on every register / heartbeat; semantics
    *  are state, not events. Omitted on pre-W5.4 Workers. */
   active_signals?: Signal[];
+  /** Phase-1 ADR-008 — pipeline-pause state echoed from ConfigState.
+   *  When `pipeline_paused_until > server_time` runners MUST exit
+   *  cleanly at startup (and ideally never reach this register call;
+   *  Python startup checks the config snapshot independently). */
+  pipeline_paused_until?: number;
+  /** Phase-1 ADR-008 — operator note for the active pause, surfaced
+   *  verbatim in runner logs and dashboard banner. */
+  pipeline_pause_reason?: string;
   server_time: number;
 }
 
 export interface HeartbeatRequest {
   holder_id: string;
+  /** Phase-1 ADR-008 — runner-reported session lifecycle (optional). */
+  session?: SessionInfo;
 }
 
 export interface HeartbeatResponse {
@@ -893,11 +967,19 @@ export interface HeartbeatResponse {
   config?: ConfigSnapshot;
   /** W5.4 — see {@link RegisterRunnerResponse.active_signals}. */
   active_signals?: Signal[];
+  /** Phase-1 ADR-008 — see {@link RegisterRunnerResponse.pipeline_paused_until}. */
+  pipeline_paused_until?: number;
+  /** Phase-1 ADR-008 — see {@link RegisterRunnerResponse.pipeline_pause_reason}. */
+  pipeline_pause_reason?: string;
   server_time: number;
 }
 
 export interface UnregisterRunnerRequest {
   holder_id: string;
+  /** Phase-1 ADR-008 — runner-reported terminal session state (optional).
+   *  Typically `status: "committed"` or `"failed"` with optional
+   *  `failure_reason`. */
+  session?: SessionInfo;
 }
 
 export interface UnregisterRunnerResponse {
@@ -1145,6 +1227,20 @@ export const CONFIG_ALLOWED_KEYS = [
   "login_cooldown_window_sec",
   "login_cooldown_duration_ms",
   "heartbeat_interval_sec",
+  // Phase-1 ADR-008 — operator-tunable alert / pipeline-pause keys.
+  /** JSON-encoded `Array<{url, kinds: AlertKind[]}>` consumed by
+   *  AlertDispatcher. Empty string disables every webhook. */
+  "alert_webhooks_json",
+  /** Integer threshold for `ban_spike` alerts inside ProxyCoordinator
+   *  (bans per 1h sliding window per proxy). Default 3. */
+  "ban_spike_threshold",
+  /** Wall-clock ms-epoch (string) until which pipeline runners should
+   *  exit early at startup. Read once per register; runners do not
+   *  cancel mid-flight on changes. `0` or empty disables the pause. */
+  "pipeline_paused_until",
+  /** Free-form operator note shown to runners that exit due to the
+   *  active pause. Surfaced verbatim on dashboard + in runner logs. */
+  "pipeline_pause_reason",
 ] as const;
 
 export type ConfigKey = typeof CONFIG_ALLOWED_KEYS[number];
@@ -1189,3 +1285,86 @@ export interface ConfigMergedEntry {
 export interface ConfigResponseWithMerged extends ConfigResponse {
   merged: Partial<Record<ConfigKey, ConfigMergedEntry>>;
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Phase-1 ADR-008 — alert dispatcher
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Closed set of alert kinds. New kinds need coordinated Worker + dashboard
+ * deploys so the SPA renders them with the right icon / message.
+ *
+ * - `session_failed` — a runner reported `status: "failed"`.
+ * - `ban_spike` — a single proxy received >= `ban_spike_threshold` bans
+ *   within the rolling 1h window.
+ * - `login_cooldown` — GlobalLoginState entered a P2-C cooldown window
+ *   (recent failure count crossed the threshold).
+ * - `manual_test` — operator-triggered probe (`POST /alerts/test`).
+ */
+export type AlertKind =
+  | "session_failed"
+  | "ban_spike"
+  | "login_cooldown"
+  | "manual_test";
+
+/** Wire envelope for one alert event. Stored verbatim in
+ *  `alert_history` and forwarded to all matching webhooks. */
+export interface AlertEvent {
+  /** Stable id (8-char hex). Operator can ack via `POST /alerts/{id}/ack`. */
+  id: string;
+  kind: AlertKind;
+  /** Wall-clock ms of the triggering event. */
+  ts: number;
+  /** Severity hint. Currently always `"warning"` — reserved for
+   *  future expansion to `info` / `error`. */
+  severity: "warning";
+  /** Short human-readable summary line for dashboard banner / webhook body. */
+  summary: string;
+  /** Structured payload — kind-specific (session_id, proxy_id, ...). */
+  details: Record<string, unknown>;
+}
+
+/** One row of `alert_history` as returned by `GET /alerts`. */
+export interface AlertRow extends AlertEvent {
+  ack: number;
+}
+
+/** Body of `POST /alerts/test`. */
+export interface AlertTestRequest {
+  /** Optional override of the summary line; defaults to a canned probe text. */
+  summary?: string;
+}
+
+/** Body of `POST /alerts/{id}/ack`. */
+export interface AlertAckRequest {
+  /** Reserved for future operator notes; currently no-op on Worker side. */
+  note?: string;
+}
+
+/** One configured webhook destination. */
+export interface AlertWebhook {
+  /** HTTPS endpoint to POST alerts to. Plain HTTP rejected by the Worker
+   *  (Cloudflare blocks non-TLS subrequests by default). */
+  url: string;
+  /** Subset of {@link AlertKind} this webhook receives. Empty array =
+   *  receive every kind. */
+  kinds?: AlertKind[];
+}
+
+/** Default ban spike threshold when `ban_spike_threshold` config key is
+ *  unset. 3 bans in 1h matches the operator intuition "more than the
+ *  usual jitter, escalate". */
+export const DEFAULT_BAN_SPIKE_THRESHOLD = 3;
+
+/** Sliding window in ms used for ban_spike detection. Fixed at 1h —
+ *  tuning this would require coordinated DO + alert dispatcher changes. */
+export const BAN_SPIKE_WINDOW_MS = 60 * 60 * 1000;
+
+/** Retention window in ms for alert_history. 7 days — enough for one
+ *  on-call rotation to triage in retrospect; longer history belongs in
+ *  external observability (Grafana / etc). */
+export const ALERT_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Max characters for `summary` field on outgoing alerts. Protects
+ *  webhook receivers + dashboard rendering from runaway strings. */
+export const ALERT_SUMMARY_MAX_LEN = 500;
