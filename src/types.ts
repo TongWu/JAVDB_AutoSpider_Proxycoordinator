@@ -812,6 +812,12 @@ export interface RegisterRunnerRequest {
   started_at?: number;
   proxy_pool_hash?: string;
   page_range?: string | null;
+  /** Phase 2 / ADR-004 — full PROXY_POOL summary uploaded by the
+   *  Python runner. Workers store this in `proxies_seen` so the
+   *  dashboard can enumerate all configured proxies (including idle
+   *  backup) without each operator passing ?proxy_ids=... manually.
+   *  Items contain ONLY `id` and `name` — no URLs / no credentials. */
+  proxy_pool?: Array<{ id: string; name: string }>;
 }
 
 export interface RegisterRunnerResponse {

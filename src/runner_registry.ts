@@ -78,10 +78,24 @@ export class RunnerRegistry implements DurableObject {
   /** Tracks whether the GC alarm is already armed, to avoid setAlarm
    *  thrash on every register/heartbeat call. */
   private alarmScheduled: boolean = false;
+  /** SQL cursor for the proxies_seen table (Phase 2 / ADR-004). */
+  private sql: SqlStorage;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    this.sql = state.storage.sql;
+    // Phase 2 / ADR-004 — proxies_seen: Worker-side proxy name register
+    // populated from runner register payloads. Dashboard reads this to
+    // enumerate all configured proxies (active + idle).
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS proxies_seen (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        first_seen_ms INTEGER NOT NULL,
+        last_seen_ms INTEGER NOT NULL
+      );
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -101,6 +115,15 @@ export class RunnerRegistry implements DurableObject {
           return await this.handlePostSignal(request);
         case "/do/signals":
           return await this.handleListSignals();
+        // Phase 2 / ADR-004 — proxies_seen
+        case "/do/proxies_seen":
+          if (request.method === "GET") {
+            return this.handleListProxiesSeen();
+          }
+          if (request.method === "DELETE") {
+            return this.handleDeleteProxySeen(url);
+          }
+          return new Response("Method Not Allowed", { status: 405 });
         default:
           return new Response("Not Found", { status: 404 });
       }
@@ -199,6 +222,33 @@ export class RunnerRegistry implements DurableObject {
     // exact property the Python client's `auto` mode relies on to avoid
     // a race where both runners think they are alone.
     data.runners[holderId] = info;
+
+    // Phase 2 / ADR-004 — populate proxies_seen from upload
+    const pool = (body as any).proxy_pool;
+    if (Array.isArray(pool)) {
+      for (const entry of pool) {
+        if (
+          entry &&
+          typeof entry.id === "string" &&
+          typeof entry.name === "string" &&
+          entry.id.length > 0 &&
+          entry.name.length > 0
+        ) {
+          this.sql.exec(
+            `INSERT INTO proxies_seen (id, name, first_seen_ms, last_seen_ms)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               last_seen_ms = excluded.last_seen_ms`,
+            entry.id.slice(0, 256),
+            entry.name.slice(0, 256),
+            now,
+            now,
+          );
+        }
+      }
+    }
+
     await this.persistState(data);
     await this.scheduleAlarm();
 
@@ -364,6 +414,37 @@ export class RunnerRegistry implements DurableObject {
       server_time: now,
     };
     return jsonResponse(response);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2 / ADR-004 — proxies_seen handlers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  private handleListProxiesSeen(): Response {
+    const rows = Array.from(
+      this.sql.exec<{
+        id: string;
+        name: string;
+        first_seen_ms: number;
+        last_seen_ms: number;
+      }>(
+        "SELECT id, name, first_seen_ms, last_seen_ms FROM proxies_seen ORDER BY name",
+      ),
+    );
+    return new Response(JSON.stringify({ proxies: rows }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  private handleDeleteProxySeen(url: URL): Response {
+    const id = url.searchParams.get("id") ?? "";
+    if (!id) {
+      return new Response(JSON.stringify({ error: "missing id" }), { status: 400 });
+    }
+    this.sql.exec("DELETE FROM proxies_seen WHERE id = ?", id);
+    return new Response(JSON.stringify({ deleted: true }), {
+      headers: { "content-type": "application/json" },
+    });
   }
 
   private async handleListSignals(): Promise<Response> {

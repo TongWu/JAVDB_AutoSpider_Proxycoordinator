@@ -126,11 +126,17 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/recommend_proxy",
   "/work/stats",
   "/metrics/range",
+  "/proxies_seen",
 ]);
 
 /** W5.3 — extra non-POST/non-GET methods allowed on specific routes. */
 const PATCH_ALLOWED_PATHS = new Set<string>([
   "/config",
+]);
+
+/** Phase 2 / ADR-004 — DELETE-allowed routes for ops cleanup. */
+const DELETE_ALLOWED_PATHS = new Set<string>([
+  "/proxies_seen",
 ]);
 
 /**
@@ -232,7 +238,8 @@ export default {
     if (
       request.method !== "POST" &&
       !GET_ALLOWED_PATHS.has(url.pathname) &&
-      !(request.method === "PATCH" && PATCH_ALLOWED_PATHS.has(url.pathname))
+      !(request.method === "PATCH" && PATCH_ALLOWED_PATHS.has(url.pathname)) &&
+      !(request.method === "DELETE" && DELETE_ALLOWED_PATHS.has(url.pathname))
     ) {
       return jsonResponse({ error: "method not allowed" }, 405);
     }
@@ -405,6 +412,14 @@ export default {
         }
         case "/signals":
           return await forwardToRunnerRegistryDo(env, "/do/signals", "GET", null);
+        // Phase 2 / ADR-004 — proxies_seen: enumerable proxy roster
+        case "/proxies_seen":
+          return await forwardToRunnerRegistryDo(
+            env,
+            "/do/proxies_seen?" + url.searchParams.toString(),
+            request.method as "GET" | "DELETE",
+            null,
+          );
         // W5.3 — dynamic config singleton (ConfigState DO)
         case "/config": {
           if (request.method === "PATCH") {
@@ -756,7 +771,7 @@ async function forwardToMovieClaimDo(
 async function forwardToRunnerRegistryDo(
   env: Env,
   path: string,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "DELETE",
   body: unknown,
 ): Promise<Response> {
   if (!env.RUNNER_REGISTRY_DO) {
@@ -768,8 +783,8 @@ async function forwardToRunnerRegistryDo(
   const id = env.RUNNER_REGISTRY_DO.idFromName("runners");
   const stub = env.RUNNER_REGISTRY_DO.get(id);
   const init: RequestInit =
-    method === "GET"
-      ? { method: "GET" }
+    method === "GET" || method === "DELETE"
+      ? { method }
       : {
           method: "POST",
           headers: { "content-type": "application/json" },
