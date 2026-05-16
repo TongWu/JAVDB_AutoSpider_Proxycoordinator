@@ -164,6 +164,9 @@ export class MovieClaimState implements DurableObject {
           return await this.handleReportFailure(request);
         case "/do/movie_status":
           return await this.handleStatus(url);
+        // Phase-3 ADR-008 — per-shard claim stats for the dashboard panel.
+        case "/do/movie_claim/stats":
+          return await this.handleClaimStats();
         default:
           return new Response("Not Found", { status: 404 });
       }
@@ -746,6 +749,40 @@ export class MovieClaimState implements DurableObject {
       server_time: now,
     };
     return jsonResponse(response);
+  }
+
+  /**
+   * Phase-3 ADR-008 — per-shard stats for the dashboard's
+   * "Today's Claims" card.  Returns the four counts that the
+   * Worker's `/movie_claim/stats` fan-out merges across all
+   * sub-shards.  ``in_cooldown`` is best-effort (cooldown windows
+   * outlive a single shard if the operator changes the failure
+   * ladder mid-flight).
+   */
+  private async handleClaimStats(): Promise<Response> {
+    const data = await this.loadState();
+    const now = Date.now();
+    let inCooldown = 0;
+    let deadLettered = 0;
+    if (data.failures) {
+      for (const f of Object.values(data.failures)) {
+        if (f.next_attempt_at > now) inCooldown += 1;
+        if (f.fail_count >= MOVIE_CLAIM_DEAD_LETTER_THRESHOLD) deadLettered += 1;
+      }
+    }
+    let activeClaims = 0;
+    for (const c of Object.values(data.claims)) {
+      if (c.expires_at > now) activeClaims += 1;
+    }
+    return jsonResponse({
+      claims_active: activeClaims,
+      staged_count: data.staged_complete ? Object.keys(data.staged_complete).length : 0,
+      completed_committed_count: Object.keys(data.completed_committed).length,
+      failures_count: data.failures ? Object.keys(data.failures).length : 0,
+      in_cooldown_count: inCooldown,
+      dead_lettered_count: deadLettered,
+      server_time: now,
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
