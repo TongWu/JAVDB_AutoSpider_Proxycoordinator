@@ -121,6 +121,8 @@ const GET_ALLOWED_PATHS = new Set<string>([
   "/active_runners",
   "/config",
   "/signals",
+  "/signals/history",
+  "/runners/history",
   "/dashboard",
   "/ops/snapshot",
   "/recommend_proxy",
@@ -412,6 +414,21 @@ export default {
         }
         case "/signals":
           return await forwardToRunnerRegistryDo(env, "/do/signals", "GET", null);
+        // Phase 2 / ADR-002 — event log history endpoints
+        case "/signals/history":
+          return await forwardToRunnerRegistryDo(
+            env,
+            "/do/signals/history?" + url.searchParams.toString(),
+            "GET",
+            null,
+          );
+        case "/runners/history":
+          return await forwardToRunnerRegistryDo(
+            env,
+            "/do/runners/history?" + url.searchParams.toString(),
+            "GET",
+            null,
+          );
         // Phase 2 / ADR-004 — proxies_seen: enumerable proxy roster
         case "/proxies_seen":
           return await forwardToRunnerRegistryDo(
@@ -501,6 +518,8 @@ const COOKIE_AUTH_PATHS = new Set<string>([
   "/dashboard",
   "/ops/snapshot",
   "/recommend_proxy",
+  "/signals/history",
+  "/runners/history",
   "/dashboard/logout",
 ]);
 

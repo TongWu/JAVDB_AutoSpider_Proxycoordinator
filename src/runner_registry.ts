@@ -96,6 +96,40 @@ export class RunnerRegistry implements DurableObject {
         last_seen_ms INTEGER NOT NULL
       );
     `);
+
+    // Phase 2 / ADR-002 — signals_event_log: lifecycle events for operator signals
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS signals_event_log (
+        ts INTEGER NOT NULL,
+        event_kind TEXT NOT NULL,
+        signal_id TEXT NOT NULL,
+        signal_kind TEXT NOT NULL,
+        payload_json TEXT,
+        PRIMARY KEY (ts, signal_id)
+      );
+    `);
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_signals_event_log_kind
+       ON signals_event_log(signal_kind, ts);`,
+    );
+
+    // Phase 2 / ADR-002 — runners_event_log: lifecycle events for runner registration
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS runners_event_log (
+        ts INTEGER NOT NULL,
+        event_kind TEXT NOT NULL,
+        holder_id TEXT NOT NULL,
+        workflow_run_id TEXT,
+        workflow_name TEXT,
+        proxy_pool_hash TEXT,
+        final_status TEXT,
+        PRIMARY KEY (ts, holder_id, event_kind)
+      );
+    `);
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_runners_event_log_holder
+       ON runners_event_log(holder_id, ts);`,
+    );
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -122,6 +156,17 @@ export class RunnerRegistry implements DurableObject {
           }
           if (request.method === "DELETE") {
             return this.handleDeleteProxySeen(url);
+          }
+          return new Response("Method Not Allowed", { status: 405 });
+        // Phase 2 / ADR-002 — event log read endpoints
+        case "/do/signals/history":
+          if (request.method === "GET") {
+            return this.handleSignalsHistory(url);
+          }
+          return new Response("Method Not Allowed", { status: 405 });
+        case "/do/runners/history":
+          if (request.method === "GET") {
+            return this.handleRunnersHistory(url);
           }
           return new Response("Method Not Allowed", { status: 405 });
         default:
@@ -151,6 +196,17 @@ export class RunnerRegistry implements DurableObject {
     let purged = 0;
     for (const holder of Object.keys(data.runners)) {
       if (data.runners[holder].last_heartbeat <= now - stale) {
+        const info = data.runners[holder];
+        // Phase 2 / ADR-002 — runners_event_log crashed event
+        this.sql.exec(
+          `INSERT OR IGNORE INTO runners_event_log
+           (ts, event_kind, holder_id, workflow_run_id, workflow_name, final_status)
+           VALUES (?, 'crashed', ?, ?, ?, 'crashed')`,
+          now,
+          info.holder_id,
+          info.workflow_run_id,
+          info.workflow_name,
+        );
         delete data.runners[holder];
         purged += 1;
       }
@@ -158,7 +214,8 @@ export class RunnerRegistry implements DurableObject {
     // W5.4 — also prune expired operator signals on every alarm tick so
     // long-lived deployments don't accumulate stale signals.
     const sigBefore = (data.signals ?? []).length;
-    pruneExpiredSignals(data, now);
+    // Phase 2 / ADR-002 — log auto_expire events before pruning
+    this.pruneExpiredSignalsWithLog(data, now);
     const sigPurged = sigBefore - (data.signals ?? []).length;
     if (purged > 0 || sigPurged > 0) {
       await this.persistState(data);
@@ -249,6 +306,18 @@ export class RunnerRegistry implements DurableObject {
       }
     }
 
+    // Phase 2 / ADR-002 — runners_event_log register event
+    this.sql.exec(
+      `INSERT OR IGNORE INTO runners_event_log
+       (ts, event_kind, holder_id, workflow_run_id, workflow_name, proxy_pool_hash)
+       VALUES (?, 'register', ?, ?, ?, ?)`,
+      now,
+      holderId,
+      info.workflow_run_id,
+      info.workflow_name,
+      info.proxy_pool_hash,
+    );
+
     await this.persistState(data);
     await this.scheduleAlarm();
 
@@ -334,6 +403,17 @@ export class RunnerRegistry implements DurableObject {
     pruneStale(data, this.env, now);
     const existed = data.runners[holderId] !== undefined;
     if (existed) {
+      // Phase 2 / ADR-002 — runners_event_log unregister event
+      const existingRunner = data.runners[holderId];
+      this.sql.exec(
+        `INSERT OR IGNORE INTO runners_event_log
+         (ts, event_kind, holder_id, workflow_run_id, workflow_name, final_status)
+         VALUES (?, 'unregister', ?, ?, ?, 'completed')`,
+        now,
+        holderId,
+        existingRunner.workflow_run_id ?? "",
+        existingRunner.workflow_name ?? "",
+      );
       delete data.runners[holderId];
       await this.persistState(data);
     }
@@ -390,6 +470,18 @@ export class RunnerRegistry implements DurableObject {
       // in one go. The signal itself is not stored — its effect is the
       // clear-all. Heartbeat readers see an empty list right after.
       if (data.signals !== undefined && data.signals.length > 0) {
+        // Phase 2 / ADR-002 — log explicit_revoke for each cleared signal
+        for (const cleared of data.signals) {
+          this.sql.exec(
+            `INSERT OR IGNORE INTO signals_event_log
+             (ts, event_kind, signal_id, signal_kind, payload_json)
+             VALUES (?, 'explicit_revoke', ?, ?, ?)`,
+            now,
+            cleared.id,
+            cleared.kind,
+            null,
+          );
+        }
         data.signals = [];
         await this.persistState(data);
       }
@@ -406,6 +498,23 @@ export class RunnerRegistry implements DurableObject {
     const without = existing.filter((s) => s.id !== validated.id);
     without.push(validated);
     data.signals = without;
+
+    // Phase 2 / ADR-002 — signals_event_log create event
+    this.sql.exec(
+      `INSERT OR REPLACE INTO signals_event_log
+       (ts, event_kind, signal_id, signal_kind, payload_json)
+       VALUES (?, 'create', ?, ?, ?)`,
+      now,
+      validated.id,
+      validated.kind,
+      JSON.stringify({
+        factor: validated.factor,
+        proxy_id: validated.proxy_id,
+        reason: validated.reason,
+        expires_at_ms: validated.expires_at_ms,
+      }),
+    );
+
     await this.persistState(data);
     await this.scheduleAlarm();
 
@@ -451,7 +560,10 @@ export class RunnerRegistry implements DurableObject {
     const now = Date.now();
     const data = await this.loadState();
     const before = (data.signals ?? []).length;
-    pruneExpiredSignals(data, now);
+    // Phase 2 / ADR-002 — use logging variant so GET /signals also
+    // opportunistically logs auto_expire events for signals that expired
+    // between alarm fires (worst-case 5 min stale window).
+    this.pruneExpiredSignalsWithLog(data, now);
     if ((data.signals ?? []).length < before) {
       await this.persistState(data);
     }
@@ -460,6 +572,81 @@ export class RunnerRegistry implements DurableObject {
       server_time: now,
     };
     return jsonResponse(response);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2 / ADR-002 — event log read handlers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  private handleSignalsHistory(url: URL): Response {
+    const from = parseInt(url.searchParams.get("from") ?? "0", 10);
+    const to = parseInt(url.searchParams.get("to") ?? `${Date.now()}`, 10);
+    const rows = Array.from(this.sql.exec<{
+      ts: number;
+      event_kind: string;
+      signal_id: string;
+      signal_kind: string;
+      payload_json: string | null;
+    }>(
+      `SELECT ts, event_kind, signal_id, signal_kind, payload_json
+       FROM signals_event_log
+       WHERE ts >= ? AND ts <= ?
+       ORDER BY ts DESC`,
+      from,
+      to,
+    ));
+    return new Response(JSON.stringify({ rows }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  private handleRunnersHistory(url: URL): Response {
+    const from = parseInt(url.searchParams.get("from") ?? "0", 10);
+    const to = parseInt(url.searchParams.get("to") ?? `${Date.now()}`, 10);
+    const holder = url.searchParams.get("holder_id");
+    const baseSql =
+      `SELECT ts, event_kind, holder_id, workflow_run_id, workflow_name, proxy_pool_hash, final_status
+       FROM runners_event_log WHERE ts >= ? AND ts <= ?`;
+    const rows = holder
+      ? Array.from(
+          this.sql.exec(
+            baseSql + " AND holder_id = ? ORDER BY ts DESC",
+            from, to, holder,
+          ),
+        )
+      : Array.from(
+          this.sql.exec(baseSql + " ORDER BY ts DESC", from, to),
+        );
+    return new Response(JSON.stringify({ rows }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  /**
+   * Phase 2 / ADR-002 — prune expired signals while also writing
+   * ``auto_expire`` events to ``signals_event_log`` for each removed entry.
+   * Called from alarm() and handleListSignals() so both the GC tick and
+   * opportunistic read-path prunes produce audit trail entries.
+   */
+  private pruneExpiredSignalsWithLog(data: RegistryData, now: number): void {
+    if (data.signals === undefined || data.signals.length === 0) return;
+    const expired = data.signals.filter(
+      (s) => s.expires_at_ms !== 0 && s.expires_at_ms <= now,
+    );
+    for (const s of expired) {
+      this.sql.exec(
+        `INSERT OR IGNORE INTO signals_event_log
+         (ts, event_kind, signal_id, signal_kind, payload_json)
+         VALUES (?, 'auto_expire', ?, ?, ?)`,
+        now,
+        s.id,
+        s.kind,
+        null,
+      );
+    }
+    data.signals = data.signals.filter(
+      (s) => s.expires_at_ms === 0 || s.expires_at_ms > now,
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
