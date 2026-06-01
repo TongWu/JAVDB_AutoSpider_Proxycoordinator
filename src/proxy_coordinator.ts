@@ -2,8 +2,12 @@ import {
   ALERT_SUMMARY_MAX_LEN,
   AlertEvent,
   BAN_SPIKE_WINDOW_MS,
+  DEFAULT_CF_AUTO_BAN_ENABLED,
+  DEFAULT_CF_AUTO_BAN_THRESHOLD,
+  DEFAULT_CF_BAN_TTL_MS,
   DEFAULT_BAN_SPIKE_THRESHOLD,
   DEFAULT_BAN_TTL_MS,
+  DEFAULT_HARD_BAN_TTL_MS,
   Env,
   LeaseRequest,
   LeaseResponse,
@@ -46,6 +50,11 @@ interface CoordinatorState {
    * before this field existed (see ``loadState``).
    */
   bannedUntil: number | null;
+  /**
+   * ADR-043 D5 — short machine-readable reason for the active ban, surfaced
+   * through `/state` for ops visibility. `null` means no attributed ban reason.
+   */
+  bannedReason: string | null;
   /**
    * P1-A — cross-runner CF-bypass requirement.  Mirrors the per-process
    * ``state.proxies_requiring_cf_bypass`` dict semantics:
@@ -104,6 +113,46 @@ function loadBanTtlMs(env: Env): number {
   if (v === undefined || v === "") return DEFAULT_BAN_TTL_MS;
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_BAN_TTL_MS;
+}
+
+/** ADR-043 — read the CF auto-ban kill-switch. Defaults ON. */
+export function loadCfAutoBanEnabled(env: Env): boolean {
+  const v = env.CF_AUTO_BAN_ENABLED;
+  if (v === undefined || v === "") return DEFAULT_CF_AUTO_BAN_ENABLED;
+  return v !== "false" && v !== "0";
+}
+
+/** ADR-043 — read the CF auto-ban event threshold. Defaults to 6. */
+export function loadCfAutoBanThreshold(env: Env): number {
+  const v = env.CF_AUTO_BAN_THRESHOLD;
+  if (v === undefined || v === "") return DEFAULT_CF_AUTO_BAN_THRESHOLD;
+  const n = Number(v);
+  const threshold = Math.floor(n);
+  return Number.isFinite(n) && threshold > 0 ? threshold : DEFAULT_CF_AUTO_BAN_THRESHOLD;
+}
+
+/** ADR-043 — read the short CF auto-ban TTL. Defaults to 6 hours. */
+export function loadCfBanTtlMs(env: Env): number {
+  const v = env.CF_BAN_TTL_MS;
+  if (v === undefined || v === "") return DEFAULT_CF_BAN_TTL_MS;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_CF_BAN_TTL_MS;
+}
+
+/** ADR-043 D9 — read the hard-ban TTL. Defaults to 8 days. */
+function loadHardBanTtlMs(env: Env): number {
+  const v = env.HARD_BAN_TTL_MS;
+  if (v === undefined || v === "") return DEFAULT_HARD_BAN_TTL_MS;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_HARD_BAN_TTL_MS;
+}
+
+/** ADR-043 D9 — resolve the ban TTL by reason when the caller omits ttl_ms. */
+function ttlForBanReason(reason: string | undefined, env: Env): number {
+  const r = (reason ?? "").toLowerCase();
+  if (r.includes("ban page")) return loadHardBanTtlMs(env);
+  if (r.includes("cf bypass failed")) return loadCfBanTtlMs(env);
+  return loadBanTtlMs(env);
 }
 
 /** Phase-1 ADR-008 — read the ban-spike threshold. Currently sourced from
@@ -245,20 +294,6 @@ export class ProxyCoordinator implements DurableObject {
     state.nextAvailableAt = grantedAt;
     state.requestTimestamps.push(grantedAt);
 
-    // P1-A — auto-expire ban / cf_bypass before we surface them. ``cfBypassUntil
-    // === 0`` is the "permanent for this session" sentinel and must NOT be
-    // pruned (it intentionally never expires until ``unban`` / TTL refresh).
-    if (state.bannedUntil !== null && state.bannedUntil <= now) {
-      state.bannedUntil = null;
-    }
-    if (
-      state.cfBypassUntil !== null &&
-      state.cfBypassUntil !== 0 &&
-      state.cfBypassUntil <= now
-    ) {
-      state.cfBypassUntil = null;
-    }
-
     await this.persistState(state);
 
     const penaltyFactor = this.computePenaltyFactor(state, now);
@@ -348,20 +383,28 @@ export class ProxyCoordinator implements DurableObject {
       kind = "ban";
       const ttl = Number.isFinite(body.ttl_ms as number) && (body.ttl_ms as number) > 0
         ? Number(body.ttl_ms)
-        : loadBanTtlMs(this.env);
+        : ttlForBanReason(body.reason, this.env);
       // Take the max of any existing ban so concurrent runners can't shorten
       // a longer ban; matches the plan's "TTL 取最大值" guidance.
       const newBannedUntil = now + ttl;
-      state.bannedUntil =
-        state.bannedUntil !== null && state.bannedUntil > newBannedUntil
-          ? state.bannedUntil
-          : newBannedUntil;
+      const shouldUpdateBan =
+        state.bannedUntil === null || state.bannedUntil <= newBannedUntil;
+      if (shouldUpdateBan) {
+        state.bannedUntil = newBannedUntil;
+        const r = (body.reason ?? "").toString().toLowerCase();
+        state.bannedReason = r.includes("ban page")
+          ? "javdb_hardban"
+          : r.includes("cf bypass failed")
+            ? "cf_auto"
+            : "manual";
+      }
       // Phase-1 ADR-008 — record the ban event for spike detection.
       state.banEvents.push(now);
       await this.maybeEmitBanSpikeAlert(proxyId, state, now, body.reason);
     } else if (rawKind === "unban") {
       kind = "unban";
       state.bannedUntil = null;
+      state.bannedReason = null;
     } else if (rawKind === "cf_bypass") {
       kind = "cf_bypass";
       // ``ttl_ms`` honours the same tri-state as `state.always_bypass_time`:
@@ -409,6 +452,7 @@ export class ProxyCoordinator implements DurableObject {
       // as a CF event for backward compatibility.
       kind = "cf";
       state.cfEvents.push(now);
+      this.maybeCfAutoBan(state, now);
     }
 
     await this.persistState(state);
@@ -506,6 +550,7 @@ export class ProxyCoordinator implements DurableObject {
       requestTimestamps: stored?.requestTimestamps ?? [],
       cfEvents: stored?.cfEvents ?? [],
       bannedUntil: stored?.bannedUntil ?? null,
+      bannedReason: stored?.bannedReason ?? null,
       cfBypassUntil: stored?.cfBypassUntil ?? null,
       successEvents: stored?.successEvents ?? [],
       failureEvents: stored?.failureEvents ?? [],
@@ -553,6 +598,21 @@ export class ProxyCoordinator implements DurableObject {
     const banCutoff = now - BAN_SPIKE_WINDOW_MS;
     while (state.banEvents.length > 0 && state.banEvents[0] < banCutoff) {
       state.banEvents.shift();
+    }
+    // P1-A / ADR-043 — auto-expire ban / cf_bypass state before it is
+    // surfaced. `cfBypassUntil === 0` is the "permanent for this session"
+    // sentinel and must NOT be pruned. Ban attribution belongs to the active
+    // ban only; clear it once the ban window expires.
+    if (state.bannedUntil !== null && state.bannedUntil <= now) {
+      state.bannedUntil = null;
+      state.bannedReason = null;
+    }
+    if (
+      state.cfBypassUntil !== null &&
+      state.cfBypassUntil !== 0 &&
+      state.cfBypassUntil <= now
+    ) {
+      state.cfBypassUntil = null;
     }
   }
 
@@ -641,6 +701,18 @@ export class ProxyCoordinator implements DurableObject {
       if (count >= threshold) factor = f;
     }
     return factor;
+  }
+
+  private maybeCfAutoBan(state: CoordinatorState, now: number): void {
+    if (!loadCfAutoBanEnabled(this.env)) return;
+    if (state.cfEvents.length < loadCfAutoBanThreshold(this.env)) return;
+    if (state.successEvents.length !== 0) return;
+
+    const newBannedUntil = now + loadCfBanTtlMs(this.env);
+    if (state.bannedUntil === null || state.bannedUntil <= newBannedUntil) {
+      state.bannedUntil = newBannedUntil;
+      state.bannedReason = "cf_auto";
+    }
   }
 
   private writeAnalytics(

@@ -162,6 +162,13 @@ JITTER_MAX_MS = "500"
 # touching client code.  Clients may also pass `ttl_ms` per /report, in
 # which case this fallback is unused.
 BAN_TTL_MS = "259200000"
+# ADR-043 — Worker-side CF auto-ban defaults ON; set
+# CF_AUTO_BAN_ENABLED = "false" as a kill-switch if the signal is noisy.
+CF_AUTO_BAN_ENABLED = "true"
+CF_AUTO_BAN_THRESHOLD = "6"
+CF_BAN_TTL_MS = "21600000"   # 6 hours
+# ADR-043 D9 — explicit JavDB IP-ban TTL (hard ban window + 1 day margin).
+HARD_BAN_TTL_MS = "691200000"   # 8 days
 # P1-B — default per-claim TTL for MovieClaimState (30 min).  Sized to
 # cover detail-page fetch + parser + qB add for a slow proxy without
 # locking the slot if the runner crashes (DO Alarm GC sweeps stale
