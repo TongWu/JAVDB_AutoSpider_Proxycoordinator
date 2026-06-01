@@ -42,6 +42,12 @@ interface CoordinatorState {
   requestTimestamps: number[];
   cfEvents: number[];
   /**
+   * ADR-043 D2 — CF-only reports used for auto-ban escalation. `failure`
+   * reports still feed `cfEvents` for historical penalty behavior, but must not
+   * count toward the CF auto-ban threshold.
+   */
+  cfAutoBanEvents: number[];
+  /**
    * P1-A — cross-runner proxy ban state.  ``null`` means "not banned".  When
    * ``bannedUntil > now`` the lease handler still computes ``wait_ms`` (so old
    * Python clients that ignore the boolean still throttle correctly) but flags
@@ -452,6 +458,7 @@ export class ProxyCoordinator implements DurableObject {
       // as a CF event for backward compatibility.
       kind = "cf";
       state.cfEvents.push(now);
+      state.cfAutoBanEvents.push(now);
       this.maybeCfAutoBan(state, now);
     }
 
@@ -549,6 +556,7 @@ export class ProxyCoordinator implements DurableObject {
       nextAvailableAt: stored?.nextAvailableAt ?? 0,
       requestTimestamps: stored?.requestTimestamps ?? [],
       cfEvents: stored?.cfEvents ?? [],
+      cfAutoBanEvents: stored?.cfAutoBanEvents ?? [],
       bannedUntil: stored?.bannedUntil ?? null,
       bannedReason: stored?.bannedReason ?? null,
       cfBypassUntil: stored?.cfBypassUntil ?? null,
@@ -587,6 +595,9 @@ export class ProxyCoordinator implements DurableObject {
     const cfCutoff = now - this.cfg.penaltyWindowSec * 1000;
     while (state.cfEvents.length > 0 && state.cfEvents[0] < cfCutoff) {
       state.cfEvents.shift();
+    }
+    while (state.cfAutoBanEvents.length > 0 && state.cfAutoBanEvents[0] < cfCutoff) {
+      state.cfAutoBanEvents.shift();
     }
     while (state.successEvents.length > 0 && state.successEvents[0] < cfCutoff) {
       state.successEvents.shift();
@@ -705,7 +716,7 @@ export class ProxyCoordinator implements DurableObject {
 
   private maybeCfAutoBan(state: CoordinatorState, now: number): void {
     if (!loadCfAutoBanEnabled(this.env)) return;
-    if (state.cfEvents.length < loadCfAutoBanThreshold(this.env)) return;
+    if (state.cfAutoBanEvents.length < loadCfAutoBanThreshold(this.env)) return;
     if (state.successEvents.length !== 0) return;
 
     const newBannedUntil = now + loadCfBanTtlMs(this.env);

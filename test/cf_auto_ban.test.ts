@@ -25,7 +25,7 @@ function asEnv(overrides: Partial<Env>): Env {
 
 async function report(
   proxyId: string,
-  kind: "cf" | "success" | "ban" = "cf",
+  kind: "cf" | "success" | "failure" | "ban" = "cf",
   extras: { ttl_ms?: number; reason?: string } = {},
 ) {
   const req = new Request("https://test.invalid/report", {
@@ -173,6 +173,20 @@ describe("CF auto-ban escalation", () => {
     const state = await dumpState(proxy);
     expect(state.cfEvents.length).toBe(6);
     expect(state.successEvents.length).toBe(1);
+    expect(state.banned).toBe(false);
+    expect(state.bannedUntil).toBeNull();
+    expect(state.bannedReason).toBeNull();
+  });
+
+  it("generic failure reports do not count toward CF auto-ban threshold", async () => {
+    const proxy = `cfab-failure-${crypto.randomUUID()}`;
+    for (let i = 0; i < 5; i++) {
+      await report(proxy, "failure");
+    }
+    await report(proxy, "cf");
+
+    const state = await dumpState(proxy);
+    expect(state.cfEvents.length).toBe(6);
     expect(state.banned).toBe(false);
     expect(state.bannedUntil).toBeNull();
     expect(state.bannedReason).toBeNull();
