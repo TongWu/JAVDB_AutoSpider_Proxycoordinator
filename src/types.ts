@@ -55,6 +55,14 @@ export interface Env {
   /** Default ban TTL applied when `/report` body omits `ttl_ms` for `kind: "ban"`.
    *  Configurable via `wrangler.toml` `[vars]`; falls back to 3 days. */
   BAN_TTL_MS?: string;
+  /** ADR-043 — kill-switch for Worker-side CF auto-ban escalation. */
+  CF_AUTO_BAN_ENABLED?: string;
+  /** ADR-043 — CF-event threshold for auto-banning a proxy with zero successes. */
+  CF_AUTO_BAN_THRESHOLD?: string;
+  /** ADR-043 — auto-ban TTL in ms for persistently CF-walled proxies. */
+  CF_BAN_TTL_MS?: string;
+  /** ADR-043 — JavDB explicit IP-ban TTL in ms. Defaults to 8 days. */
+  HARD_BAN_TTL_MS?: string;
   /** Default per-claim TTL for `MovieClaimState`.  Configurable via
    *  `wrangler.toml [vars]`; falls back to 30 minutes. */
   MOVIE_CLAIM_TTL_MS?: string;
@@ -111,6 +119,10 @@ export interface Env {
 
 /** Default ban duration when the client doesn't pass `ttl_ms`. 3 days = 259_200_000 ms. */
 export const DEFAULT_BAN_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+export const DEFAULT_CF_AUTO_BAN_ENABLED = true;
+export const DEFAULT_CF_AUTO_BAN_THRESHOLD = 6;
+export const DEFAULT_CF_BAN_TTL_MS = 6 * 60 * 60 * 1000;
+export const DEFAULT_HARD_BAN_TTL_MS = 8 * 24 * 60 * 60 * 1000;
 
 export interface ThrottleConfig {
   shortWindowSec: number;
@@ -214,7 +226,8 @@ export interface ReportRequest {
    *  ``ban`` defaults to ``BAN_TTL_MS`` (3 days); ``cf_bypass`` accepts ``0`` =
    *  "permanent for this session" to mirror ``always_bypass_time == 0``. */
   ttl_ms?: number;
-  /** Free-form annotation kept for ops only; the DO does not parse it. */
+  /** Free-form annotation kept for ops; `ban` reports without `ttl_ms` use it
+   *  to choose a cause-specific TTL (ADR-043 D9). */
   reason?: string;
   /** P2-D — observed HTTP latency for this attempt, in ms.  Folded into
    *  ``latencyEma`` regardless of ``kind`` (a slow-but-successful
