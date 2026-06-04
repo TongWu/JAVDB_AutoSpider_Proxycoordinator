@@ -156,3 +156,71 @@ export function computeRecommendationRankScore(
   const floor = clamp(input.exploration_floor, 0, 0.2);
   return clamp(Math.max(floor, blended), 0, 1);
 }
+
+export type RecommendationRolloutGate =
+  | "observe"
+  | "ready"
+  | "blocked_global_instability";
+
+export interface RecommendationPolicySummaryInput {
+  proxy_id: string;
+  heuristic_score: number;
+  model_score: number;
+  rank_score: number;
+  confidence: number;
+  available: boolean;
+  reason_code: RecommendReasonCode;
+}
+
+export interface RecommendationPolicySummary {
+  mode: RecommendationPolicyMode;
+  candidate_count: number;
+  available_count: number;
+  average_confidence: number;
+  max_score_delta: number;
+  disagreement_count: number;
+  global_pool_unstable_count: number;
+  rollout_gate: RecommendationRolloutGate;
+}
+
+export function computeRecommendationPolicySummary(
+  rows: RecommendationPolicySummaryInput[],
+  mode: RecommendationPolicyMode,
+): RecommendationPolicySummary {
+  const candidateCount = rows.length;
+  const available = rows.filter((row) => row.available);
+  const confidenceSum = rows.reduce((acc, row) => acc + clamp(row.confidence, 0, 1), 0);
+  const deltas = rows.map((row) =>
+    Math.abs(clamp(row.model_score, 0, 1) - clamp(row.heuristic_score, 0, 1)),
+  );
+  const maxDelta = deltas.length > 0 ? Math.max(...deltas) : 0;
+  const disagreementCount = deltas.filter((delta) => delta >= 0.2).length;
+  const globalPoolUnstableCount = rows.filter(
+    (row) => row.reason_code === "global_pool_unstable",
+  ).length;
+  const averageConfidence =
+    candidateCount > 0 ? confidenceSum / candidateCount : 0;
+
+  let rolloutGate: RecommendationRolloutGate = "observe";
+  if (globalPoolUnstableCount > 0) {
+    rolloutGate = "blocked_global_instability";
+  } else if (
+    mode === "policy" &&
+    candidateCount > 0 &&
+    averageConfidence >= 0.6 &&
+    maxDelta < 0.2
+  ) {
+    rolloutGate = "ready";
+  }
+
+  return {
+    mode,
+    candidate_count: candidateCount,
+    available_count: available.length,
+    average_confidence: averageConfidence,
+    max_score_delta: maxDelta,
+    disagreement_count: disagreementCount,
+    global_pool_unstable_count: globalPoolUnstableCount,
+    rollout_gate: rolloutGate,
+  };
+}

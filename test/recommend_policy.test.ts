@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   RECOMMEND_POLICY_MODEL_VERSION,
   computeGlobalRecommendationBaseline,
+  computeRecommendationPolicySummary,
   computeRecommendationRankScore,
   computeRecommendationShadow,
   parseRecommendationPolicyMode,
   type RecommendationPolicyInput,
+  type RecommendationPolicySummaryInput,
 } from "../src/recommend_policy";
 
 function input(overrides: Partial<RecommendationPolicyInput>): RecommendationPolicyInput {
@@ -203,5 +205,55 @@ describe("recommend_policy ranking mode", () => {
     expect(parseRecommendationPolicyMode("shadow")).toBe("shadow");
     expect(parseRecommendationPolicyMode("garbage")).toBe("shadow");
     expect(parseRecommendationPolicyMode(undefined)).toBe("shadow");
+  });
+});
+
+function summaryInput(
+  overrides: Partial<RecommendationPolicySummaryInput>,
+): RecommendationPolicySummaryInput {
+  return {
+    proxy_id: "P",
+    heuristic_score: 0.5,
+    model_score: 0.5,
+    rank_score: 0.5,
+    confidence: 0,
+    available: true,
+    reason_code: "low_confidence_prior",
+    ...overrides,
+  };
+}
+
+describe("recommend_policy summary diagnostics", () => {
+  it("summarizes disagreement and confidence", () => {
+    const summary = computeRecommendationPolicySummary([
+      summaryInput({ proxy_id: "A", heuristic_score: 0.9, model_score: 0.2, confidence: 0.5 }),
+      summaryInput({ proxy_id: "B", heuristic_score: 0.1, model_score: 0.8, confidence: 0.75 }),
+    ], "shadow");
+
+    expect(summary.mode).toBe("shadow");
+    expect(summary.candidate_count).toBe(2);
+    expect(summary.average_confidence).toBeCloseTo(0.625, 5);
+    expect(summary.max_score_delta).toBeCloseTo(0.7, 5);
+    expect(summary.disagreement_count).toBe(2);
+    expect(summary.rollout_gate).toBe("observe");
+  });
+
+  it("marks blocked when global pool is unstable", () => {
+    const summary = computeRecommendationPolicySummary([
+      summaryInput({ reason_code: "global_pool_unstable", confidence: 0.2 }),
+      summaryInput({ reason_code: "global_pool_unstable", confidence: 0.2 }),
+    ], "policy");
+
+    expect(summary.global_pool_unstable_count).toBe(2);
+    expect(summary.rollout_gate).toBe("blocked_global_instability");
+  });
+
+  it("marks ready only when policy mode has enough confidence and low disagreement", () => {
+    const summary = computeRecommendationPolicySummary([
+      summaryInput({ heuristic_score: 0.8, model_score: 0.82, confidence: 0.8 }),
+      summaryInput({ heuristic_score: 0.7, model_score: 0.72, confidence: 0.9 }),
+    ], "policy");
+
+    expect(summary.rollout_gate).toBe("ready");
   });
 });
