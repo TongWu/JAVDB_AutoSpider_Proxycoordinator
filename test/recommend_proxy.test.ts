@@ -64,6 +64,12 @@ async function recommend(query: string): Promise<{
     recommendations: Array<{
       proxy_id: string;
       score: number;
+      heuristic_score: number;
+      model_score: number;
+      confidence: number;
+      reason_code: string;
+      cooldown_until: number | null;
+      model_version: string;
       banned: boolean;
       available: boolean;
     }>;
@@ -83,6 +89,12 @@ async function recommend(query: string): Promise<{
     recommendations: Array<{
       proxy_id: string;
       score: number;
+      heuristic_score: number;
+      model_score: number;
+      confidence: number;
+      reason_code: string;
+      cooldown_until: number | null;
+      model_version: string;
       banned: boolean;
       available: boolean;
     }>;
@@ -199,6 +211,49 @@ describe("W5.5 /recommend_proxy — ranking", () => {
       "R-AA",
       "R-ZZ",
     ]);
+  });
+
+  it("adds ADR-023 shadow scoring fields without changing heuristic score", async () => {
+    await lease("R-SHADOW-GOOD");
+    await lease("R-SHADOW-BAD");
+    for (let i = 0; i < 10; i++) {
+      await reportEvent("R-SHADOW-GOOD", "success", { latency_ms: 100 });
+    }
+    for (let i = 0; i < 10; i++) {
+      await reportEvent("R-SHADOW-BAD", "failure");
+    }
+
+    const r = await recommend("proxy_ids=R-SHADOW-GOOD,R-SHADOW-BAD");
+
+    expect(r.body.recommendations.map((rec) => rec.proxy_id)).toEqual([
+      "R-SHADOW-GOOD",
+      "R-SHADOW-BAD",
+    ]);
+    for (const rec of r.body.recommendations) {
+      expect(rec.heuristic_score).toBe(rec.score);
+      expect(rec.model_score).toBeGreaterThanOrEqual(0);
+      expect(rec.model_score).toBeLessThanOrEqual(1);
+      expect(rec.confidence).toBeGreaterThanOrEqual(0);
+      expect(rec.confidence).toBeLessThanOrEqual(1);
+      expect(rec.reason_code).toMatch(
+        /stable_recently|proxy_underperforming|global_pool_unstable|low_confidence_prior|banned_cooldown|cf_bypass_cooldown/,
+      );
+      expect(rec.model_version).toBe("adr023-shadow-v1");
+    }
+  });
+
+  it("returns cooldown_until for banned proxies when included", async () => {
+    await lease("R-COOLDOWN-VISIBLE");
+    await reportEvent("R-COOLDOWN-VISIBLE", "ban", { ttl_ms: 60_000 });
+
+    const r = await recommend("proxy_ids=R-COOLDOWN-VISIBLE&include_unhealthy=1");
+    const rec = r.body.recommendations[0];
+
+    expect(rec.proxy_id).toBe("R-COOLDOWN-VISIBLE");
+    expect(rec.banned).toBe(true);
+    expect(rec.reason_code).toBe("banned_cooldown");
+    expect(typeof rec.cooldown_until).toBe("number");
+    expect(rec.cooldown_until).toBeGreaterThan(r.body.server_time);
   });
 });
 

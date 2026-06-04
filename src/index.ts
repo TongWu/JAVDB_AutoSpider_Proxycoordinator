@@ -9,6 +9,12 @@ import {
 } from "./types";
 import { renderDashboardHtml, commonDashboardStyles, escapeHtmlForServer } from "./dashboard_html";
 import { recordAndDispatch } from "./alert_dispatcher";
+import {
+  computeGlobalRecommendationBaseline,
+  computeRecommendationShadow,
+  type RecommendationPolicyInput,
+  type RecommendationShadowFields,
+} from "./recommend_policy";
 
 export { ProxyCoordinator } from "./proxy_coordinator";
 export { GlobalLoginState } from "./global_login_state";
@@ -1431,18 +1437,20 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
 
   const states = await snapshotProxies(env, proxyIds);
 
-  interface Recommendation {
+  interface Recommendation extends RecommendationShadowFields {
     proxy_id: string;
     score: number;
     latency_ema_ms: number;
     success_count: number;
     failure_count: number;
     banned: boolean;
+    banned_until: number | null;
     requires_cf_bypass: boolean;
+    cf_bypass_until: number | null;
     available: boolean;
   }
 
-  const ranked: Recommendation[] = states.map((s) => {
+  const baseRanked = states.map((s) => {
     const banned = Boolean(s.banned);
     const requires_cf_bypass = Boolean(s.requires_cf_bypass);
     const healthy = !s.error && !banned;
@@ -1465,10 +1473,37 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
       success_count: clampNumber(h?.success_count, 0, 0, Number.MAX_SAFE_INTEGER),
       failure_count: clampNumber(h?.failure_count, 0, 0, Number.MAX_SAFE_INTEGER),
       banned,
+      banned_until: nullableEpochMs(s.bannedUntil),
       requires_cf_bypass,
+      cf_bypass_until: nullableEpochMs(s.cfBypassUntil),
       available: healthy,
     };
   });
+
+  const policyInputs: RecommendationPolicyInput[] = baseRanked.map((r) => ({
+    proxy_id: r.proxy_id,
+    heuristic_score: r.score < 0 ? 0 : r.score,
+    latency_ema_ms: r.latency_ema_ms,
+    success_count: r.success_count,
+    failure_count: r.failure_count,
+    banned: r.banned,
+    banned_until: r.banned_until,
+    requires_cf_bypass: r.requires_cf_bypass,
+    cf_bypass_until: r.cf_bypass_until,
+    available: r.available,
+  }));
+  const baseline = computeGlobalRecommendationBaseline(policyInputs);
+  const policyByProxyId = new Map(
+    policyInputs.map((input) => [
+      input.proxy_id,
+      computeRecommendationShadow(input, baseline, Date.now()),
+    ]),
+  );
+
+  const ranked: Recommendation[] = baseRanked.map((r) => ({
+    ...r,
+    ...policyByProxyId.get(r.proxy_id)!,
+  }));
 
   ranked.sort((a, b) => {
     if (a.score !== b.score) return b.score - a.score;
@@ -1500,6 +1535,13 @@ function clampNumber(
   if (n < min) return min;
   if (n > max) return max;
   return n;
+}
+
+function nullableEpochMs(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
 }
 
 /**
