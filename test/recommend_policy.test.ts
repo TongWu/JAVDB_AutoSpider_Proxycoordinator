@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   RECOMMEND_POLICY_MODEL_VERSION,
   computeGlobalRecommendationBaseline,
+  computeRecommendationRankScore,
   computeRecommendationShadow,
+  parseRecommendationPolicyMode,
   type RecommendationPolicyInput,
 } from "../src/recommend_policy";
 
@@ -140,5 +142,66 @@ describe("recommend_policy shadow scoring", () => {
     expect(shadow.model_score).toBeCloseTo(0.05, 5);
     expect(shadow.reason_code).toBe("banned_cooldown");
     expect(shadow.cooldown_until).toBe(999);
+  });
+});
+
+describe("recommend_policy ranking mode", () => {
+  it("keeps heuristic rank score in shadow mode", () => {
+    const rank = computeRecommendationRankScore({
+      heuristic_score: 0.8,
+      model_score: 0.1,
+      confidence: 1,
+      available: true,
+      mode: "shadow",
+      exploration_floor: 0.02,
+    });
+
+    expect(rank).toBe(0.8);
+  });
+
+  it("blends model and heuristic in policy mode by confidence", () => {
+    const rank = computeRecommendationRankScore({
+      heuristic_score: 0.2,
+      model_score: 0.8,
+      confidence: 0.25,
+      available: true,
+      mode: "policy",
+      exploration_floor: 0.02,
+    });
+
+    expect(rank).toBeCloseTo(0.35, 5);
+  });
+
+  it("applies exploration floor only to available policy-ranked proxies", () => {
+    const rank = computeRecommendationRankScore({
+      heuristic_score: 0,
+      model_score: 0,
+      confidence: 1,
+      available: true,
+      mode: "policy",
+      exploration_floor: 0.05,
+    });
+
+    expect(rank).toBe(0.05);
+  });
+
+  it("keeps unavailable proxies below available proxies even in policy mode", () => {
+    const rank = computeRecommendationRankScore({
+      heuristic_score: 1,
+      model_score: 1,
+      confidence: 1,
+      available: false,
+      mode: "policy",
+      exploration_floor: 0.05,
+    });
+
+    expect(rank).toBeLessThan(0);
+  });
+
+  it("parses unknown policy modes as shadow", () => {
+    expect(parseRecommendationPolicyMode("policy")).toBe("policy");
+    expect(parseRecommendationPolicyMode("shadow")).toBe("shadow");
+    expect(parseRecommendationPolicyMode("garbage")).toBe("shadow");
+    expect(parseRecommendationPolicyMode(undefined)).toBe("shadow");
   });
 });

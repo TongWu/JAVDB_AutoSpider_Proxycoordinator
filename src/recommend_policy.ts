@@ -122,3 +122,37 @@ export function computeRecommendationShadow(
     model_version: RECOMMEND_POLICY_MODEL_VERSION,
   };
 }
+
+export type RecommendationPolicyMode = "shadow" | "policy";
+
+export interface RecommendationRankScoreInput {
+  heuristic_score: number;
+  model_score: number;
+  confidence: number;
+  available: boolean;
+  mode: RecommendationPolicyMode;
+  exploration_floor: number;
+}
+
+export function parseRecommendationPolicyMode(
+  raw: string | undefined,
+): RecommendationPolicyMode {
+  return raw === "policy" ? "policy" : "shadow";
+}
+
+export function computeRecommendationRankScore(
+  input: RecommendationRankScoreInput,
+): number {
+  if (!input.available) {
+    return -1;
+  }
+  const heuristic = clamp(input.heuristic_score, 0, 1);
+  if (input.mode === "shadow") {
+    return heuristic;
+  }
+  const model = clamp(input.model_score, 0, 1);
+  const confidence = clamp(input.confidence, 0, 1);
+  const blended = heuristic * (1 - confidence) + model * confidence;
+  const floor = clamp(input.exploration_floor, 0, 0.2);
+  return clamp(Math.max(floor, blended), 0, 1);
+}
