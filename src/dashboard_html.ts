@@ -1835,3 +1835,39 @@ export function escapeHtmlForServer(s: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
+
+export interface PolicySummaryForDashboard {
+  mode: string;
+  candidate_count: number;
+  available_count: number;
+  average_confidence: number;
+  max_score_delta: number;
+  disagreement_count: number;
+  global_pool_unstable_count: number;
+  rollout_gate: string;
+}
+
+export function renderPolicySummaryBadge(
+  summary: PolicySummaryForDashboard | null | undefined,
+): string {
+  if (!summary) return "";
+  const confidencePct = Math.round(Math.max(0, Math.min(1, summary.average_confidence)) * 100);
+  const disagreementLabel =
+    summary.disagreement_count === 1
+      ? "1 disagreement"
+      : `${summary.disagreement_count} disagreements`;
+  return [
+    '<span class="pill info">',
+    `policy ${escapeHtmlForServer(summary.mode)}`,
+    '</span> ',
+    '<span class="pill">',
+    `gate ${escapeHtmlForServer(summary.rollout_gate)}`,
+    '</span> ',
+    '<span class="pill">',
+    `${confidencePct}% confidence`,
+    '</span> ',
+    '<span class="pill">',
+    escapeHtmlForServer(disagreementLabel),
+    '</span>',
+  ].join("");
+}
