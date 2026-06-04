@@ -11,10 +11,12 @@ import { renderDashboardHtml, commonDashboardStyles, escapeHtmlForServer } from 
 import { recordAndDispatch } from "./alert_dispatcher";
 import {
   computeGlobalRecommendationBaseline,
+  computeRecommendationPolicySummary,
   computeRecommendationRankScore,
   computeRecommendationShadow,
   parseRecommendationPolicyMode,
   type RecommendationPolicyInput,
+  type RecommendationPolicySummaryInput,
   type RecommendationShadowFields,
 } from "./recommend_policy";
 
@@ -1549,10 +1551,45 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
     ? ranked
     : ranked.filter((r) => r.available);
 
+  const policySummary = computeRecommendationPolicySummary(
+    ranked.map((row): RecommendationPolicySummaryInput => ({
+      proxy_id: row.proxy_id,
+      heuristic_score: row.heuristic_score,
+      model_score: row.model_score,
+      rank_score: row.rank_score,
+      confidence: row.confidence,
+      available: row.available,
+      reason_code: row.reason_code,
+    })),
+    rankingMode,
+  );
+
+  if (env.LEASE_ANALYTICS) {
+    try {
+      env.LEASE_ANALYTICS.writeDataPoint({
+        blobs: ["recommend_proxy", rankingMode, policySummary.rollout_gate],
+        doubles: [
+          policySummary.candidate_count,
+          policySummary.available_count,
+          policySummary.average_confidence,
+          policySummary.max_score_delta,
+          policySummary.disagreement_count,
+          policySummary.global_pool_unstable_count,
+        ],
+        indexes: ["recommend_proxy"],
+      });
+    } catch (err) {
+      console.warn("recommend_proxy analytics write failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   return jsonResponse({
     recommendations: filtered.slice(0, topN),
     queried_proxy_ids: proxyIds,
     server_time: Date.now(),
+    policy_summary: policySummary,
   });
 }
 

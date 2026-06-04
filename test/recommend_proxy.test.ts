@@ -77,6 +77,16 @@ async function recommend(query: string): Promise<{
     }>;
     queried_proxy_ids: string[];
     server_time: number;
+    policy_summary?: {
+      mode: string;
+      candidate_count: number;
+      available_count: number;
+      average_confidence: number;
+      max_score_delta: number;
+      disagreement_count: number;
+      global_pool_unstable_count: number;
+      rollout_gate: string;
+    };
   };
 }> {
   const req = new Request(`https://test.invalid/recommend_proxy?${query}`, {
@@ -104,6 +114,16 @@ async function recommend(query: string): Promise<{
     }>;
     queried_proxy_ids: string[];
     server_time: number;
+    policy_summary?: {
+      mode: string;
+      candidate_count: number;
+      available_count: number;
+      average_confidence: number;
+      max_score_delta: number;
+      disagreement_count: number;
+      global_pool_unstable_count: number;
+      rollout_gate: string;
+    };
   };
   return { status, body };
 }
@@ -289,6 +309,23 @@ describe("W5.5 /recommend_proxy — ranking", () => {
     expect(rec.reason_code).toBe("banned_cooldown");
     expect(typeof rec.cooldown_until).toBe("number");
     expect(rec.cooldown_until).toBeGreaterThan(r.body.server_time);
+  });
+
+  it("returns policy_summary for recommendation diagnostics", async () => {
+    await lease("R-SUMMARY-A");
+    await lease("R-SUMMARY-B");
+    await reportEvent("R-SUMMARY-A", "success", { latency_ms: 100 });
+    await reportEvent("R-SUMMARY-B", "failure");
+
+    const r = await recommend("proxy_ids=R-SUMMARY-A,R-SUMMARY-B&include_unhealthy=1");
+
+    expect(r.body.policy_summary).toBeDefined();
+    expect(r.body.policy_summary!.mode).toBe("shadow");
+    expect(r.body.policy_summary!.candidate_count).toBe(2);
+    expect(r.body.policy_summary!.available_count).toBe(2);
+    expect(r.body.policy_summary!.rollout_gate).toMatch(
+      /observe|ready|blocked_global_instability/,
+    );
   });
 });
 
