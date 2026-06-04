@@ -72,6 +72,8 @@ async function recommend(query: string): Promise<{
       model_version: string;
       banned: boolean;
       available: boolean;
+      rank_score: number;
+      ranking_mode: string;
     }>;
     queried_proxy_ids: string[];
     server_time: number;
@@ -97,10 +99,28 @@ async function recommend(query: string): Promise<{
       model_version: string;
       banned: boolean;
       available: boolean;
+      rank_score: number;
+      ranking_mode: string;
     }>;
     queried_proxy_ids: string[];
     server_time: number;
   };
+  return { status, body };
+}
+
+async function recommendWithEnv(
+  query: string,
+  overrides: Record<string, string>,
+): Promise<Awaited<ReturnType<typeof recommend>>> {
+  const req = new Request(`https://test.invalid/recommend_proxy?${query}`, {
+    method: "GET",
+    headers: { ...AUTH },
+  });
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(req, { ...env, ...overrides }, ctx);
+  await waitOnExecutionContext(ctx);
+  const status = res.status;
+  const body = (await res.json()) as Awaited<ReturnType<typeof recommend>>["body"];
   return { status, body };
 }
 
@@ -288,5 +308,65 @@ describe("W5.5 /recommend_proxy — auth + caps", () => {
     const ids = Array.from({ length: 50 }, (_, i) => `Cap-${i}`).join(",");
     const r = await recommend(`proxy_ids=${ids}&include_unhealthy=1`);
     expect(r.body.queried_proxy_ids).toHaveLength(32);
+  });
+});
+
+describe("W5.5 /recommend_proxy — policy mode flag (ADR-023 Phase 2)", () => {
+  it("keeps heuristic ordering by default even when model_score disagrees", async () => {
+    await lease("R-DEFAULT-HEURISTIC-HIGH");
+    await lease("R-DEFAULT-HEURISTIC-LOW");
+    for (let i = 0; i < 10; i++) {
+      await reportEvent("R-DEFAULT-HEURISTIC-HIGH", "success", { latency_ms: 5000 });
+      await reportEvent("R-DEFAULT-HEURISTIC-LOW", "failure");
+    }
+
+    const r = await recommend(
+      "proxy_ids=R-DEFAULT-HEURISTIC-HIGH,R-DEFAULT-HEURISTIC-LOW&include_unhealthy=1",
+    );
+
+    expect(r.body.recommendations[0].ranking_mode).toBe("shadow");
+    expect(r.body.recommendations[0].rank_score).toBe(
+      r.body.recommendations[0].score,
+    );
+  });
+
+  it("uses blended policy rank score when RECOMMEND_PROXY_POLICY_MODE=policy", async () => {
+    await lease("R-POLICY-FAST");
+    await lease("R-POLICY-SLOW");
+    for (let i = 0; i < 10; i++) {
+      await reportEvent("R-POLICY-FAST", "success", { latency_ms: 100 });
+      await reportEvent("R-POLICY-SLOW", "success", { latency_ms: 7000 });
+    }
+
+    const r = await recommendWithEnv(
+      "proxy_ids=R-POLICY-SLOW,R-POLICY-FAST&include_unhealthy=1",
+      {
+        RECOMMEND_PROXY_POLICY_MODE: "policy",
+        RECOMMEND_PROXY_EXPLORATION_FLOOR: "0.02",
+      },
+    );
+
+    expect(r.body.recommendations[0].proxy_id).toBe("R-POLICY-FAST");
+    expect(r.body.recommendations[0].ranking_mode).toBe("policy");
+    expect(r.body.recommendations[0].rank_score).toBeGreaterThan(
+      r.body.recommendations[1].rank_score,
+    );
+  });
+
+  it("keeps banned proxies last in policy mode when include_unhealthy=1", async () => {
+    await lease("R-POLICY-AVAILABLE");
+    await lease("R-POLICY-BANNED");
+    await reportEvent("R-POLICY-AVAILABLE", "success", { latency_ms: 100 });
+    await reportEvent("R-POLICY-BANNED", "success", { latency_ms: 100 });
+    await reportEvent("R-POLICY-BANNED", "ban", { ttl_ms: 60_000 });
+
+    const r = await recommendWithEnv(
+      "proxy_ids=R-POLICY-BANNED,R-POLICY-AVAILABLE&include_unhealthy=1",
+      { RECOMMEND_PROXY_POLICY_MODE: "policy" },
+    );
+
+    expect(r.body.recommendations[0].proxy_id).toBe("R-POLICY-AVAILABLE");
+    expect(r.body.recommendations[1].proxy_id).toBe("R-POLICY-BANNED");
+    expect(r.body.recommendations[1].rank_score).toBeLessThan(0);
   });
 });

@@ -11,7 +11,9 @@ import { renderDashboardHtml, commonDashboardStyles, escapeHtmlForServer } from 
 import { recordAndDispatch } from "./alert_dispatcher";
 import {
   computeGlobalRecommendationBaseline,
+  computeRecommendationRankScore,
   computeRecommendationShadow,
+  parseRecommendationPolicyMode,
   type RecommendationPolicyInput,
   type RecommendationShadowFields,
 } from "./recommend_policy";
@@ -1454,6 +1456,8 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
     requires_cf_bypass: boolean;
     cf_bypass_until: number | null;
     available: boolean;
+    rank_score: number;
+    ranking_mode: "shadow" | "policy";
   }
 
   const baseRanked = states.map((s) => {
@@ -1507,15 +1511,31 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
     ]),
   );
 
-  const ranked: Recommendation[] = baseRanked.map((r) => ({
-    ...r,
+  const rankingMode = parseRecommendationPolicyMode(env.RECOMMEND_PROXY_POLICY_MODE);
+  const explorationFloor = parseExplorationFloor(env);
+
+  const ranked: Recommendation[] = baseRanked.map((r) => {
+    const shadow = policyByProxyId.get(r.proxy_id)!;
     // Non-null assertion is safe: proxy_ids is deduped above, so
     // baseRanked and policyInputs share identical, unique proxy_id sets.
-    ...policyByProxyId.get(r.proxy_id)!,
-  }));
+    const rankScore = computeRecommendationRankScore({
+      heuristic_score: shadow.heuristic_score,
+      model_score: shadow.model_score,
+      confidence: shadow.confidence,
+      available: r.available,
+      mode: rankingMode,
+      exploration_floor: explorationFloor,
+    });
+    return {
+      ...r,
+      ...shadow,
+      rank_score: rankScore,
+      ranking_mode: rankingMode,
+    };
+  });
 
   ranked.sort((a, b) => {
-    if (a.score !== b.score) return b.score - a.score;
+    if (a.rank_score !== b.rank_score) return b.rank_score - a.rank_score;
     if (a.latency_ema_ms !== b.latency_ema_ms) {
       return a.latency_ema_ms - b.latency_ema_ms;
     }
@@ -1551,6 +1571,13 @@ function nullableEpochMs(raw: unknown): number | null {
   const n = typeof raw === "number" ? raw : Number(raw);
   if (!Number.isFinite(n) || n < 0) return null;
   return Math.floor(n);
+}
+
+function parseExplorationFloor(env: Env): number {
+  const raw = env.RECOMMEND_PROXY_EXPLORATION_FLOOR;
+  const n = raw === undefined || raw === "" ? 0.02 : Number(raw);
+  if (!Number.isFinite(n)) return 0.02;
+  return Math.min(0.2, Math.max(0, n));
 }
 
 /**
