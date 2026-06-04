@@ -312,7 +312,7 @@ describe("W5.5 /recommend_proxy — auth + caps", () => {
 });
 
 describe("W5.5 /recommend_proxy — policy mode flag (ADR-023 Phase 2)", () => {
-  it("keeps heuristic ordering by default even when model_score disagrees", async () => {
+  it("keeps heuristic ordering by default (shadow mode: rank_score === score)", async () => {
     await lease("R-DEFAULT-HEURISTIC-HIGH");
     await lease("R-DEFAULT-HEURISTIC-LOW");
     for (let i = 0; i < 10; i++) {
@@ -324,6 +324,10 @@ describe("W5.5 /recommend_proxy — policy mode flag (ADR-023 Phase 2)", () => {
       "proxy_ids=R-DEFAULT-HEURISTIC-HIGH,R-DEFAULT-HEURISTIC-LOW&include_unhealthy=1",
     );
 
+    // R-DEFAULT-HEURISTIC-HIGH has 10 successes → high heuristic score.
+    // R-DEFAULT-HEURISTIC-LOW has 10 failures → low heuristic score.
+    // In shadow mode the sort key is rank_score = heuristic score, so HIGH wins.
+    expect(r.body.recommendations[0].proxy_id).toBe("R-DEFAULT-HEURISTIC-HIGH");
     expect(r.body.recommendations[0].ranking_mode).toBe("shadow");
     expect(r.body.recommendations[0].rank_score).toBe(
       r.body.recommendations[0].score,
@@ -351,6 +355,10 @@ describe("W5.5 /recommend_proxy — policy mode flag (ADR-023 Phase 2)", () => {
     expect(r.body.recommendations[0].rank_score).toBeGreaterThan(
       r.body.recommendations[1].rank_score,
     );
+    // Both available proxies must respect the exploration floor.
+    for (const rec of r.body.recommendations) {
+      expect(rec.rank_score).toBeGreaterThanOrEqual(0.02);
+    }
   });
 
   it("keeps banned proxies last in policy mode when include_unhealthy=1", async () => {

@@ -1492,6 +1492,9 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
 
   const policyInputs: RecommendationPolicyInput[] = baseRanked.map((r) => ({
     proxy_id: r.proxy_id,
+    // Banned proxies carry score = -1; the policy model uses 0 as a neutral
+    // prior for them. Callers must identify banned proxies via `available` or
+    // `rank_score < 0`, NOT via `heuristic_score` (which is 0, not -1).
     heuristic_score: r.score < 0 ? 0 : r.score,
     latency_ema_ms: r.latency_ema_ms,
     success_count: r.success_count,
