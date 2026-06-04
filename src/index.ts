@@ -1211,12 +1211,15 @@ async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
   let proxyIds: string[] = [];
   if (rawIds) {
     // Caller explicitly listed proxy IDs — honour them (backward compat for
-    // external monitoring scripts).
-    proxyIds = rawIds
-      .split(",")
-      .map((s) => normalizeProxyId(s.trim()))
-      .filter((s) => s !== "")
-      .slice(0, 32);
+    // external monitoring scripts). Dedup so each proxy DO is contacted once.
+    proxyIds = [
+      ...new Set(
+        rawIds
+          .split(",")
+          .map((s) => normalizeProxyId(s.trim()))
+          .filter((s) => s !== ""),
+      ),
+    ].slice(0, 32);
   } else {
     // Phase 2 / ADR-004 — auto-enumerate from proxies_seen.
     proxyIds = await fetchSeenProxyIds(env);
@@ -1416,11 +1419,14 @@ async function forwardToWorkDistributorDo(
 async function recommendProxies(env: Env, url: URL): Promise<Response> {
   const rawIds = (url.searchParams.get("proxy_ids") ?? "").trim();
   const proxyIds = rawIds
-    ? rawIds
-        .split(",")
-        .map((s) => normalizeProxyId(s.trim()))
-        .filter((s) => s !== "")
-        .slice(0, 32)
+    ? [
+        ...new Set(
+          rawIds
+            .split(",")
+            .map((s) => normalizeProxyId(s.trim()))
+            .filter((s) => s !== ""),
+        ),
+      ].slice(0, 32)
     : [];
   const topNRaw = parseInt(url.searchParams.get("top_n") ?? "", 10);
   const topN =
@@ -1493,15 +1499,18 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
     available: r.available,
   }));
   const baseline = computeGlobalRecommendationBaseline(policyInputs);
+  const nowMs = Date.now();
   const policyByProxyId = new Map(
     policyInputs.map((input) => [
       input.proxy_id,
-      computeRecommendationShadow(input, baseline, Date.now()),
+      computeRecommendationShadow(input, baseline, nowMs),
     ]),
   );
 
   const ranked: Recommendation[] = baseRanked.map((r) => ({
     ...r,
+    // Non-null assertion is safe: proxy_ids is deduped above, so
+    // baseRanked and policyInputs share identical, unique proxy_id sets.
     ...policyByProxyId.get(r.proxy_id)!,
   }));
 

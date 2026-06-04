@@ -240,6 +240,21 @@ describe("W5.5 /recommend_proxy — ranking", () => {
       );
       expect(rec.model_version).toBe("adr023-shadow-v1");
     }
+    // R-SHADOW-GOOD has 10 successes; R-SHADOW-BAD has 10 failures.
+    // The model_score must reflect this differential.
+    expect(r.body.recommendations[0].model_score).toBeGreaterThan(
+      r.body.recommendations[1].model_score,
+    );
+  });
+
+  it("deduplicates repeated proxy_ids in the query", async () => {
+    await lease("R-DUP");
+    await reportEvent("R-DUP", "success", { latency_ms: 100 });
+
+    const r = await recommend("proxy_ids=R-DUP,R-DUP");
+
+    const dupRows = r.body.recommendations.filter((rec) => rec.proxy_id === "R-DUP");
+    expect(dupRows.length).toBe(1);
   });
 
   it("returns cooldown_until for banned proxies when included", async () => {
