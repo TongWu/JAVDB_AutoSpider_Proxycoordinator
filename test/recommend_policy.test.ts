@@ -131,4 +131,14 @@ describe("recommend_policy shadow scoring", () => {
     expect(shadow.reason_code).toBe("cf_bypass_cooldown");
     expect(shadow.cooldown_until).toBe(0);
   });
+
+  it("applies cooldown penalty to an unseen banned proxy", () => {
+    const rows = [input({ proxy_id: "P-BANNED-NEW", banned: true, banned_until: 999 })];
+    const baseline = computeGlobalRecommendationBaseline(rows);
+    const shadow = computeRecommendationShadow(rows[0], baseline, 1_000);
+
+    expect(shadow.model_score).toBeCloseTo(0.05, 5);
+    expect(shadow.reason_code).toBe("banned_cooldown");
+    expect(shadow.cooldown_until).toBe(999);
+  });
 });

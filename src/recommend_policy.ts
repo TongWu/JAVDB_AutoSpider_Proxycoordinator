@@ -84,7 +84,7 @@ export function computeRecommendationShadow(
   const cooldownPenalty = input.banned ? 0.45 : input.requires_cf_bypass ? 0.25 : 0;
   const modelScore =
     count === 0
-      ? 0.5
+      ? clamp(0.5 - cooldownPenalty, 0, 1)
       : clamp(successRate - relativeFailurePenalty - latencyPenalty - cooldownPenalty, 0, 1);
 
   let confidence = count / (count + 20);
