@@ -9,6 +9,16 @@ import {
 } from "./types";
 import { renderDashboardHtml, commonDashboardStyles, escapeHtmlForServer } from "./dashboard_html";
 import { recordAndDispatch } from "./alert_dispatcher";
+import {
+  computeGlobalRecommendationBaseline,
+  computeRecommendationPolicySummary,
+  computeRecommendationRankScore,
+  computeRecommendationShadow,
+  parseRecommendationPolicyMode,
+  type RecommendationPolicyInput,
+  type RecommendationPolicySummaryInput,
+  type RecommendationShadowFields,
+} from "./recommend_policy";
 
 export { ProxyCoordinator } from "./proxy_coordinator";
 export { GlobalLoginState } from "./global_login_state";
@@ -1205,12 +1215,15 @@ async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
   let proxyIds: string[] = [];
   if (rawIds) {
     // Caller explicitly listed proxy IDs — honour them (backward compat for
-    // external monitoring scripts).
-    proxyIds = rawIds
-      .split(",")
-      .map((s) => normalizeProxyId(s.trim()))
-      .filter((s) => s !== "")
-      .slice(0, 32);
+    // external monitoring scripts). Dedup so each proxy DO is contacted once.
+    proxyIds = [
+      ...new Set(
+        rawIds
+          .split(",")
+          .map((s) => normalizeProxyId(s.trim()))
+          .filter((s) => s !== ""),
+      ),
+    ].slice(0, 32);
   } else {
     // Phase 2 / ADR-004 — auto-enumerate from proxies_seen.
     proxyIds = await fetchSeenProxyIds(env);
@@ -1410,11 +1423,14 @@ async function forwardToWorkDistributorDo(
 async function recommendProxies(env: Env, url: URL): Promise<Response> {
   const rawIds = (url.searchParams.get("proxy_ids") ?? "").trim();
   const proxyIds = rawIds
-    ? rawIds
-        .split(",")
-        .map((s) => normalizeProxyId(s.trim()))
-        .filter((s) => s !== "")
-        .slice(0, 32)
+    ? [
+        ...new Set(
+          rawIds
+            .split(",")
+            .map((s) => normalizeProxyId(s.trim()))
+            .filter((s) => s !== ""),
+        ),
+      ].slice(0, 32)
     : [];
   const topNRaw = parseInt(url.searchParams.get("top_n") ?? "", 10);
   const topN =
@@ -1431,18 +1447,22 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
 
   const states = await snapshotProxies(env, proxyIds);
 
-  interface Recommendation {
+  interface Recommendation extends RecommendationShadowFields {
     proxy_id: string;
     score: number;
     latency_ema_ms: number;
     success_count: number;
     failure_count: number;
     banned: boolean;
+    banned_until: number | null;
     requires_cf_bypass: boolean;
+    cf_bypass_until: number | null;
     available: boolean;
+    rank_score: number;
+    ranking_mode: "shadow" | "policy";
   }
 
-  const ranked: Recommendation[] = states.map((s) => {
+  const baseRanked = states.map((s) => {
     const banned = Boolean(s.banned);
     const requires_cf_bypass = Boolean(s.requires_cf_bypass);
     const healthy = !s.error && !banned;
@@ -1465,13 +1485,62 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
       success_count: clampNumber(h?.success_count, 0, 0, Number.MAX_SAFE_INTEGER),
       failure_count: clampNumber(h?.failure_count, 0, 0, Number.MAX_SAFE_INTEGER),
       banned,
+      banned_until: nullableEpochMs(s.bannedUntil),
       requires_cf_bypass,
+      cf_bypass_until: nullableEpochMs(s.cfBypassUntil),
       available: healthy,
     };
   });
 
+  const policyInputs: RecommendationPolicyInput[] = baseRanked.map((r) => ({
+    proxy_id: r.proxy_id,
+    // Banned proxies carry score = -1; the policy model uses 0 as a neutral
+    // prior for them. Callers must identify banned proxies via `available` or
+    // `rank_score < 0`, NOT via `heuristic_score` (which is 0, not -1).
+    heuristic_score: r.score < 0 ? 0 : r.score,
+    latency_ema_ms: r.latency_ema_ms,
+    success_count: r.success_count,
+    failure_count: r.failure_count,
+    banned: r.banned,
+    banned_until: r.banned_until,
+    requires_cf_bypass: r.requires_cf_bypass,
+    cf_bypass_until: r.cf_bypass_until,
+    available: r.available,
+  }));
+  const baseline = computeGlobalRecommendationBaseline(policyInputs);
+  const nowMs = Date.now();
+  const policyByProxyId = new Map(
+    policyInputs.map((input) => [
+      input.proxy_id,
+      computeRecommendationShadow(input, baseline, nowMs),
+    ]),
+  );
+
+  const rankingMode = parseRecommendationPolicyMode(env.RECOMMEND_PROXY_POLICY_MODE);
+  const explorationFloor = parseExplorationFloor(env);
+
+  const ranked: Recommendation[] = baseRanked.map((r) => {
+    const shadow = policyByProxyId.get(r.proxy_id)!;
+    // Non-null assertion is safe: proxy_ids is deduped above, so
+    // baseRanked and policyInputs share identical, unique proxy_id sets.
+    const rankScore = computeRecommendationRankScore({
+      heuristic_score: shadow.heuristic_score,
+      model_score: shadow.model_score,
+      confidence: shadow.confidence,
+      available: r.available,
+      mode: rankingMode,
+      exploration_floor: explorationFloor,
+    });
+    return {
+      ...r,
+      ...shadow,
+      rank_score: rankScore,
+      ranking_mode: rankingMode,
+    };
+  });
+
   ranked.sort((a, b) => {
-    if (a.score !== b.score) return b.score - a.score;
+    if (a.rank_score !== b.rank_score) return b.rank_score - a.rank_score;
     if (a.latency_ema_ms !== b.latency_ema_ms) {
       return a.latency_ema_ms - b.latency_ema_ms;
     }
@@ -1482,10 +1551,45 @@ async function recommendProxies(env: Env, url: URL): Promise<Response> {
     ? ranked
     : ranked.filter((r) => r.available);
 
+  const policySummary = computeRecommendationPolicySummary(
+    ranked.map((row): RecommendationPolicySummaryInput => ({
+      proxy_id: row.proxy_id,
+      heuristic_score: row.heuristic_score,
+      model_score: row.model_score,
+      rank_score: row.rank_score,
+      confidence: row.confidence,
+      available: row.available,
+      reason_code: row.reason_code,
+    })),
+    rankingMode,
+  );
+
+  if (env.LEASE_ANALYTICS) {
+    try {
+      env.LEASE_ANALYTICS.writeDataPoint({
+        blobs: ["recommend_proxy", rankingMode, policySummary.rollout_gate],
+        doubles: [
+          policySummary.candidate_count,
+          policySummary.available_count,
+          policySummary.average_confidence,
+          policySummary.max_score_delta,
+          policySummary.disagreement_count,
+          policySummary.global_pool_unstable_count,
+        ],
+        indexes: ["recommend_proxy"],
+      });
+    } catch (err) {
+      console.warn("recommend_proxy analytics write failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   return jsonResponse({
     recommendations: filtered.slice(0, topN),
     queried_proxy_ids: proxyIds,
     server_time: Date.now(),
+    policy_summary: policySummary,
   });
 }
 
@@ -1500,6 +1604,20 @@ function clampNumber(
   if (n < min) return min;
   if (n > max) return max;
   return n;
+}
+
+function nullableEpochMs(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.floor(n);
+}
+
+function parseExplorationFloor(env: Env): number {
+  const raw = env.RECOMMEND_PROXY_EXPLORATION_FLOOR;
+  const n = raw === undefined || raw === "" ? 0.02 : Number(raw);
+  if (!Number.isFinite(n)) return 0.02;
+  return Math.min(0.2, Math.max(0, n));
 }
 
 /**

@@ -157,6 +157,14 @@ LONG_MAX = "30"
 EXTRA_WINDOW_SEC = "1800"
 EXTRA_MAX = "200"
 PENALTY_WINDOW_SEC = "300"
+# ADR-023 Phase 2 - recommendation ranking mode.
+# "shadow" (default): /recommend_proxy keeps existing heuristic ordering and
+# only returns policy fields for observability.
+# "policy": /recommend_proxy sorts by blended policy rank_score.
+RECOMMEND_PROXY_POLICY_MODE = "shadow"
+# Minimum rank score for available proxies in policy mode. Keeps a small
+# exploration floor so recovered proxies are not permanently starved.
+RECOMMEND_PROXY_EXPLORATION_FLOOR = "0.02"
 JITTER_MAX_MS = "500"
 # P1-A — default ban duration (3 days). Override per-deploy without
 # touching client code.  Clients may also pass `ttl_ms` per /report, in

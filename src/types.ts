@@ -115,6 +115,13 @@ export interface Env {
    *  ConfigState key (preferred — no redeploy). Default
    *  {@link DEFAULT_BAN_SPIKE_THRESHOLD}. */
   BAN_SPIKE_THRESHOLD?: string;
+  /** ADR-023 Phase 2 - recommendation ranking mode. Default "shadow" keeps
+   *  existing heuristic ordering. Set to "policy" to sort by the blended
+   *  ADR-023 rank score returned alongside each /recommend_proxy row. */
+  RECOMMEND_PROXY_POLICY_MODE?: string;
+  /** ADR-023 Phase 2 - minimum rank score for available proxies when policy
+   *  mode is enabled. Defaults to 0.02; capped at 0.2 server-side. */
+  RECOMMEND_PROXY_EXPLORATION_FLOOR?: string;
 }
 
 /** Default ban duration when the client doesn't pass `ttl_ms`. 3 days = 259_200_000 ms. */

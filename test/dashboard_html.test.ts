@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { renderDashboardHtml } from "../src/dashboard_html";
+import { renderDashboardHtml, renderPolicySummaryBadge } from "../src/dashboard_html";
 
 describe("Phase 3 dashboard HTML — visibility-aware polling", () => {
   const html = renderDashboardHtml(new URL("https://dash.test/dashboard"));
@@ -598,5 +598,44 @@ describe("Phase-3 — responsive CSS + chart sizing", () => {
     expect(html).toContain("chartWidthFor(panelId)");
     // The old hard-coded width: 360 in chartOptions is gone.
     expect(html).not.toMatch(/chartOptions\s*\(\s*[^)]*\)\s*{\s*return\s*{\s*width:\s*360/);
+  });
+});
+
+describe("renderPolicySummaryBadge", () => {
+  it("renders policy mode and rollout gate", () => {
+    const html = renderPolicySummaryBadge({
+      mode: "policy",
+      candidate_count: 4,
+      available_count: 3,
+      average_confidence: 0.75,
+      max_score_delta: 0.12,
+      disagreement_count: 1,
+      global_pool_unstable_count: 0,
+      rollout_gate: "ready",
+    });
+
+    expect(html).toContain("policy");
+    expect(html).toContain("ready");
+    expect(html).toContain("75%");
+    expect(html).toContain("1 disagreement");
+  });
+
+  it("renders empty string when no summary is available", () => {
+    expect(renderPolicySummaryBadge(null)).toBe("");
+  });
+
+  it("uses plural label when disagreement_count > 1", () => {
+    const html = renderPolicySummaryBadge({
+      mode: "shadow",
+      candidate_count: 5,
+      available_count: 4,
+      average_confidence: 0.5,
+      max_score_delta: 0.3,
+      disagreement_count: 3,
+      global_pool_unstable_count: 0,
+      rollout_gate: "observe",
+    });
+
+    expect(html).toContain("3 disagreements");
   });
 });
