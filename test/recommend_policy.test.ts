@@ -256,4 +256,16 @@ describe("recommend_policy summary diagnostics", () => {
 
     expect(summary.rollout_gate).toBe("ready");
   });
+
+  it("stays observe when all candidates are unavailable even if confidence and delta thresholds pass", () => {
+    // Regression guard for Fix 1: a pool where every proxy is banned/unavailable
+    // must not report ready — there are no usable candidates.
+    const summary = computeRecommendationPolicySummary([
+      summaryInput({ heuristic_score: 0.8, model_score: 0.82, confidence: 0.8, available: false }),
+      summaryInput({ heuristic_score: 0.7, model_score: 0.72, confidence: 0.9, available: false }),
+    ], "policy");
+
+    expect(summary.available_count).toBe(0);
+    expect(summary.rollout_gate).toBe("observe");
+  });
 });

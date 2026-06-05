@@ -1,5 +1,24 @@
 export const RECOMMEND_POLICY_MODEL_VERSION = "adr023-shadow-v1";
 
+// Tunable policy parameter: minimum sample count to consider a pool unstable.
+const UNSTABLE_POOL_MIN_SAMPLES = 6;
+// Tunable policy parameter: failure rate threshold above which pool is considered unstable.
+const UNSTABLE_POOL_FAILURE_THRESHOLD = 0.65;
+// Tunable policy parameter: weight applied to per-proxy failure rate relative to global baseline.
+const RELATIVE_FAILURE_PENALTY_WEIGHT = 0.45;
+// Tunable policy parameter: default latency (ms) assumed when no EMA is available.
+const LATENCY_BASELINE_MS = 500;
+// Tunable policy parameter: divisor (ms) used to scale latency into a [0,cap] penalty.
+const LATENCY_PENALTY_DIVISOR_MS = 10_000;
+// Tunable policy parameter: maximum latency penalty contribution.
+const LATENCY_PENALTY_CAP = 0.35;
+// Tunable policy parameter: score penalty for proxies under a ban cooldown.
+const BANNED_COOLDOWN_PENALTY = 0.45;
+// Tunable policy parameter: score penalty for proxies requiring CF bypass cooldown.
+const CF_BYPASS_COOLDOWN_PENALTY = 0.25;
+// Tunable policy parameter: prior sample count used in confidence Bayesian smoothing.
+const CONFIDENCE_PRIOR_SAMPLES = 20;
+
 export type RecommendReasonCode =
   | "low_confidence_prior"
   | "stable_recently"
@@ -65,7 +84,7 @@ export function computeGlobalRecommendationBaseline(
     success_count: success,
     failure_count: failure,
     failure_rate: failureRate,
-    unstable_pool: total >= 6 && failureRate >= 0.65,
+    unstable_pool: total >= UNSTABLE_POOL_MIN_SAMPLES && failureRate >= UNSTABLE_POOL_FAILURE_THRESHOLD,
   };
 }
 
@@ -78,16 +97,16 @@ export function computeRecommendationShadow(
   const count = sampleCount(input);
   const successRate = count > 0 ? Math.max(0, input.success_count) / count : 0.5;
   const failureRate = count > 0 ? Math.max(0, input.failure_count) / count : baseline.failure_rate;
-  const relativeFailurePenalty = Math.max(0, failureRate - baseline.failure_rate) * 0.45;
-  const latency = input.latency_ema_ms > 0 ? input.latency_ema_ms : 500;
-  const latencyPenalty = clamp((latency - 500) / 10_000, 0, 0.35);
-  const cooldownPenalty = input.banned ? 0.45 : input.requires_cf_bypass ? 0.25 : 0;
+  const relativeFailurePenalty = Math.max(0, failureRate - baseline.failure_rate) * RELATIVE_FAILURE_PENALTY_WEIGHT;
+  const latency = input.latency_ema_ms > 0 ? input.latency_ema_ms : LATENCY_BASELINE_MS;
+  const latencyPenalty = clamp((latency - LATENCY_BASELINE_MS) / LATENCY_PENALTY_DIVISOR_MS, 0, LATENCY_PENALTY_CAP);
+  const cooldownPenalty = input.banned ? BANNED_COOLDOWN_PENALTY : input.requires_cf_bypass ? CF_BYPASS_COOLDOWN_PENALTY : 0;
   const modelScore =
     count === 0
       ? clamp(0.5 - cooldownPenalty, 0, 1)
       : clamp(successRate - relativeFailurePenalty - latencyPenalty - cooldownPenalty, 0, 1);
 
-  let confidence = count / (count + 20);
+  let confidence = count / (count + CONFIDENCE_PRIOR_SAMPLES);
   if (baseline.unstable_pool) {
     confidence *= 0.5;
   }
@@ -207,6 +226,7 @@ export function computeRecommendationPolicySummary(
   } else if (
     mode === "policy" &&
     candidateCount > 0 &&
+    available.length > 0 &&
     averageConfidence >= 0.6 &&
     maxDelta < 0.2
   ) {

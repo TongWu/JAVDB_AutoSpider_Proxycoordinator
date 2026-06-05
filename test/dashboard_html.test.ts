@@ -623,4 +623,19 @@ describe("renderPolicySummaryBadge", () => {
   it("renders empty string when no summary is available", () => {
     expect(renderPolicySummaryBadge(null)).toBe("");
   });
+
+  it("uses plural label when disagreement_count > 1", () => {
+    const html = renderPolicySummaryBadge({
+      mode: "shadow",
+      candidate_count: 5,
+      available_count: 4,
+      average_confidence: 0.5,
+      max_score_delta: 0.3,
+      disagreement_count: 3,
+      global_pool_unstable_count: 0,
+      rollout_gate: "observe",
+    });
+
+    expect(html).toContain("3 disagreements");
+  });
 });

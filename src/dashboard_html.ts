@@ -94,6 +94,7 @@ ${commonDashboardStyles()}
   td .pill.warn { background: rgba(251, 191, 36, 0.12); color: var(--warn); }
   td .pill.bad { background: rgba(248, 113, 113, 0.12); color: var(--bad); }
   td .pill.muted { background: var(--input-bg); color: var(--muted); }
+  td .pill.info { background: rgba(56, 189, 248, 0.12); color: var(--accent); }
 
   .score-bar { display: inline-flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
   .score-bar .track { width: 80px; height: 4px; border-radius: 2px; background: var(--input-bg); overflow: hidden; }
