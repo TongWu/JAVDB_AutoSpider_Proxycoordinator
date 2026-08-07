@@ -1,0 +1,45 @@
+name: Tests
+
+# This Worker had no CI. Its 443 tests run in ~25s against real workerd
+# isolates via @cloudflare/vitest-pool-workers, but nothing ran them, and
+# `wrangler deploy` goes straight to the single production environment — so
+# a change to the ban logic reached live proxies unverified. That is how the
+# BFR-025 blind spot survived: ADR-043 D7 deferred site-wide handling, and
+# there was no gate to notice the gap.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Node
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
