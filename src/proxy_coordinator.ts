@@ -121,11 +121,30 @@ function loadBanTtlMs(env: Env): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_BAN_TTL_MS;
 }
 
+/**
+ * Values that disable a boolean env flag, matched after trimming and
+ * lower-casing. The previous `v !== "false" && v !== "0"` form only honoured
+ * those two exact spellings: an operator throwing a kill-switch under
+ * incident pressure who typed `"False"`, `"no"`, `"off"` or `" false "`
+ * believed auto-ban was disarmed while it was still armed. A kill-switch has
+ * to fail *safe*, so accept the whole family of falsey spellings.
+ */
+const FALSEY_ENV_VALUES: ReadonlySet<string> = new Set([
+  "false", "0", "no", "off", "n", "disabled",
+]);
+
+/** Normalise a boolean env var: unset / empty → *fallback*, any spelling in
+ *  {@link FALSEY_ENV_VALUES} → `false`, anything else → `true`. */
+function loadBooleanEnv(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw === null) return fallback;
+  const v = String(raw).trim().toLowerCase();
+  if (v === "") return fallback;
+  return !FALSEY_ENV_VALUES.has(v);
+}
+
 /** ADR-043 — read the CF auto-ban kill-switch. Defaults ON. */
 export function loadCfAutoBanEnabled(env: Env): boolean {
-  const v = env.CF_AUTO_BAN_ENABLED;
-  if (v === undefined || v === "") return DEFAULT_CF_AUTO_BAN_ENABLED;
-  return v !== "false" && v !== "0";
+  return loadBooleanEnv(env.CF_AUTO_BAN_ENABLED, DEFAULT_CF_AUTO_BAN_ENABLED);
 }
 
 /** ADR-043 — read the CF auto-ban event threshold. Defaults to 6. */
@@ -348,6 +367,10 @@ export class ProxyCoordinator implements DurableObject {
     // every subsequent lease for the duration of ``penaltyWindowSec``.
     const ALLOWED_KINDS: ReadonlySet<string> = new Set([
       "success", "failure", "cf", "ban", "unban", "cf_bypass",
+      // ADR-043 D7 — site-wide CF wall observed through this proxy. Gated
+      // here so the client's report isn't rejected as invalid; the DO
+      // deliberately records nothing for it (see the dispatch below).
+      "site_challenge",
     ]);
     if (rawKind !== undefined && rawKind !== null && !ALLOWED_KINDS.has(rawKind as string)) {
       return jsonResponse(
@@ -384,7 +407,14 @@ export class ProxyCoordinator implements DurableObject {
     // P1-A — ban / unban / cf_bypass are *out-of-band* kinds: they mutate the
     // ban / cf_bypass state but do NOT push into ``cfEvents`` (which would
     // double-count an already-throttled proxy through the penalty factor).
-    let kind: "cf" | "failure" | "ban" | "unban" | "cf_bypass" | "success" = "cf";
+    let kind:
+      | "cf"
+      | "failure"
+      | "ban"
+      | "unban"
+      | "cf_bypass"
+      | "success"
+      | "site_challenge" = "cf";
     if (rawKind === "ban") {
       kind = "ban";
       const ttl = Number.isFinite(body.ttl_ms as number) && (body.ttl_ms as number) > 0
@@ -453,13 +483,23 @@ export class ProxyCoordinator implements DurableObject {
       // penalty factor) and does NOT touch bannedUntil / cfBypass.
       kind = "success";
       state.successEvents.push(now);
+    } else if (rawKind === "site_challenge") {
+      // ADR-043 D7 — deliberately inert here. A site-wide wall is served to
+      // every egress IP, so attributing it to *this* proxy would be wrong:
+      // it must never touch ``cfEvents`` (penalty factor), the health
+      // counters, or ``cfAutoBanEvents`` / ``maybeCfAutoBan``. The report's
+      // only effect is the cross-proxy aggregation the Worker performs in
+      // RunnerRegistry before forwarding here (see
+      // ``resolveSiteChallengeTripped`` in src/index.ts); the DO records it
+      // purely for analytics.
+      kind = "site_challenge";
     } else {
       // Any unknown kind (including the historical default ``"cf"``) is treated
       // as a CF event for backward compatibility.
       kind = "cf";
       state.cfEvents.push(now);
       state.cfAutoBanEvents.push(now);
-      this.maybeCfAutoBan(state, now);
+      this.maybeCfAutoBan(state, now, body.site_challenge_tripped === true);
     }
 
     await this.persistState(state);
@@ -714,7 +754,24 @@ export class ProxyCoordinator implements DurableObject {
     return factor;
   }
 
-  private maybeCfAutoBan(state: CoordinatorState, now: number): void {
+  /**
+   * ADR-043 D2 — escalate a proxy that only ever sees CF challenges to a
+   * short ban.
+   *
+   * *siteChallengeTripped* is resolved by the Worker (which holds both the
+   * PROXY_DO and RUNNER_REGISTRY_DO bindings) and passed down in the report
+   * body; the DO never fetches the registry itself, which would put a
+   * cross-DO round trip on the report path. ADR-043 D7: while the global
+   * breaker is tripped the wall is being served to *every* egress IP, so
+   * every proxy would cross this threshold at once and ban the whole pool —
+   * banning individual proxies is the wrong remedy, so we skip.
+   */
+  private maybeCfAutoBan(
+    state: CoordinatorState,
+    now: number,
+    siteChallengeTripped: boolean,
+  ): void {
+    if (siteChallengeTripped) return;
     if (!loadCfAutoBanEnabled(this.env)) return;
     if (state.cfAutoBanEvents.length < loadCfAutoBanThreshold(this.env)) return;
     if (state.successEvents.length !== 0) return;

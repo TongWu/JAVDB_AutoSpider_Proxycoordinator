@@ -75,6 +75,7 @@ Runner N ─┘   (auth +           │
                                 ├──> RunnerRegistry (singleton)
                                 │     /register + /heartbeat + /unregister
                                 │     /signal + /signals               (W5.4)
+                                │     site-challenge breaker      (ADR-043 D7)
                                 │
                                 ├──> ConfigState (singleton)            (W5.3)
                                 │     /config (GET, PATCH)
@@ -102,7 +103,7 @@ rotating one cannot disrupt the others.
 | `src/proxy_coordinator.ts` | `ProxyCoordinator` per-proxy DO: `next_available_at` + 3 windows + CF events |
 | `src/global_login_state.ts` | `GlobalLoginState` singleton DO: cookie (AES-GCM at rest), version, lease mutex |
 | `src/movie_claim_state.ts` | `MovieClaimState` per-day DO: cross-runner detail-page mutex (P1-B), failure cooldown (P2-A), staged-commit (Phase-1) |
-| `src/runner_registry.ts` | `RunnerRegistry` singleton DO: live runner list + drift detection + W5.4 operator signals |
+| `src/runner_registry.ts` | `RunnerRegistry` singleton DO: live runner list + drift detection + W5.4 operator signals + ADR-043 D7 site-challenge breaker |
 | `src/config_state.ts` | `ConfigState` singleton DO (W5.3): versioned snapshot of operator-tunable runtime config |
 | `src/work_distributor.ts` | `WorkDistributor` singleton DO (W5.2): dedup'd FIFO queue with visibility leases |
 | `src/types.ts` | Env / payload / response type definitions for every DO |
@@ -116,8 +117,9 @@ rotating one cannot disrupt the others.
 | `test/dashboard.test.ts` | Vitest suite (17 tests, W5.1) — login flow + cookie auth + /ops/snapshot aggregation |
 | `test/recommend_proxy.test.ts` | Vitest suite (11 tests, W5.5) — cross-DO health ranking + filters |
 | `test/work_distributor.test.ts` | Vitest suite (16 tests, W5.2) — enqueue / pull / complete / release / stats |
+| `test/site_challenge.test.ts` | Vitest suite (22 tests, ADR-043 D7) — breaker trip / suppression / expiry / one-alert-per-trip |
 
-Total: **260 tests** across 10 files.
+Total: **282 tests** across 11 files.
 
 ## Auth
 
@@ -303,6 +305,44 @@ W5.3 config snapshot and W5.4 active signals.
 | `POST /heartbeat` | `{holder_id}` | Refresh `last_heartbeat`. Returns `alive=false` (not 404) for evicted holders so the client can re-register without treating it as fatal. Same `config` / `active_signals` embedding as `/register`. |
 | `POST /unregister` | `{holder_id}` | atexit cleanup. Idempotent — unknown holder returns `unregistered=false`. |
 | `GET /active_runners` | — | Read-only snapshot for ops dashboards. Does not refresh any heartbeat. |
+
+## Site-wide challenge breaker (ADR-043 D7)
+
+When JavDB turns on a site-wide Cloudflare managed challenge, the wall is
+served to **every egress IP**. Every proxy fails identically, so without a
+cross-proxy view each `ProxyCoordinator` DO crosses `CF_AUTO_BAN_THRESHOLD`
+with zero successes and bans itself for `CF_BAN_TTL_MS` — the entire pool
+goes down over a fault no proxy has. Banning individual proxies is the
+wrong remedy for a wall that applies to all of them.
+
+The breaker aggregates the signal where the cross-proxy view exists (the
+singleton `RunnerRegistry`), and suppresses the escalation rather than the
+report:
+
+| Piece | Behaviour |
+|---|---|
+| `POST /report` with `kind: "site_challenge"` | Records **one observation per proxy** (repeat reports from the same proxy still count once). Deliberately touches none of the per-proxy counters: not `cfEvents` (penalty factor), not `cfAutoBanEvents`, not the health success/failure counts. It is not a proxy-quality signal. |
+| Trip condition | Distinct proxies reporting within `SITE_CHALLENGE_WINDOW_SEC` reaches the threshold. |
+| Threshold | `max(SITE_CHALLENGE_MIN_PROXIES_FLOOR, ceil(roster × SITE_CHALLENGE_MIN_FRACTION))`, where `roster` is the `proxies_seen` count runners upload on register. Set `SITE_CHALLENGE_MIN_PROXIES` to pin an absolute count instead. |
+| While tripped | Per-proxy CF auto-ban is suppressed. Everything else is unchanged: CF events still accumulate, penalty factors still climb, explicit `kind: "ban"` reports and operator bans still apply. |
+| Auto-clear | `SITE_CHALLENGE_TTL_MS` after the **last** observation — the wall lifting is observable as reports simply stopping. |
+| Alerting | One `site_challenge` alert per trip and one on recovery (`details.state` = `"tripped"` / `"cleared"`), **not** one per proxy. The per-proxy `ban_spike` alert would have fired up to 28 times during the incident while never saying "the pool is down". |
+| Visibility | `GET /ops/snapshot` → `site_challenge: {tripped, tripped_at, distinct_proxies, threshold, roster_size, window_sec, ttl_ms, last_observation_ms}`. A tripped breaker also defeats MetricsState idle suppression, so the outage stays in `/metrics/range` history even after every runner has exited. |
+
+Defaults (all overridable in `wrangler.toml [vars]`):
+
+| Var | Default | Rationale |
+|---|---|---|
+| `SITE_CHALLENGE_WINDOW_SEC` | `300` | Mirrors `PENALTY_WINDOW_SEC` so the breaker sees the same horizon the CF auto-ban counter does. |
+| `SITE_CHALLENGE_MIN_FRACTION` | `0.5` | "A majority of the pool is walled" — more than any single bad egress IP explains, yet trips long before every proxy accumulates the 6 CF events it needs to self-ban. |
+| `SITE_CHALLENGE_MIN_PROXIES_FLOOR` | `3` | Below 3 distinct proxies there is no quorum to tell "site-wide wall" from "two unlucky IPs"; per-proxy auto-ban stays the right remedy. Also applies when the roster is still unknown. |
+| `SITE_CHALLENGE_TTL_MS` | `900000` (15 min) | 3× the window, so the breaker doesn't flap while the wall is up but the spider has backed off and reports have gone sparse. **Keep this larger than the window** — a TTL below the window lets the latch expire while a quorum is still inside it. |
+
+**Kill-switch note:** `CF_AUTO_BAN_ENABLED` disables per-proxy CF auto-ban
+outright. Any falsey spelling works after trimming and lower-casing
+(`false`, `0`, `no`, `off`, `n`, `disabled`); anything else — including
+`true` / `1` / `yes` — leaves it enabled, and unset / empty falls back to
+the default (enabled).
 
 ## Dynamic config (W5.3)
 

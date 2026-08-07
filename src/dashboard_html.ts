@@ -793,6 +793,7 @@ ${commonDashboardStyles()}
         : a.kind === 'ban_spike' ? T('BAN SPIKE')
         : a.kind === 'login_cooldown' ? T('LOGIN COOLDOWN')
         : a.kind === 'manual_test' ? T('TEST')
+        : a.kind === 'site_challenge' ? T('SITE CHALLENGE')
         : String(a.kind || '').toUpperCase();
       html += '<div class="banner" style="margin-bottom:10px">'
         + '<strong>[' + esc(kindLabel) + ']</strong> ' + esc(a.summary || '')

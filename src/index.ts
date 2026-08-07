@@ -175,6 +175,11 @@ const DELETE_ALLOWED_PATHS = new Set<string>([
  * - `POST /lease`   — body `{ proxy_id, intended_sleep_ms }` → grant pacing slot.
  * - `POST /report`  — body `{ proxy_id, kind, ttl_ms?, reason? }` → record
  *                     CF/failure event OR mutate ban / cf_bypass state (P1-A).
+ *                     `kind: "site_challenge"` (ADR-043 D7) records nothing
+ *                     per-proxy; it feeds the cross-proxy breaker held in
+ *                     RunnerRegistry, whose state the Worker resolves here
+ *                     and passes down so a walled pool doesn't auto-ban
+ *                     itself proxy by proxy.
  * - `GET  /state?proxy_id=...` — debug snapshot.
  *
  * Cross-runtime login state (GlobalLoginState DO, addressed by `idFromName("global")`):
@@ -285,7 +290,18 @@ export default {
           const body = (await request.json()) as ReportRequest;
           const proxyId = normalizeProxyId(body?.proxy_id);
           if (!proxyId) return jsonResponse({ error: "missing proxy_id" }, 400);
-          return await forwardToProxyDo(env, proxyId, "/do/report", body);
+          // ADR-043 D7 — resolve the global breaker HERE, in the Worker,
+          // which already holds both bindings. Doing it inside the per-proxy
+          // DO would put a cross-DO round trip on the report path.
+          const siteChallengeTripped = await resolveSiteChallengeTripped(
+            env,
+            proxyId,
+            body?.kind,
+          );
+          return await forwardToProxyDo(env, proxyId, "/do/report", {
+            ...body,
+            site_challenge_tripped: siteChallengeTripped,
+          });
         }
         case "/state": {
           const proxyId = normalizeProxyId(url.searchParams.get("proxy_id"));
@@ -887,6 +903,61 @@ function normalizeProxyId(raw: unknown): string {
   return trimmed;
 }
 
+/**
+ * ADR-043 D7 — resolve the global site-challenge breaker for one `/report`.
+ *
+ * Two kinds need the RunnerRegistry singleton, and only those two pay the
+ * round trip:
+ *
+ * - `site_challenge` records one observation for this proxy (the breaker's
+ *   only input) and returns the post-observation state;
+ * - `cf` (including the legacy "kind omitted / unrecognised" spelling, which
+ *   the DO still treats as CF) reads the state, because CF is the only kind
+ *   whose handling the breaker changes.
+ *
+ * `success` / `failure` / `ban` / `unban` / `cf_bypass` and every `/lease`
+ * skip it entirely, keeping the hot path free of extra DO hops.
+ *
+ * Fail-open: a missing binding, non-200, or thrown error resolves to `false`
+ * (= not tripped), which preserves the pre-ADR-043-D7 behaviour rather than
+ * silently disarming CF auto-ban on an unrelated registry fault.
+ */
+async function resolveSiteChallengeTripped(
+  env: Env,
+  proxyId: string,
+  kind: ReportRequest["kind"] | undefined,
+): Promise<boolean> {
+  if (!env.RUNNER_REGISTRY_DO) return false;
+  const isObservation = kind === "site_challenge";
+  const isCf = kind === undefined || kind === null || kind === "cf";
+  if (!isObservation && !isCf) return false;
+  try {
+    const id = env.RUNNER_REGISTRY_DO.idFromName("runners");
+    const stub = env.RUNNER_REGISTRY_DO.get(id);
+    const r = isObservation
+      ? await stub.fetch("https://do/do/site_challenge", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ proxy_id: proxyId }),
+        })
+      : await stub.fetch("https://do/do/site_challenge", { method: "GET" });
+    if (r.status !== 200) {
+      // Drain the body — mirrors the forwardTo*Do helpers, see their comment
+      // about vitest-pool-workers isolated storage stack frames.
+      await r.text();
+      return false;
+    }
+    const data = (await r.json()) as { tripped?: boolean };
+    return data?.tripped === true;
+  } catch (err) {
+    console.warn("site_challenge breaker lookup failed", {
+      proxy_id: proxyId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
 async function forwardToProxyDo(
   env: Env,
   proxyId: string,
@@ -1242,6 +1313,7 @@ async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
     alerts,
     movieClaimStats,
     workStats,
+    siteChallenge,
   ] = await Promise.all([
     snapshotFromRegistry(env, "/do/active_runners"),
     snapshotFromRegistry(env, "/do/signals"),
@@ -1253,6 +1325,11 @@ async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
     // Phase-3 ADR-008 — MovieClaim + WorkDistributor stats.
     snapshotMovieClaimStats(env),
     snapshotWorkStats(env),
+    // ADR-043 D7 — global site-challenge breaker. This read is also the
+    // recovery tick: the cron fires /ops/snapshot every minute, so a breaker
+    // clears (and alerts) even after every runner has exited and the
+    // registry's own GC alarm has stopped re-arming.
+    snapshotFromRegistry(env, "/do/site_challenge"),
   ]);
 
   return jsonResponse({
@@ -1265,6 +1342,7 @@ async function aggregateOpsSnapshot(env: Env, url: URL): Promise<Response> {
     alerts,
     movie_claim_stats: movieClaimStats,
     work_stats: workStats,
+    site_challenge: siteChallenge,
     // Echo back so the SPA can rebuild the query for refresh links.
     queried_proxy_ids: proxyIds,
   });

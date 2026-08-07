@@ -104,6 +104,7 @@ export function parseWebhooksJson(raw: string): AlertWebhook[] {
     "ban_spike",
     "login_cooldown",
     "manual_test",
+    "site_challenge",
   ]);
   for (const entry of parsed) {
     if (!entry || typeof entry !== "object") continue;

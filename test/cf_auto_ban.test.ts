@@ -69,12 +69,33 @@ describe("CF auto-ban env loaders", () => {
     expect(loadCfBanTtlMs(asEnv({ CF_BAN_TTL_MS: "" }))).toBe(21_600_000);
   });
 
-  it("only exact false and 0 disable auto-ban", () => {
-    expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: "false" }))).toBe(false);
-    expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: "0" }))).toBe(false);
-    expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: "true" }))).toBe(true);
-    expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: "False" }))).toBe(true);
-    expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: "no" }))).toBe(true);
+  // Previously "only exact false and 0 disable auto-ban" — that asserted the
+  // bug: an operator throwing the kill-switch under incident pressure who
+  // typed "False", "no", "off" or " false " believed auto-ban was disarmed
+  // while it stayed armed. A kill-switch has to fail safe.
+  it("disables auto-ban for any falsey spelling, case- and space-insensitive", () => {
+    for (const falsey of [
+      "false", "False", "FALSE", " false ", "\tFalse\n",
+      "0", " 0 ",
+      "no", "No", "NO",
+      "off", "Off", "OFF",
+      "n", "N",
+      "disabled", "Disabled",
+    ]) {
+      expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: falsey }))).toBe(false);
+    }
+  });
+
+  it("keeps auto-ban enabled for truthy and unrelated values", () => {
+    for (const truthy of [
+      "true", "True", " true ", "1", "yes", "on", "enabled", "banana",
+    ]) {
+      expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: truthy }))).toBe(true);
+    }
+    // Unset / empty / whitespace-only all fall back to the ADR-043 default.
+    expect(loadCfAutoBanEnabled(asEnv({}))).toBe(true);
+    expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: "" }))).toBe(true);
+    expect(loadCfAutoBanEnabled(asEnv({ CF_AUTO_BAN_ENABLED: "   " }))).toBe(true);
   });
 
   it("accepts positive numeric overrides and floors threshold", () => {

@@ -306,7 +306,7 @@ describe("payload validation", () => {
     };
     expect(body.error).toBe("invalid_kind");
     expect(body.allowed_kinds).toEqual(
-      ["ban", "cf", "cf_bypass", "failure", "success", "unban"],
+      ["ban", "cf", "cf_bypass", "failure", "site_challenge", "success", "unban"],
     );
   });
 });

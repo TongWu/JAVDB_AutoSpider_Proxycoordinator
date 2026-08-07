@@ -177,6 +177,38 @@ CF_AUTO_BAN_THRESHOLD = "6"
 CF_BAN_TTL_MS = "21600000"   # 6 hours
 # ADR-043 D9 — explicit JavDB IP-ban TTL (hard ban window + 1 day margin).
 HARD_BAN_TTL_MS = "691200000"   # 8 days
+# ADR-043 D7 — global site-challenge breaker.
+#
+# When JavDB turns on a site-wide Cloudflare managed challenge, the wall is
+# served to EVERY egress IP: all proxies fail identically, each
+# ProxyCoordinator DO crosses CF_AUTO_BAN_THRESHOLD with zero successes, and
+# the whole pool bans itself for CF_BAN_TTL_MS. No proxy is at fault, so
+# banning individual proxies is the wrong remedy. Clients report
+# `kind: "site_challenge"`; RunnerRegistry counts DISTINCT reporting proxies
+# and suppresses per-proxy CF auto-ban once enough of the pool has reported.
+#
+# Rolling window over which distinct reporting proxies are counted. 300 s
+# mirrors PENALTY_WINDOW_SEC so the breaker sees the same horizon the CF
+# auto-ban counter does.
+SITE_CHALLENGE_WINDOW_SEC = "300"
+# Threshold = max(SITE_CHALLENGE_MIN_PROXIES_FLOOR,
+#                 ceil(roster * SITE_CHALLENGE_MIN_FRACTION))
+# where `roster` is the proxies_seen count uploaded by runners. Scaling with
+# the pool keeps one deploy sensible on a 4-proxy and a 28-proxy pool; the
+# floor stops a tiny pool tripping on one or two reports (and applies when
+# the roster is still unknown). 0.5 = "a majority of the pool is walled",
+# which no single bad egress IP can explain, yet trips long before every
+# proxy has accumulated the 6 CF events it needs to auto-ban itself.
+SITE_CHALLENGE_MIN_FRACTION = "0.5"
+SITE_CHALLENGE_MIN_PROXIES_FLOOR = "3"
+# Set SITE_CHALLENGE_MIN_PROXIES to pin an absolute distinct-proxy count and
+# bypass the fraction/floor derivation entirely (left unset by default).
+# SITE_CHALLENGE_MIN_PROXIES = "14"
+# How long the tripped state survives after the LAST site_challenge report.
+# The wall lifting is observable as reports simply stopping. 15 min = 3x the
+# window so the breaker doesn't flap while the wall is up but the spider has
+# backed off and reports have gone sparse.
+SITE_CHALLENGE_TTL_MS = "900000"   # 15 minutes
 # P1-B — default per-claim TTL for MovieClaimState (30 min).  Sized to
 # cover detail-page fetch + parser + qB add for a slow proxy without
 # locking the slot if the runner crashes (DO Alarm GC sweeps stale

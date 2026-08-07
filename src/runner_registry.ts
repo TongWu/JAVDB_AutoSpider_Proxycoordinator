@@ -6,6 +6,10 @@ import {
   ALERT_SUMMARY_MAX_LEN,
   DEFAULT_MOVIE_CLAIM_MIN_RUNNERS,
   DEFAULT_RUNNER_STALE_TTL_MS,
+  DEFAULT_SITE_CHALLENGE_MIN_FRACTION,
+  DEFAULT_SITE_CHALLENGE_MIN_PROXIES_FLOOR,
+  DEFAULT_SITE_CHALLENGE_TTL_MS,
+  DEFAULT_SITE_CHALLENGE_WINDOW_SEC,
   Env,
   HeartbeatRequest,
   HeartbeatResponse,
@@ -24,6 +28,7 @@ import {
   SessionsResponse,
   Signal,
   SignalsResponse,
+  SiteChallengeStatus,
   UnregisterRunnerRequest,
   UnregisterRunnerResponse,
 } from "./types";
@@ -195,6 +200,31 @@ export class RunnerRegistry implements DurableObject {
        ON alert_history(kind, ts);`,
     );
 
+    // ADR-043 D7 — site_challenge_events: one row per proxy holding its most
+    // recent `site_challenge` observation. Keying on proxy_id (rather than
+    // appending a log) makes "distinct proxies within the window" a single
+    // COUNT and bounds the table by pool size instead of report volume.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS site_challenge_events (
+        proxy_id TEXT PRIMARY KEY,
+        last_ts INTEGER NOT NULL
+      );
+    `);
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_site_challenge_events_ts
+       ON site_challenge_events(last_ts);`,
+    );
+    // ADR-043 D7 — singleton latch row (id = 1). `tripped_at` is both the
+    // "are we tripped" flag (0 = clear) and the stable suffix of the alert id,
+    // which is what makes the alert fire once per *trip* rather than once per
+    // report.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS site_challenge_state (
+        id INTEGER PRIMARY KEY,
+        tripped_at INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+
     // Phase 2 follow-up — unconditionally arm the alarm in the constructor
     // so retention sweeps run even when no register/signal traffic ever
     // arrives. Matches the pattern in ConfigState/GlobalLoginState/MetricsState.
@@ -256,6 +286,17 @@ export class RunnerRegistry implements DurableObject {
         case "/do/alerts/ack":
           if (request.method === "POST") {
             return await this.handleAckAlert(request);
+          }
+          return new Response("Method Not Allowed", { status: 405 });
+        // ADR-043 D7 — global site-challenge breaker. POST records one
+        // observation for `proxy_id` and re-evaluates; GET evaluates without
+        // observing (used by the CF report path and by /ops/snapshot).
+        case "/do/site_challenge":
+          if (request.method === "POST") {
+            return await this.handleSiteChallengeReport(request);
+          }
+          if (request.method === "GET") {
+            return jsonResponse(await this.evaluateSiteChallenge(Date.now()));
           }
           return new Response("Method Not Allowed", { status: 405 });
         default:
@@ -327,11 +368,24 @@ export class RunnerRegistry implements DurableObject {
     // Phase-1 ADR-008 — prune alert_history past retention horizon.
     const alertCutoff = now2 - ALERT_HISTORY_RETENTION_MS;
     this.sql.exec(`DELETE FROM alert_history WHERE ts <= ?`, alertCutoff);
-    // Re-arm when EITHER runners or signals remain — both are
-    // time-bounded state worth GC'ing.
+    // ADR-043 D7 — drop observations too old to affect either the rolling
+    // window or the post-observation TTL, then re-evaluate so a breaker whose
+    // wall lifted clears (and emits its recovery alert) even if no report
+    // ever arrives again.
+    const scHorizon =
+      loadSiteChallengeWindowSec(this.env) * 1000 +
+      loadSiteChallengeTtlMs(this.env);
+    this.sql.exec(
+      `DELETE FROM site_challenge_events WHERE last_ts <= ?`,
+      now2 - scHorizon,
+    );
+    const siteChallenge = await this.evaluateSiteChallenge(now2);
+    // Re-arm when runners, signals OR a tripped breaker remain — all three
+    // are time-bounded state worth GC'ing.
     if (
       Object.keys(data.runners).length > 0 ||
-      (data.signals ?? []).length > 0
+      (data.signals ?? []).length > 0 ||
+      siteChallenge.tripped
     ) {
       await this.scheduleAlarm();
     } else {
@@ -1016,6 +1070,187 @@ export class RunnerRegistry implements DurableObject {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // ADR-043 D7 — global site-challenge breaker
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Handle `POST /do/site_challenge` — body `{ proxy_id }`. Records one
+   *  observation for that proxy (upsert, so a proxy reporting 50 times still
+   *  counts once) and returns the post-observation breaker state. */
+  private async handleSiteChallengeReport(request: Request): Promise<Response> {
+    const body = (await request.json()) as { proxy_id?: unknown };
+    const proxyId = clipString(
+      typeof body?.proxy_id === "string" ? body.proxy_id : "",
+    );
+    if (!proxyId) {
+      return jsonResponse({ error: "missing proxy_id" }, 400);
+    }
+    const now = Date.now();
+    this.sql.exec(
+      `INSERT INTO site_challenge_events (proxy_id, last_ts)
+       VALUES (?, ?)
+       ON CONFLICT(proxy_id) DO UPDATE SET last_ts = excluded.last_ts`,
+      proxyId,
+      now,
+    );
+    const status = await this.evaluateSiteChallenge(now);
+    // A tripped breaker keeps the GC alarm armed so the recovery transition
+    // is detected even after every runner has exited.
+    if (status.tripped) await this.scheduleAlarm();
+    return jsonResponse(status);
+  }
+
+  /**
+   * Derive the current breaker state, applying (and persisting) any trip /
+   * recovery transition and emitting exactly one alert per transition.
+   *
+   * Called from the report path, from `GET /do/site_challenge`
+   * (`/ops/snapshot` and the per-report CF check) and from the GC alarm, so
+   * recovery is observed on whichever of those ticks comes first.
+   */
+  private async evaluateSiteChallenge(now: number): Promise<SiteChallengeStatus> {
+    const windowSec = loadSiteChallengeWindowSec(this.env);
+    const ttlMs = loadSiteChallengeTtlMs(this.env);
+    const rosterSize = this.countProxiesSeen();
+    const threshold = resolveSiteChallengeMinProxies(this.env, rosterSize);
+    const distinct = this.countDistinctSiteChallengeProxies(now - windowSec * 1000);
+    const lastObservation = this.lastSiteChallengeObservation();
+    const prevTrippedAt = this.readSiteChallengeTrippedAt();
+
+    const decision = resolveSiteChallengeTrip({
+      now,
+      prevTrippedAt,
+      lastObservationMs: lastObservation,
+      distinctProxies: distinct,
+      threshold,
+      ttlMs,
+    });
+
+    const status: SiteChallengeStatus = {
+      tripped: decision.trippedAt > 0,
+      tripped_at: decision.trippedAt,
+      distinct_proxies: distinct,
+      threshold,
+      roster_size: rosterSize,
+      window_sec: windowSec,
+      ttl_ms: ttlMs,
+      last_observation_ms: lastObservation,
+      server_time: now,
+    };
+
+    if (decision.transition !== null) {
+      this.writeSiteChallengeTrippedAt(decision.trippedAt);
+      await this.emitSiteChallengeAlert(
+        decision.transition,
+        // Both alerts key off the *trip* timestamp so the recovery pairs with
+        // the trip it closes; on recovery `decision.trippedAt` is already 0.
+        decision.transition === "tripped" ? decision.trippedAt : prevTrippedAt,
+        status,
+      );
+    }
+    return status;
+  }
+
+  /** Emit the one alert for a breaker transition. Deterministic ids
+   *  (`sitechal-<trippedAt>` / `sitechal-clear-<trippedAt>`) make
+   *  `recordAlert`'s `INSERT OR IGNORE` the de-duplicator, so a long outage
+   *  produces one alert rather than one per report. */
+  private async emitSiteChallengeAlert(
+    transition: "tripped" | "cleared",
+    trippedAt: number,
+    status: SiteChallengeStatus,
+  ): Promise<void> {
+    const summary =
+      transition === "tripped"
+        ? `Site-wide challenge breaker TRIPPED: ${status.distinct_proxies} distinct ` +
+          `proxies (roster ${status.roster_size}, threshold ${status.threshold}) reported a ` +
+          `site challenge within ${status.window_sec}s. Per-proxy CF auto-ban is suppressed ` +
+          `until ${Math.round(status.ttl_ms / 60_000)} min after the last report.`
+        : `Site-wide challenge breaker CLEARED after ` +
+          `${Math.max(0, Math.round((status.server_time - trippedAt) / 60_000))} min. No site ` +
+          `challenge reported for ${Math.round(status.ttl_ms / 60_000)} min; per-proxy CF ` +
+          `auto-ban is re-armed.`;
+    const alert: AlertEvent = {
+      id:
+        transition === "tripped"
+          ? `sitechal-${trippedAt}`
+          : `sitechal-clear-${trippedAt}`,
+      kind: "site_challenge",
+      ts: status.server_time,
+      severity: "warning",
+      summary: summary.slice(0, ALERT_SUMMARY_MAX_LEN),
+      details: {
+        state: transition,
+        tripped_at: trippedAt,
+        distinct_proxies: status.distinct_proxies,
+        roster_size: status.roster_size,
+        threshold: status.threshold,
+        window_sec: status.window_sec,
+        ttl_ms: status.ttl_ms,
+        last_observation_ms: status.last_observation_ms,
+      },
+    };
+    // In-registry alert: write straight to our own `alert_history` and
+    // dispatch, exactly like `maybeEmitSessionFailedAlert`. Going through
+    // `recordAndDispatch` would make this DO stub-fetch *itself*.
+    recordAlert(this.sql, alert);
+    try {
+      await dispatchAlert(this.env, alert);
+    } catch (err) {
+      console.warn("site_challenge alert dispatch error", {
+        state: transition,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** Size of the known proxy roster, used to derive the trip threshold as a
+   *  fraction of the pool. `0` when no runner has uploaded a `proxy_pool`. */
+  private countProxiesSeen(): number {
+    const rows = Array.from(
+      this.sql.exec<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM proxies_seen`,
+      ),
+    );
+    return rows[0]?.count ?? 0;
+  }
+
+  private countDistinctSiteChallengeProxies(cutoff: number): number {
+    const rows = Array.from(
+      this.sql.exec<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM site_challenge_events WHERE last_ts >= ?`,
+        cutoff,
+      ),
+    );
+    return rows[0]?.count ?? 0;
+  }
+
+  private lastSiteChallengeObservation(): number {
+    const rows = Array.from(
+      this.sql.exec<{ last_ts: number | null }>(
+        `SELECT MAX(last_ts) AS last_ts FROM site_challenge_events`,
+      ),
+    );
+    return rows[0]?.last_ts ?? 0;
+  }
+
+  private readSiteChallengeTrippedAt(): number {
+    const rows = Array.from(
+      this.sql.exec<{ tripped_at: number }>(
+        `SELECT tripped_at FROM site_challenge_state WHERE id = 1`,
+      ),
+    );
+    return rows[0]?.tripped_at ?? 0;
+  }
+
+  private writeSiteChallengeTrippedAt(trippedAt: number): void {
+    this.sql.exec(
+      `INSERT INTO site_challenge_state (id, tripped_at) VALUES (1, ?)
+       ON CONFLICT(id) DO UPDATE SET tripped_at = excluded.tripped_at`,
+      trippedAt,
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Storage helpers
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -1076,6 +1311,127 @@ function loadMovieClaimMinRunners(env: Env): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 1) return DEFAULT_MOVIE_CLAIM_MIN_RUNNERS;
   return Math.floor(n);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-043 D7 — site-challenge breaker loaders + trip decision
+//
+// Same loader shape as `loadCfAutoBanThreshold` in proxy_coordinator.ts:
+// unset / empty / garbage all fall back to the code default rather than
+// letting a typo silently disable the breaker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Rolling window (seconds) for counting distinct reporting proxies. */
+export function loadSiteChallengeWindowSec(env: Env): number {
+  const raw = env.SITE_CHALLENGE_WINDOW_SEC;
+  if (raw === undefined || raw === "") return DEFAULT_SITE_CHALLENGE_WINDOW_SEC;
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SITE_CHALLENGE_WINDOW_SEC;
+}
+
+/** How long the tripped state survives after the last observation (ms). */
+export function loadSiteChallengeTtlMs(env: Env): number {
+  const raw = env.SITE_CHALLENGE_TTL_MS;
+  if (raw === undefined || raw === "") return DEFAULT_SITE_CHALLENGE_TTL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_SITE_CHALLENGE_TTL_MS;
+}
+
+/** Fraction of the roster required to trip, clamped to (0, 1]. */
+export function loadSiteChallengeMinFraction(env: Env): number {
+  const raw = env.SITE_CHALLENGE_MIN_FRACTION;
+  if (raw === undefined || raw === "") return DEFAULT_SITE_CHALLENGE_MIN_FRACTION;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || n > 1) {
+    return DEFAULT_SITE_CHALLENGE_MIN_FRACTION;
+  }
+  return n;
+}
+
+/** Absolute floor for the derived threshold. */
+export function loadSiteChallengeMinProxiesFloor(env: Env): number {
+  const raw = env.SITE_CHALLENGE_MIN_PROXIES_FLOOR;
+  if (raw === undefined || raw === "") {
+    return DEFAULT_SITE_CHALLENGE_MIN_PROXIES_FLOOR;
+  }
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SITE_CHALLENGE_MIN_PROXIES_FLOOR;
+}
+
+/**
+ * Resolve the distinct-proxy count that trips the breaker.
+ *
+ * `SITE_CHALLENGE_MIN_PROXIES` is an absolute override for operators who
+ * know their pool. Otherwise the threshold scales with the known roster
+ * (`proxies_seen`) so the same deploy behaves sensibly on a 4-proxy and a
+ * 28-proxy pool, floored so a tiny pool can't trip on one or two reports.
+ * An unknown roster (0) collapses to the floor.
+ */
+export function resolveSiteChallengeMinProxies(
+  env: Env,
+  rosterSize: number,
+): number {
+  const override = env.SITE_CHALLENGE_MIN_PROXIES;
+  if (override !== undefined && override !== "") {
+    const n = Math.floor(Number(override));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const floor = loadSiteChallengeMinProxiesFloor(env);
+  const scaled = Math.ceil(
+    Math.max(0, rosterSize) * loadSiteChallengeMinFraction(env),
+  );
+  return Math.max(floor, scaled);
+}
+
+export interface SiteChallengeTripInput {
+  now: number;
+  /** Persisted latch: ms epoch of the current trip, `0` when clear. */
+  prevTrippedAt: number;
+  /** ms epoch of the newest observation across all proxies, `0` when none. */
+  lastObservationMs: number;
+  /** Distinct proxies that reported inside the rolling window. */
+  distinctProxies: number;
+  threshold: number;
+  ttlMs: number;
+}
+
+export interface SiteChallengeTripDecision {
+  /** New latch value: `0` = clear, otherwise the ms epoch of the trip. */
+  trippedAt: number;
+  /** Set only on a state change, which is what gates alert emission. */
+  transition: "tripped" | "cleared" | null;
+}
+
+/**
+ * Pure trip / recovery decision, extracted so the latch semantics can be
+ * unit-tested at arbitrary timestamps without waiting on wall-clock TTLs.
+ *
+ * Recovery is checked before the trip check so a deployment configured with
+ * `ttlMs < window` (an expiring latch while reports are still inside the
+ * window) settles on "tripped" in one pass instead of oscillating.
+ */
+export function resolveSiteChallengeTrip(
+  input: SiteChallengeTripInput,
+): SiteChallengeTripDecision {
+  const { now, prevTrippedAt, lastObservationMs, distinctProxies, threshold, ttlMs } =
+    input;
+  let trippedAt = prevTrippedAt;
+  let transition: "tripped" | "cleared" | null = null;
+
+  // Auto-clear: the wall lifting is observable as reports simply stopping,
+  // so the latch expires `ttlMs` after the most recent observation.
+  if (
+    trippedAt > 0 &&
+    (lastObservationMs <= 0 || now - lastObservationMs > ttlMs)
+  ) {
+    trippedAt = 0;
+    transition = "cleared";
+  }
+  if (trippedAt === 0 && threshold > 0 && distinctProxies >= threshold) {
+    trippedAt = now;
+    transition = "tripped";
+  }
+  return { trippedAt, transition };
 }
 
 /** Defensive read-time prune.  Keeps the response payload compact even

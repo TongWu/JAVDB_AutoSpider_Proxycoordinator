@@ -63,6 +63,30 @@ export interface Env {
   CF_BAN_TTL_MS?: string;
   /** ADR-043 — JavDB explicit IP-ban TTL in ms. Defaults to 8 days. */
   HARD_BAN_TTL_MS?: string;
+  /** ADR-043 D7 — rolling window (seconds) over which distinct proxies
+   *  reporting `kind: "site_challenge"` are counted by the global
+   *  site-challenge breaker. Defaults to
+   *  {@link DEFAULT_SITE_CHALLENGE_WINDOW_SEC}. */
+  SITE_CHALLENGE_WINDOW_SEC?: string;
+  /** ADR-043 D7 — absolute override for the number of distinct proxies
+   *  that trips the breaker. When unset (the recommended setup) the
+   *  threshold is derived from the `proxies_seen` roster via
+   *  {@link SITE_CHALLENGE_MIN_FRACTION} floored at
+   *  {@link SITE_CHALLENGE_MIN_PROXIES_FLOOR}. */
+  SITE_CHALLENGE_MIN_PROXIES?: string;
+  /** ADR-043 D7 — fraction of the known proxy roster that must report a
+   *  site challenge for the breaker to trip. Defaults to
+   *  {@link DEFAULT_SITE_CHALLENGE_MIN_FRACTION}. Ignored when
+   *  `SITE_CHALLENGE_MIN_PROXIES` is set. */
+  SITE_CHALLENGE_MIN_FRACTION?: string;
+  /** ADR-043 D7 — absolute floor applied to the derived threshold so a
+   *  tiny pool can't trip the breaker on one or two reports. Defaults to
+   *  {@link DEFAULT_SITE_CHALLENGE_MIN_PROXIES_FLOOR}. */
+  SITE_CHALLENGE_MIN_PROXIES_FLOOR?: string;
+  /** ADR-043 D7 — how long (ms) the tripped state survives after the most
+   *  recent `site_challenge` observation. Defaults to
+   *  {@link DEFAULT_SITE_CHALLENGE_TTL_MS}. */
+  SITE_CHALLENGE_TTL_MS?: string;
   /** Default per-claim TTL for `MovieClaimState`.  Configurable via
    *  `wrangler.toml [vars]`; falls back to 30 minutes. */
   MOVIE_CLAIM_TTL_MS?: string;
@@ -130,6 +154,69 @@ export const DEFAULT_CF_AUTO_BAN_ENABLED = true;
 export const DEFAULT_CF_AUTO_BAN_THRESHOLD = 6;
 export const DEFAULT_CF_BAN_TTL_MS = 6 * 60 * 60 * 1000;
 export const DEFAULT_HARD_BAN_TTL_MS = 8 * 24 * 60 * 60 * 1000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-043 D7 — global site-challenge breaker
+//
+// When JavDB turns on a site-wide Cloudflare managed challenge, every proxy
+// fails identically because the wall is served to every egress IP. Each
+// ProxyCoordinator DO would independently cross `CF_AUTO_BAN_THRESHOLD` with
+// zero successes and ban itself, taking the whole pool down for
+// `CF_BAN_TTL_MS`. Banning individual proxies is the wrong remedy, so the
+// RunnerRegistry singleton aggregates `site_challenge` reports across proxies
+// and, once enough *distinct* proxies have reported, suppresses per-proxy CF
+// auto-ban until the wall lifts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Rolling window for counting distinct proxies that reported a site
+ *  challenge. 300 s mirrors the default `PENALTY_WINDOW_SEC` so the breaker
+ *  observes the same horizon the CF auto-ban counter does. */
+export const DEFAULT_SITE_CHALLENGE_WINDOW_SEC = 300;
+
+/** Fraction of the known proxy roster (`proxies_seen`) that must report a
+ *  site challenge within the window. 0.5 = "a majority of the pool is
+ *  walled" — well past anything a single bad egress IP can explain, while
+ *  still tripping long before every proxy has accumulated the 6 CF events
+ *  it needs to auto-ban itself. */
+export const DEFAULT_SITE_CHALLENGE_MIN_FRACTION = 0.5;
+
+/** Absolute floor for the derived threshold. Below 3 distinct proxies there
+ *  is no quorum to distinguish "site-wide wall" from "two unlucky egress
+ *  IPs", and per-proxy CF auto-ban remains the correct remedy. Also applies
+ *  when the roster is unknown (empty `proxies_seen`). */
+export const DEFAULT_SITE_CHALLENGE_MIN_PROXIES_FLOOR = 3;
+
+/** How long the tripped state survives after the last `site_challenge`
+ *  observation. 15 min = 3x the default window, so the breaker doesn't flap
+ *  while the wall is still up but the spider has backed off and reports have
+ *  gone sparse. The wall lifting is observable as reports simply stopping. */
+export const DEFAULT_SITE_CHALLENGE_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Current state of the global site-challenge breaker, returned by the
+ * RunnerRegistry's `/do/site_challenge` endpoint and embedded verbatim in
+ * `GET /ops/snapshot`.
+ */
+export interface SiteChallengeStatus {
+  /** `true` while per-proxy CF auto-ban is suppressed. */
+  tripped: boolean;
+  /** Wall-clock ms epoch at which the current trip began; `0` when clear. */
+  tripped_at: number;
+  /** Distinct proxies that reported within the rolling window. */
+  distinct_proxies: number;
+  /** Distinct-proxy count at which the breaker trips (derived or overridden). */
+  threshold: number;
+  /** Size of the known proxy roster (`proxies_seen`) used to derive the
+   *  threshold; `0` when no runner has uploaded a pool yet. */
+  roster_size: number;
+  /** Effective rolling window in seconds. */
+  window_sec: number;
+  /** Effective post-observation TTL in ms. */
+  ttl_ms: number;
+  /** Wall-clock ms epoch of the most recent observation; `0` when none. */
+  last_observation_ms: number;
+  server_time: number;
+}
 
 export interface ThrottleConfig {
   shortWindowSec: number;
@@ -227,8 +314,19 @@ export interface ReportRequest {
    *  adds three out-of-band kinds that mutate ``bannedUntil`` /
    *  ``cfBypassUntil``.  P2-D adds ``"success"`` for the health
    *  scorer; the DO bumps ``successEvents`` and refreshes the
-   *  ``latencyEma`` from ``latency_ms`` when present. */
-  kind: "cf" | "failure" | "ban" | "unban" | "cf_bypass" | "success";
+   *  ``latencyEma`` from ``latency_ms`` when present.  ADR-043 D7 adds
+   *  ``"site_challenge"``: a *site-wide* Cloudflare wall observed through
+   *  this proxy.  It is explicitly NOT a proxy-quality signal — the DO
+   *  touches none of its counters — it only feeds the cross-proxy
+   *  breaker aggregated in RunnerRegistry. */
+  kind:
+    | "cf"
+    | "failure"
+    | "ban"
+    | "unban"
+    | "cf_bypass"
+    | "success"
+    | "site_challenge";
   /** Optional TTL for ``ban`` / ``cf_bypass`` kinds, in ms.  Ignored otherwise.
    *  ``ban`` defaults to ``BAN_TTL_MS`` (3 days); ``cf_bypass`` accepts ``0`` =
    *  "permanent for this session" to mirror ``always_bypass_time == 0``. */
@@ -241,6 +339,12 @@ export interface ReportRequest {
    *  request still counts as healthy time, just with worse latency).
    *  Optional; older clients omit it. */
   latency_ms?: number;
+  /** ADR-043 D7 — set by the *Worker* (never by a client) when the global
+   *  site-challenge breaker is tripped, so the per-proxy DO can suppress
+   *  CF auto-ban without paying a cross-DO round trip on every report.
+   *  Absent / `false` means "not tripped", which keeps an older client or
+   *  a direct `/do/report` call safe by default. */
+  site_challenge_tripped?: boolean;
 }
 
 /**
@@ -1320,12 +1424,18 @@ export interface ConfigResponseWithMerged extends ConfigResponse {
  * - `login_cooldown` — GlobalLoginState entered a P2-C cooldown window
  *   (recent failure count crossed the threshold).
  * - `manual_test` — operator-triggered probe (`POST /alerts/test`).
+ * - `site_challenge` — ADR-043 D7 global breaker changed state. Emitted
+ *   exactly once per trip and once on the matching recovery, NOT once per
+ *   proxy: `ban_spike` is per-proxy and would fire 28 times during a
+ *   site-wide wall while never saying "the pool is down".
+ *   `details.state` is `"tripped"` or `"cleared"`.
  */
 export type AlertKind =
   | "session_failed"
   | "ban_spike"
   | "login_cooldown"
-  | "manual_test";
+  | "manual_test"
+  | "site_challenge";
 
 /** Wire envelope for one alert event. Stored verbatim in
  *  `alert_history` and forwarded to all matching webhooks. */

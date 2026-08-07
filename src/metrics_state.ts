@@ -57,6 +57,10 @@ function isPayloadActive(payload: Record<string, unknown>): boolean {
   const work = (payload as any).work ?? {};
   if (Array.isArray(runners) && runners.length > 0) return true;
   if (Array.isArray(signals) && signals.length > 0) return true;
+  // ADR-043 D7 — a tripped site-challenge breaker is exactly the situation
+  // where every runner has died, so without this the outage would be
+  // idle-suppressed out of the /metrics/range history that explains it.
+  if ((payload as any).site_challenge?.tripped === true) return true;
   if (typeof work.queued === "number" && work.queued > 0) return true;
   if (typeof work.in_flight === "number" && work.in_flight > 0) return true;
   return false;
