@@ -249,6 +249,8 @@ state is a single SQLite-backed snapshot (see `src/global_login_state.ts`).
 | `POST /login_state/record_attempt` | `{holder_id, proxy_name, outcome, reason?}` | `{recent_attempt_count, recent_failure_count, cooldown_until_ms, server_time}` | Append a `success`/`failure` record to the P2-C buffer.  `reason:"cf_challenge"` on a failure marks `proxy_name` login-blocked for `LOGIN_PROXY_BLOCK_TTL_SEC` (default 24 h); other reasons are ignored. |
 | `POST /login_state/report_all_blocked` | `{holder_id, proxies}` | `{all_blocked, first, blocked_until_ms, server_time}` | ADR-063: the spider reports every proxy it may log in through.  `first:true` once per blocked episode (the caller emails then); `all_blocked:false` when any listed proxy is not blocked. |
 
+Proxy names used with login blocks must be 1 to 256 characters (real pool names are far shorter); a longer name is never blocked, and `report_all_blocked` rejects it with 400.
+
 `last_success_proxy` is the proxy of the last `publish` and survives `invalidate`.  `login_blocked` maps each blocked proxy to its `blocked_until` (ms epoch); expired entries are never returned.
 
 ### Why a separate lease + publish step?
