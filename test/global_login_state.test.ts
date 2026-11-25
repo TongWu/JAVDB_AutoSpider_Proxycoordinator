@@ -60,6 +60,8 @@ interface LoginStateGetResp {
   last_verified_at: number;
   has_active_lease: boolean;
   server_time: number;
+  last_success_proxy?: string | null;
+  login_blocked?: Record<string, number>;
 }
 
 interface AcquireLeaseResp {
@@ -726,5 +728,70 @@ describe("P2-C acquire_lease cooldown", () => {
     expect(r.acquired).toBe(true);
     expect(r.cooldown_until_ms).toBe(0);
     expect(r.recent_attempt_count).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-063 — last_success_proxy + login_blocked
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Merge `patch` into the stored snapshot (creating a blank one if needed). */
+async function seedState(patch: Record<string, unknown>): Promise<void> {
+  const id = env.GLOBAL_LOGIN_STATE_DO.idFromName("global");
+  const stub = env.GLOBAL_LOGIN_STATE_DO.get(id);
+  await runInDurableObject(stub, async (_inst, state) => {
+    const data = (await state.storage.get<any>("state")) ?? {
+      proxy_name: null,
+      cookie_ciphertext: null,
+      version: 0,
+      last_verified_at: 0,
+      lease: null,
+      recent_attempts: [],
+    };
+    await state.storage.put("state", { ...data, ...patch });
+  });
+}
+
+describe("ADR-063 login block state", () => {
+  it("get returns null last_success_proxy and an empty login_blocked on a fresh DO", async () => {
+    const s = await getState();
+    expect(s.last_success_proxy).toBeNull();
+    expect(s.login_blocked).toEqual({});
+  });
+
+  it("publish sets last_success_proxy", async () => {
+    await acquire("runner-A", "P1", 60_000);
+    await publish("runner-A", "P1", "_jdb_session=alpha");
+    expect((await getState()).last_success_proxy).toBe("P1");
+  });
+
+  it("invalidate keeps last_success_proxy", async () => {
+    await acquire("runner-A", "P1", 60_000);
+    const pub = await publish("runner-A", "P1", "_jdb_session=alpha");
+    await invalidate(pub.version);
+    const s = await getState();
+    expect(s.proxy_name).toBeNull();
+    expect(s.last_success_proxy).toBe("P1");
+  });
+
+  it("an old snapshot without the new fields defaults last_success_proxy to proxy_name", async () => {
+    await seedState({ proxy_name: "Pold" });
+    const s = await getState();
+    expect(s.last_success_proxy).toBe("Pold");
+    expect(s.login_blocked).toEqual({});
+  });
+
+  it("publish clears the block entry of the publishing proxy only", async () => {
+    const until = Date.now() + 60_000;
+    await seedState({ login_blocked: { P1: until, P2: until } });
+    await acquire("runner-A", "P1", 60_000);
+    await publish("runner-A", "P1", "_jdb_session=alpha");
+    expect((await getState()).login_blocked).toEqual({ P2: until });
+  });
+
+  it("get omits expired block entries", async () => {
+    const until = Date.now() + 60_000;
+    await seedState({ login_blocked: { P1: Date.now() - 1, P2: until } });
+    expect((await getState()).login_blocked).toEqual({ P2: until });
   });
 });

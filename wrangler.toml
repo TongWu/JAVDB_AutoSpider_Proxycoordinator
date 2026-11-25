@@ -204,6 +204,10 @@ MOVIE_CLAIM_MIN_RUNNERS = "2"
 LOGIN_COOLDOWN_THRESHOLD = "5"
 LOGIN_COOLDOWN_WINDOW_SEC = "3600"
 LOGIN_COOLDOWN_DURATION_MS = "1800000"
+# ADR-063 — seconds a proxy stays login-blocked after its signin POST was
+# still Cloudflare-challenged following the cf_clearance retry.  Every
+# runner skips a blocked proxy until the entry expires.  Default 24 h.
+LOGIN_PROXY_BLOCK_TTL_SEC = "86400"
 # W5.6 — Worker-level token-bucket rate limit. Caps authorised requests
 # per minute per Bearer token to guard against burst abuse from a single
 # runner. State is per-Worker-isolate and resets on cold start; not a

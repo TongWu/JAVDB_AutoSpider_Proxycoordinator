@@ -89,6 +89,9 @@ export interface Env {
    *  crossed.  Defaults to 30 min so a flapping login pool gets a clear
    *  back-off without blocking the day's ingestion. */
   LOGIN_COOLDOWN_DURATION_MS?: string;
+  /** ADR-063 — seconds a proxy stays login-blocked after its signin POST
+   *  was still challenged by Cloudflare.  Defaults to 86400 (24 h). */
+  LOGIN_PROXY_BLOCK_TTL_SEC?: string;
   /** Number of href-based sub-shards within each per-day MovieClaim shard.
    *  Defaults to 4; set to "1" to disable sub-sharding (e.g. in tests). */
   NUM_CLAIM_SHARDS?: string;
@@ -309,6 +312,11 @@ export interface LoginStateGetResponse {
   /** ``true`` iff a non-expired lease exists; holder identity is hidden. */
   has_active_lease: boolean;
   server_time: number;
+  /** ADR-063 — proxy of the last successful ``publish``; survives
+   *  ``invalidate``.  ``null`` before any login. */
+  last_success_proxy: string | null;
+  /** ADR-063 — unexpired login blocks, proxy name to ``blocked_until`` ms. */
+  login_blocked: Record<string, number>;
 }
 
 export interface AcquireLeaseRequest {
@@ -414,6 +422,10 @@ export const DEFAULT_LOGIN_COOLDOWN_THRESHOLD = 5;
  * shortens the effective cooldown because the success record lowers
  * the failure ratio inside the window. */
 export const DEFAULT_LOGIN_COOLDOWN_DURATION_MS = 30 * 60 * 1000;
+
+/** ADR-063 — default login-block TTL (seconds): a challenged proxy is
+ * skipped by every runner for 24 hours, then re-tested by the next login. */
+export const DEFAULT_LOGIN_PROXY_BLOCK_TTL_SEC = 86_400;
 
 /** P2-C — hard cap on the number of recent_attempts entries kept in
  * DO storage.  Pruning by window already keeps the buffer small under

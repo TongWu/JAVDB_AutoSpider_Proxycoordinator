@@ -6,6 +6,7 @@ import {
   DEFAULT_LOGIN_COOLDOWN_DURATION_MS,
   DEFAULT_LOGIN_COOLDOWN_THRESHOLD,
   DEFAULT_LOGIN_COOLDOWN_WINDOW_SEC,
+  DEFAULT_LOGIN_PROXY_BLOCK_TTL_SEC,
   Env,
   InvalidateRequest,
   InvalidateResponse,
@@ -93,6 +94,19 @@ interface GlobalLoginStateData {
    * round-trip cleanly through ``loadState``.
    */
   recent_attempts?: LoginAttemptRecord[];
+  /**
+   * ADR-063 — proxy of the last successful ``publish``.  Unlike
+   * ``proxy_name`` it is not cleared by ``invalidate``, so the next login
+   * can start from the proxy that worked last.  Optional in storage: a
+   * pre-ADR-063 snapshot defaults it to ``proxy_name`` in ``loadState``.
+   */
+  last_success_proxy?: string | null;
+  /**
+   * ADR-063 — proxies whose signin POST was still Cloudflare-challenged
+   * after the cf_clearance retry, mapped to ``blocked_until`` (ms epoch).
+   * Expired entries are pruned on every read.
+   */
+  login_blocked?: Record<string, number>;
 }
 
 const STORAGE_KEY = "state";
@@ -227,6 +241,8 @@ export class GlobalLoginState implements DurableObject {
       last_verified_at: data.last_verified_at,
       has_active_lease: data.lease !== null && now < data.lease.expires_at,
       server_time: now,
+      last_success_proxy: data.last_success_proxy ?? null,
+      login_blocked: pruneLoginBlocked(data.login_blocked ?? {}, now),
     };
     return jsonResponse(response);
   }
@@ -487,6 +503,10 @@ export class GlobalLoginState implements DurableObject {
     data.cookie_ciphertext = ciphertext;
     data.version += 1;
     data.last_verified_at = now;
+    data.last_success_proxy = proxyName;
+    const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
+    delete blocked[proxyName];
+    data.login_blocked = blocked;
     // Keep the lease intact: callers should release explicitly so they can
     // run any post-publish verification before relinquishing the mutex.
     await this.persistState(data);
@@ -630,6 +650,8 @@ export class GlobalLoginState implements DurableObject {
         last_verified_at: 0,
         lease: null,
         recent_attempts: [],
+        last_success_proxy: null,
+        login_blocked: {},
       };
     }
     // Defensive backfill: pre-P2-C snapshots may not have
@@ -637,6 +659,17 @@ export class GlobalLoginState implements DurableObject {
     // code (acquire / record_attempt) doesn't have to null-check.
     if (!Array.isArray(stored.recent_attempts)) {
       stored.recent_attempts = [];
+    }
+    // ADR-063: pre-existing snapshots lack the login-block fields.
+    if (stored.last_success_proxy === undefined) {
+      stored.last_success_proxy = stored.proxy_name;
+    }
+    if (
+      typeof stored.login_blocked !== "object" ||
+      stored.login_blocked === null ||
+      Array.isArray(stored.login_blocked)
+    ) {
+      stored.login_blocked = {};
     }
     return stored;
   }
@@ -793,6 +826,26 @@ function computeCooldownUntilMs(
   if (lastFailureAt <= 0) return 0;
   const until = lastFailureAt + durationMs;
   return until > now ? until : 0;
+}
+
+/** ADR-063 — block TTL in ms; falls back to the default for unset or invalid values. */
+function loadBlockTtlMs(env: Env): number {
+  const raw = env.LOGIN_PROXY_BLOCK_TTL_SEC;
+  const n = raw === undefined || raw === "" ? NaN : Number(raw);
+  const sec = Number.isFinite(n) && n > 0 ? n : DEFAULT_LOGIN_PROXY_BLOCK_TTL_SEC;
+  return sec * 1000;
+}
+
+/** ADR-063 — drop block entries whose ``blocked_until`` has passed. */
+function pruneLoginBlocked(
+  blocked: Record<string, number>,
+  now: number,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [proxy, until] of Object.entries(blocked)) {
+    if (typeof until === "number" && until > now) out[proxy] = until;
+  }
+  return out;
 }
 
 /**
