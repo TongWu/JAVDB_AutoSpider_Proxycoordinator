@@ -6,6 +6,7 @@ import {
   DEFAULT_LOGIN_COOLDOWN_DURATION_MS,
   DEFAULT_LOGIN_COOLDOWN_THRESHOLD,
   DEFAULT_LOGIN_COOLDOWN_WINDOW_SEC,
+  DEFAULT_LOGIN_PROXY_BLOCK_TTL_SEC,
   Env,
   InvalidateRequest,
   InvalidateResponse,
@@ -14,6 +15,8 @@ import {
   LOGIN_LEASE_TTL_MIN_MS,
   PublishRequest,
   PublishResponse,
+  ReportAllBlockedRequest,
+  ReportAllBlockedResponse,
   RECENT_ATTEMPTS_MAX_LEN,
   RecordAttemptOutcome,
   RecordAttemptRequest,
@@ -93,6 +96,26 @@ interface GlobalLoginStateData {
    * round-trip cleanly through ``loadState``.
    */
   recent_attempts?: LoginAttemptRecord[];
+  /**
+   * ADR-063 — proxy of the last successful ``publish``.  Unlike
+   * ``proxy_name`` it is not cleared by ``invalidate``, so the next login
+   * can start from the proxy that worked last.  Optional in storage: a
+   * pre-ADR-063 snapshot defaults it to ``proxy_name`` in ``loadState``.
+   */
+  last_success_proxy?: string | null;
+  /**
+   * ADR-063 — ms epoch until which no further all-blocked alert is raised:
+   * the latest ``blocked_until`` among the proxies of the last alert.  One
+   * alert per blocked window, even while individual proxies are re-tested and
+   * re-blocked inside it or runners report different lists.
+   */
+  last_all_blocked_alert_until?: number | null;
+  /**
+   * ADR-063 — proxies whose signin POST was still Cloudflare-challenged
+   * after the cf_clearance retry, mapped to ``blocked_until`` (ms epoch).
+   * Expired entries are pruned on every read.
+   */
+  login_blocked?: Record<string, number>;
 }
 
 const STORAGE_KEY = "state";
@@ -106,6 +129,13 @@ const HKDF_INFO = new TextEncoder().encode("aes-gcm-key");
  * while protecting the DO from a misconfigured caller storing megabytes.
  */
 const MAX_COOKIE_BYTES = 16 * 1024;
+
+/** ADR-063 — cap on the proxy list accepted by ``report_all_blocked``. */
+const MAX_REPORTED_PROXIES = 64;
+
+/** ADR-063 — cap on stored login blocks and on the configurable TTL. */
+const MAX_LOGIN_BLOCKED_ENTRIES = 256;
+const MAX_LOGIN_PROXY_BLOCK_TTL_SEC = 30 * 86_400;
 
 export class GlobalLoginState implements DurableObject {
   private state: DurableObjectState;
@@ -185,6 +215,8 @@ export class GlobalLoginState implements DurableObject {
           return await this.handleReleaseLease(request);
         case "/do/login_state/record_attempt":
           return await this.handleRecordAttempt(request);
+        case "/do/login_state/report_all_blocked":
+          return await this.handleReportAllBlocked(request);
         case "/do/login/history":
           return await this.handleLoginHistory(request);
         default:
@@ -227,6 +259,8 @@ export class GlobalLoginState implements DurableObject {
       last_verified_at: data.last_verified_at,
       has_active_lease: data.lease !== null && now < data.lease.expires_at,
       server_time: now,
+      last_success_proxy: data.last_success_proxy ?? null,
+      login_blocked: pruneLoginBlocked(data.login_blocked ?? {}, now),
     };
     return jsonResponse(response);
   }
@@ -327,6 +361,7 @@ export class GlobalLoginState implements DurableObject {
       proxy_id?: string;
       success?: boolean;
       detail?: string;
+      reason?: string;
     };
     const holderId = String(body.holder_id ?? "").trim();
     // proxy_id is accepted as an alias for proxy_name.
@@ -375,6 +410,14 @@ export class GlobalLoginState implements DurableObject {
       pruned.shift();
     }
     data.recent_attempts = pruned;
+    // ADR-063: a signin POST still challenged after the clearance retry
+    // blocks the proxy; the caller sends the record before releasing its
+    // lease so no peer can try the same proxy first.
+    const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
+    if (outcome === "failure" && body.reason === "cf_challenge" && isBlockableProxyName(proxyName)) {
+      blocked[proxyName] = now + loadBlockTtlMs(this.env);
+    }
+    data.login_blocked = capLoginBlocked(blocked);
     await this.persistState(data);
 
     // Phase 2 / ADR-002 — login_event_log: attempt
@@ -439,6 +482,73 @@ export class GlobalLoginState implements DurableObject {
     return jsonResponse(response);
   }
 
+  private async handleReportAllBlocked(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<ReportAllBlockedRequest>;
+    const holderId = String(body.holder_id ?? "").trim();
+    const proxies = body.proxies;
+    if (
+      !holderId ||
+      !Array.isArray(proxies) ||
+      proxies.length === 0 ||
+      proxies.length > MAX_REPORTED_PROXIES ||
+      proxies.some((p) => typeof p !== "string" || !isBlockableProxyName(p.trim()))
+    ) {
+      return jsonResponse(
+        {
+          error:
+            "holder_id and a non-empty proxies list (max 64 names, each 1-256 characters) are required",
+        },
+        400,
+      );
+    }
+    const names = (proxies as string[]).map((p) => p.trim());
+
+    const now = Date.now();
+    const data = await this.loadState();
+    const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
+    const allBlocked = names.every((n) => Object.hasOwn(blocked, n));
+    if (!allBlocked) {
+      const none: ReportAllBlockedResponse = {
+        all_blocked: false, first: false, blocked_until_ms: 0, server_time: now,
+      };
+      return jsonResponse(none);
+    }
+
+    const earliest = Math.min(...names.map((n) => blocked[n]));
+    const latest = Math.max(...names.map((n) => blocked[n]));
+    const alertId = `loginblk-${earliest}`;
+    const suppressedUntil = data.last_all_blocked_alert_until ?? 0;
+    const first = now >= suppressedUntil;
+    if (first) {
+      // Persist the dedupe key before dispatching: a failed dispatch must
+      // not make the next report look like a new episode.
+      data.last_all_blocked_alert_until = latest;
+      await this.persistState(data);
+      const alert: AlertEvent = {
+        id: alertId,
+        kind: "login_all_blocked",
+        ts: now,
+        severity: "warning",
+        summary: (
+          `Every login proxy is blocked until ${new Date(earliest).toISOString()} ` +
+          `(${names.length} proxies)`
+        ).slice(0, ALERT_SUMMARY_MAX_LEN),
+        details: { proxies: names, earliest_blocked_until_ms: earliest },
+      };
+      try {
+        await recordAndDispatch(this.env, alert);
+      } catch (err) {
+        console.warn("login_all_blocked alert dispatch error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const response: ReportAllBlockedResponse = {
+      all_blocked: true, first, blocked_until_ms: earliest, server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
   private async handlePublish(request: Request): Promise<Response> {
     const body = (await request.json()) as Partial<PublishRequest>;
     const holderId = String(body.holder_id ?? "").trim();
@@ -487,6 +597,10 @@ export class GlobalLoginState implements DurableObject {
     data.cookie_ciphertext = ciphertext;
     data.version += 1;
     data.last_verified_at = now;
+    data.last_success_proxy = proxyName;
+    const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
+    delete blocked[proxyName];
+    data.login_blocked = blocked;
     // Keep the lease intact: callers should release explicitly so they can
     // run any post-publish verification before relinquishing the mutex.
     await this.persistState(data);
@@ -630,6 +744,8 @@ export class GlobalLoginState implements DurableObject {
         last_verified_at: 0,
         lease: null,
         recent_attempts: [],
+        last_success_proxy: null,
+        login_blocked: {},
       };
     }
     // Defensive backfill: pre-P2-C snapshots may not have
@@ -637,6 +753,17 @@ export class GlobalLoginState implements DurableObject {
     // code (acquire / record_attempt) doesn't have to null-check.
     if (!Array.isArray(stored.recent_attempts)) {
       stored.recent_attempts = [];
+    }
+    // ADR-063: pre-existing snapshots lack the login-block fields.
+    if (stored.last_success_proxy === undefined) {
+      stored.last_success_proxy = stored.proxy_name;
+    }
+    if (
+      typeof stored.login_blocked !== "object" ||
+      stored.login_blocked === null ||
+      Array.isArray(stored.login_blocked)
+    ) {
+      stored.login_blocked = {};
     }
     return stored;
   }
@@ -793,6 +920,45 @@ function computeCooldownUntilMs(
   if (lastFailureAt <= 0) return 0;
   const until = lastFailureAt + durationMs;
   return until > now ? until : 0;
+}
+
+/** ADR-063 — block TTL in ms; falls back to the default for unset or invalid values. */
+export function loadBlockTtlMs(env: Env): number {
+  const raw = env.LOGIN_PROXY_BLOCK_TTL_SEC;
+  const n = raw === undefined || raw === "" ? NaN : Number(raw);
+  const sec = Number.isFinite(n) && n > 0 ? n : DEFAULT_LOGIN_PROXY_BLOCK_TTL_SEC;
+  // Cap at 30 days so blocked_until always stays a valid Date.
+  return Math.min(sec, MAX_LOGIN_PROXY_BLOCK_TTL_SEC) * 1000;
+}
+
+/**
+ * ADR-063 — a proxy name that may key the block map: 1 to 256 characters and
+ * not ``__proto__`` (an own ``__proto__`` key cannot be set on a plain object).
+ * Longer names are never real pool proxies, so they are ignored rather than
+ * clipped; clipping would let two distinct names collide.
+ */
+function isBlockableProxyName(name: string): boolean {
+  return name.length >= 1 && name.length <= 256 && name !== "__proto__";
+}
+
+/** ADR-063 — keep the block map bounded: drop the soonest-expiring entries first. */
+function capLoginBlocked(blocked: Record<string, number>): Record<string, number> {
+  const entries = Object.entries(blocked);
+  if (entries.length <= MAX_LOGIN_BLOCKED_ENTRIES) return blocked;
+  entries.sort((a, b) => b[1] - a[1]);
+  return Object.fromEntries(entries.slice(0, MAX_LOGIN_BLOCKED_ENTRIES));
+}
+
+/** ADR-063 — drop block entries whose ``blocked_until`` has passed. */
+function pruneLoginBlocked(
+  blocked: Record<string, number>,
+  now: number,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [proxy, until] of Object.entries(blocked)) {
+    if (typeof until === "number" && until > now) out[proxy] = until;
+  }
+  return out;
 }
 
 /**

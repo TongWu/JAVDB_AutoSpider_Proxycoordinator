@@ -107,7 +107,7 @@ rotating one cannot disrupt the others.
 | `src/work_distributor.ts` | `WorkDistributor` singleton DO (W5.2): dedup'd FIFO queue with visibility leases |
 | `src/types.ts` | Env / payload / response type definitions for every DO |
 | `test/proxy_coordinator.test.ts` | Vitest suite (43 tests) — throttle math, auth, P2-D health snapshots |
-| `test/global_login_state.test.ts` | Vitest suite (46 tests) — lease, publish, invalidate, encryption, isolation |
+| `test/global_login_state.test.ts` | Vitest suite (85 tests) — lease, publish, invalidate, encryption, isolation |
 | `test/movie_claim_state.test.ts` | Vitest suite (62 tests) — claim / complete / stage / rollback / sweep |
 | `test/runner_registry.test.ts` | Vitest suite (34 tests) — register / heartbeat / drift summary |
 | `test/config_state.test.ts` | Vitest suite (11 tests, W5.3) — GET / PATCH / heartbeat embedding |
@@ -241,11 +241,17 @@ state is a single SQLite-backed snapshot (see `src/global_login_state.ts`).
 
 | Method + path | Body | Returns | Purpose |
 |---|---|---|---|
-| `GET /login_state` | — | `{proxy_name, cookie, version, last_verified_at, has_active_lease, server_time}` | Read the current logged-in proxy + its cookie (decrypted plaintext); cookie is `null` before any publish or after `invalidate`. |
+| `GET /login_state` | — | `{proxy_name, cookie, version, last_verified_at, has_active_lease, server_time, last_success_proxy, login_blocked}` | Read the current logged-in proxy + its cookie (decrypted plaintext); cookie is `null` before any publish or after `invalidate`. |
 | `POST /login_state/acquire_lease` | `{holder_id, target_proxy_name, ttl_ms}` | `{acquired, holder_id, target_proxy_name, lease_expires_at, server_time}` | At-most-one mutex for the next re-login.  `ttl_ms` is clamped to `[5_000, 300_000]`.  Same `holder_id` calling again renews idempotently. |
 | `POST /login_state/publish` | `{holder_id, proxy_name, cookie}` | `{ok, version, server_time}` | Publish a fresh cookie.  **Must hold a live lease** (`409 lease_required` otherwise).  Bumps `version`; **does not** release the lease — call `release_lease` next. |
 | `POST /login_state/invalidate` | `{version}` | `{invalidated, current_version, server_time}` | Mark the current cookie bad with an optimistic version lock.  `invalidated:false` means a newer cookie has already been published; resync via `GET /login_state`. |
 | `POST /login_state/release_lease` | `{holder_id}` | `{released, server_time}` | Owner releases the lease.  Non-owner calls return `released:false` and leave the lease alone. |
+| `POST /login_state/record_attempt` | `{holder_id, proxy_name, outcome, reason?}` | `{recent_attempt_count, recent_failure_count, cooldown_until_ms, server_time}` | Append a `success`/`failure` record to the P2-C buffer.  `reason:"cf_challenge"` on a failure marks `proxy_name` login-blocked for `LOGIN_PROXY_BLOCK_TTL_SEC` (default 24 h); other reasons are ignored. |
+| `POST /login_state/report_all_blocked` | `{holder_id, proxies}` | `{all_blocked, first, blocked_until_ms, server_time}` | ADR-063: the spider reports every proxy it may log in through.  `first:true` once per blocked episode (the caller emails then); `all_blocked:false` when any listed proxy is not blocked. |
+
+Proxy names used with login blocks must be 1 to 256 characters (real pool names are far shorter); a longer name is never blocked, and `report_all_blocked` rejects it with 400.
+
+`last_success_proxy` is the proxy of the last `publish` and survives `invalidate`.  `login_blocked` maps each blocked proxy to its `blocked_until` (ms epoch); expired entries are never returned.
 
 ### Why a separate lease + publish step?
 

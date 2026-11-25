@@ -103,6 +103,7 @@ export function parseWebhooksJson(raw: string): AlertWebhook[] {
     "session_failed",
     "ban_spike",
     "login_cooldown",
+    "login_all_blocked",
     "manual_test",
   ]);
   for (const entry of parsed) {

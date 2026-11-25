@@ -792,6 +792,7 @@ ${commonDashboardStyles()}
       var kindLabel = a.kind === 'session_failed' ? T('SESSION FAILED')
         : a.kind === 'ban_spike' ? T('BAN SPIKE')
         : a.kind === 'login_cooldown' ? T('LOGIN COOLDOWN')
+        : a.kind === 'login_all_blocked' ? T('LOGIN ALL BLOCKED')
         : a.kind === 'manual_test' ? T('TEST')
         : String(a.kind || '').toUpperCase();
       html += '<div class="banner" style="margin-bottom:10px">'

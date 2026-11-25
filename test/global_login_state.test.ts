@@ -7,6 +7,7 @@ import {
 import { describe, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/types";
+import { loadBlockTtlMs } from "../src/global_login_state";
 
 declare module "cloudflare:test" {
   interface ProvidedEnv extends Env {}
@@ -60,6 +61,8 @@ interface LoginStateGetResp {
   last_verified_at: number;
   has_active_lease: boolean;
   server_time: number;
+  last_success_proxy?: string | null;
+  login_blocked?: Record<string, number>;
 }
 
 interface AcquireLeaseResp {
@@ -726,5 +729,299 @@ describe("P2-C acquire_lease cooldown", () => {
     expect(r.acquired).toBe(true);
     expect(r.cooldown_until_ms).toBe(0);
     expect(r.recent_attempt_count).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-063 — last_success_proxy + login_blocked
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Merge `patch` into the stored snapshot (creating a blank one if needed). */
+async function seedState(patch: Record<string, unknown>): Promise<void> {
+  const id = env.GLOBAL_LOGIN_STATE_DO.idFromName("global");
+  const stub = env.GLOBAL_LOGIN_STATE_DO.get(id);
+  await runInDurableObject(stub, async (_inst, state) => {
+    const data = (await state.storage.get<any>("state")) ?? {
+      proxy_name: null,
+      cookie_ciphertext: null,
+      version: 0,
+      last_verified_at: 0,
+      lease: null,
+      recent_attempts: [],
+    };
+    await state.storage.put("state", { ...data, ...patch });
+  });
+}
+
+describe("ADR-063 login block state", () => {
+  it("get returns null last_success_proxy and an empty login_blocked on a fresh DO", async () => {
+    const s = await getState();
+    expect(s.last_success_proxy).toBeNull();
+    expect(s.login_blocked).toEqual({});
+  });
+
+  it("publish sets last_success_proxy", async () => {
+    await acquire("runner-A", "P1", 60_000);
+    await publish("runner-A", "P1", "_jdb_session=alpha");
+    expect((await getState()).last_success_proxy).toBe("P1");
+  });
+
+  it("invalidate keeps last_success_proxy", async () => {
+    await acquire("runner-A", "P1", 60_000);
+    const pub = await publish("runner-A", "P1", "_jdb_session=alpha");
+    await invalidate(pub.version);
+    const s = await getState();
+    expect(s.proxy_name).toBeNull();
+    expect(s.last_success_proxy).toBe("P1");
+  });
+
+  it("an old snapshot without the new fields defaults last_success_proxy to proxy_name", async () => {
+    await seedState({ proxy_name: "Pold" });
+    const s = await getState();
+    expect(s.last_success_proxy).toBe("Pold");
+    expect(s.login_blocked).toEqual({});
+  });
+
+  it("publish clears the block entry of the publishing proxy only", async () => {
+    const until = Date.now() + 60_000;
+    await seedState({ login_blocked: { P1: until, P2: until } });
+    await acquire("runner-A", "P1", 60_000);
+    await publish("runner-A", "P1", "_jdb_session=alpha");
+    expect((await getState()).login_blocked).toEqual({ P2: until });
+  });
+
+  it("get omits expired block entries", async () => {
+    const until = Date.now() + 60_000;
+    await seedState({ login_blocked: { P1: Date.now() - 1, P2: until } });
+    expect((await getState()).login_blocked).toEqual({ P2: until });
+  });
+});
+
+describe("ADR-063 record_attempt reason", () => {
+  const post = (body: Record<string, unknown>) =>
+    jsonPost<RecordAttemptResp>("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: "P1", ...body,
+    });
+
+  it("cf_challenge failure blocks the proxy for the TTL", async () => {
+    const r = await post({ outcome: "failure", reason: "cf_challenge" });
+    const s = await getState();
+    expect(Math.abs(s.login_blocked!.P1 - (r.server_time + 86_400_000))).toBeLessThan(2_000);
+  });
+
+  it("reason on a success is ignored", async () => {
+    await post({ outcome: "success", reason: "cf_challenge" });
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("an unknown reason is ignored and the call still succeeds", async () => {
+    await post({ outcome: "failure", reason: "other" });
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("no reason behaves as before", async () => {
+    const r = await post({ outcome: "failure" });
+    expect(r.recent_failure_count).toBe(1);
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("a cf_challenge failure still counts toward the P2-C buffer", async () => {
+    const r = await post({ outcome: "failure", reason: "cf_challenge" });
+    expect(r.recent_failure_count).toBe(1);
+  });
+
+  it("detail is stored verbatim", async () => {
+    await post({ outcome: "failure", reason: "cf_challenge", detail: "challenge after clearance" });
+    const hist = await jsonGet<{ rows: Array<{ event_kind: string; detail: string | null }> }>(
+      "/login/history",
+    );
+    const attempt = hist.rows.find((r) => r.event_kind === "attempt");
+    expect(attempt?.detail).toBe("challenge after clearance");
+  });
+});
+
+describe("ADR-063 report_all_blocked", () => {
+  interface Resp { all_blocked: boolean; first: boolean; blocked_until_ms: number; server_time: number }
+  const report = (proxies: unknown, holder: unknown = "runner-A", status = 200) =>
+    jsonPost<Resp>("/login_state/report_all_blocked", { holder_id: holder, proxies }, status);
+  const alertsNow = () =>
+    jsonGet<{ alerts: Array<{ id: string; kind: string }> }>("/alerts").then((r) =>
+      r.alerts.filter((a) => a.kind === "login_all_blocked"));
+
+  it("all listed proxies blocked: first once, then false", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1, P2: t1 + 5_000 } });
+    const a = await report(["P1", "P2"]);
+    expect(a).toMatchObject({ all_blocked: true, first: true, blocked_until_ms: t1 });
+    const b = await report(["P1", "P2"]);
+    expect(b).toMatchObject({ all_blocked: true, first: false });
+  });
+
+  it("a new episode alerts again once the previous alert's blocks have expired", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1 } });
+    expect((await report(["P1"])).first).toBe(true);
+    await seedState({
+      last_all_blocked_alert_until: Date.now() - 1,
+      login_blocked: { P1: t1 + 60_000 },
+    });
+    expect((await report(["P1"])).first).toBe(true);
+  });
+
+  it("a rolling re-block inside the alerted window does not alert again", async () => {
+    const now = Date.now();
+    await seedState({ login_blocked: { P1: now + 60_000, P2: now + 120_000, P3: now + 180_000 } });
+    expect((await report(["P1", "P2", "P3"])).first).toBe(true);
+    // P1 is re-tested, challenged again and re-blocked: the earliest value changes.
+    await seedState({ login_blocked: { P1: now + 400_000, P2: now + 120_000, P3: now + 180_000 } });
+    expect((await report(["P1", "P2", "P3"])).first).toBe(false);
+  });
+
+  it("different proxy lists inside the window do not flip-flop the alert", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1, P2: t1 + 1_000 } });
+    expect((await report(["P1", "P2"])).first).toBe(true);
+    expect((await report(["P2"])).first).toBe(false);
+    expect((await report(["P1", "P2"])).first).toBe(false);
+  });
+
+  it("one proxy unblocked: not all blocked, nothing recorded", async () => {
+    await seedState({ login_blocked: { P1: Date.now() + 120_000 } });
+    const r = await report(["P1", "P2"]);
+    expect(r).toMatchObject({ all_blocked: false, first: false, blocked_until_ms: 0 });
+    expect(await alertsNow()).toHaveLength(0);
+  });
+
+  it("expired entries do not count as blocked", async () => {
+    await seedState({ login_blocked: { P1: Date.now() - 1, P2: Date.now() + 120_000 } });
+    expect((await report(["P1", "P2"])).all_blocked).toBe(false);
+  });
+
+  it("the alert id is deterministic and recorded once", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1 } });
+    await report(["P1"]);
+    await report(["P1"]);
+    const rows = await alertsNow();
+    expect(rows.map((r) => r.id)).toEqual([`loginblk-${t1}`]);
+  });
+
+  it("400 on bad bodies, and never an alert", async () => {
+    await seedState({ login_blocked: { P1: Date.now() + 120_000 } });
+    await report([], "runner-A", 400);
+    await report("P1", "runner-A", 400);
+    await report(["P1", ""], "runner-A", 400);
+    await report(["P1", "   "], "runner-A", 400);
+    await report(["P1", 123], "runner-A", 400);
+    await report(Array.from({ length: 65 }, (_, i) => `P${i}`), "runner-A", 400);
+    await report(["P1"], "", 400);
+    expect(await alertsNow()).toHaveLength(0);
+  });
+
+  it("is authenticated", async () => {
+    const res = await rawFetch("/login_state/report_all_blocked", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ holder_id: "x", proxies: ["P1"] }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("ADR-063 review follow-ups", () => {
+  it("invalidate keeps login_blocked", async () => {
+    const until = Date.now() + 120_000;
+    await acquire("runner-A", "P1", 60_000);
+    const pub = await publish("runner-A", "P1", "_jdb_session=alpha");
+    await seedState({ login_blocked: { P2: until } });
+    await invalidate(pub.version);
+    expect((await getState()).login_blocked).toEqual({ P2: until });
+  });
+
+  it("a malformed stored login_blocked is reset to empty", async () => {
+    await seedState({ login_blocked: ["P1"] });
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("the success:false alias shape also applies the cf_challenge reason", async () => {
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_id: "P1", success: false, reason: "cf_challenge",
+    });
+    expect(Object.keys((await getState()).login_blocked!)).toEqual(["P1"]);
+  });
+
+  it("login_blocked is capped at 256 entries, dropping the soonest-expiring", async () => {
+    const base = Date.now() + 1_000_000;
+    const seeded: Record<string, number> = {};
+    for (let i = 0; i < 256; i++) seeded[`S${i}`] = base + i;
+    await seedState({ login_blocked: seeded });
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: "NEW", outcome: "failure", reason: "cf_challenge",
+    });
+    const blocked = (await getState()).login_blocked!;
+    expect(Object.keys(blocked)).toHaveLength(256);
+    expect(blocked.NEW).toBeDefined();
+    expect(blocked.S0).toBeUndefined();
+  });
+
+  it("a proxy name longer than 256 characters is never stored as a block, and last_success_proxy keeps it whole", async () => {
+    const longName = "L".repeat(300);
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: longName, outcome: "failure", reason: "cf_challenge",
+    });
+    expect((await getState()).login_blocked).toEqual({});
+    await acquire("runner-A", longName, 60_000);
+    await publish("runner-A", longName, "_jdb_session=alpha");
+    expect((await getState()).last_success_proxy).toBe(longName);
+  });
+
+  it("two names sharing a 256-character prefix never collide", async () => {
+    const a = "P".repeat(256) + "a";
+    const b = "P".repeat(256) + "b";
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: a, outcome: "failure", reason: "cf_challenge",
+    });
+    const r = await jsonPost<{ all_blocked: boolean }>(
+      "/login_state/report_all_blocked", { holder_id: "runner-A", proxies: [b] }, 400,
+    );
+    expect((r as any).error).toBeDefined();
+  });
+
+  it.each(["constructor", "toString", "hasOwnProperty", "valueOf"])(
+    "inherited property name %s is an ordinary proxy name",
+    async (name) => {
+      const none = await jsonPost<{ all_blocked: boolean; first: boolean }>(
+        "/login_state/report_all_blocked", { holder_id: "runner-A", proxies: [name] },
+      );
+      expect(none).toMatchObject({ all_blocked: false, first: false });
+      await jsonPost("/login_state/record_attempt", {
+        holder_id: "runner-A", proxy_name: name, outcome: "failure", reason: "cf_challenge",
+      });
+      expect(Object.keys((await getState()).login_blocked!)).toEqual([name]);
+      const yes = await jsonPost<{ all_blocked: boolean; first: boolean }>(
+        "/login_state/report_all_blocked", { holder_id: "runner-A", proxies: [name] },
+      );
+      expect(yes).toMatchObject({ all_blocked: true, first: true });
+    },
+  );
+
+  it("__proto__ is rejected by report_all_blocked and never stored as a block", async () => {
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: "__proto__", outcome: "failure", reason: "cf_challenge",
+    });
+    expect((await getState()).login_blocked).toEqual({});
+    await jsonPost("/login_state/report_all_blocked", { holder_id: "runner-A", proxies: ["__proto__"] }, 400);
+  });
+
+  it.each([
+    [undefined, 86_400_000],
+    ["", 86_400_000],
+    ["abc", 86_400_000],
+    ["0", 86_400_000],
+    ["-5", 86_400_000],
+    ["3600", 3_600_000],
+    ["99999999999", 30 * 86_400_000],
+  ])("loadBlockTtlMs(%j) is %d ms", (raw, expected) => {
+    expect(loadBlockTtlMs({ LOGIN_PROXY_BLOCK_TTL_SEC: raw } as Env)).toBe(expected);
   });
 });
