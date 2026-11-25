@@ -107,7 +107,7 @@ rotating one cannot disrupt the others.
 | `src/work_distributor.ts` | `WorkDistributor` singleton DO (W5.2): dedup'd FIFO queue with visibility leases |
 | `src/types.ts` | Env / payload / response type definitions for every DO |
 | `test/proxy_coordinator.test.ts` | Vitest suite (43 tests) — throttle math, auth, P2-D health snapshots |
-| `test/global_login_state.test.ts` | Vitest suite (46 tests) — lease, publish, invalidate, encryption, isolation |
+| `test/global_login_state.test.ts` | Vitest suite (79 tests) — lease, publish, invalidate, encryption, isolation |
 | `test/movie_claim_state.test.ts` | Vitest suite (62 tests) — claim / complete / stage / rollback / sweep |
 | `test/runner_registry.test.ts` | Vitest suite (34 tests) — register / heartbeat / drift summary |
 | `test/config_state.test.ts` | Vitest suite (11 tests, W5.3) — GET / PATCH / heartbeat embedding |

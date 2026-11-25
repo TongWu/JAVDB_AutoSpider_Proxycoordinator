@@ -103,8 +103,13 @@ interface GlobalLoginStateData {
    * pre-ADR-063 snapshot defaults it to ``proxy_name`` in ``loadState``.
    */
   last_success_proxy?: string | null;
-  /** ADR-063 — id of the last all-blocked alert raised; the dedupe key. */
-  last_all_blocked_alert_id?: string | null;
+  /**
+   * ADR-063 — ms epoch until which no further all-blocked alert is raised:
+   * the latest ``blocked_until`` among the proxies of the last alert.  One
+   * alert per blocked window, even while individual proxies are re-tested and
+   * re-blocked inside it or runners report different lists.
+   */
+  last_all_blocked_alert_until?: number | null;
   /**
    * ADR-063 — proxies whose signin POST was still Cloudflare-challenged
    * after the cf_clearance retry, mapped to ``blocked_until`` (ms epoch).
@@ -127,6 +132,10 @@ const MAX_COOKIE_BYTES = 16 * 1024;
 
 /** ADR-063 — cap on the proxy list accepted by ``report_all_blocked``. */
 const MAX_REPORTED_PROXIES = 64;
+
+/** ADR-063 — cap on stored login blocks and on the configurable TTL. */
+const MAX_LOGIN_BLOCKED_ENTRIES = 256;
+const MAX_LOGIN_PROXY_BLOCK_TTL_SEC = 30 * 86_400;
 
 export class GlobalLoginState implements DurableObject {
   private state: DurableObjectState;
@@ -408,7 +417,7 @@ export class GlobalLoginState implements DurableObject {
     if (outcome === "failure" && body.reason === "cf_challenge") {
       blocked[clipShortString(proxyName)] = now + loadBlockTtlMs(this.env);
     }
-    data.login_blocked = blocked;
+    data.login_blocked = capLoginBlocked(blocked);
     await this.persistState(data);
 
     // Phase 2 / ADR-002 — login_event_log: attempt
@@ -503,12 +512,14 @@ export class GlobalLoginState implements DurableObject {
     }
 
     const earliest = Math.min(...names.map((n) => blocked[n]));
+    const latest = Math.max(...names.map((n) => blocked[n]));
     const alertId = `loginblk-${earliest}`;
-    const first = data.last_all_blocked_alert_id !== alertId;
+    const suppressedUntil = data.last_all_blocked_alert_until ?? 0;
+    const first = now >= suppressedUntil;
     if (first) {
       // Persist the dedupe key before dispatching: a failed dispatch must
       // not make the next report look like a new episode.
-      data.last_all_blocked_alert_id = alertId;
+      data.last_all_blocked_alert_until = latest;
       await this.persistState(data);
       const alert: AlertEvent = {
         id: alertId,
@@ -583,9 +594,10 @@ export class GlobalLoginState implements DurableObject {
     data.cookie_ciphertext = ciphertext;
     data.version += 1;
     data.last_verified_at = now;
-    data.last_success_proxy = proxyName;
+    const storedName = clipShortString(proxyName);
+    data.last_success_proxy = storedName;
     const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
-    delete blocked[proxyName];
+    delete blocked[storedName];
     data.login_blocked = blocked;
     // Keep the lease intact: callers should release explicitly so they can
     // run any post-publish verification before relinquishing the mutex.
@@ -909,11 +921,20 @@ function computeCooldownUntilMs(
 }
 
 /** ADR-063 — block TTL in ms; falls back to the default for unset or invalid values. */
-function loadBlockTtlMs(env: Env): number {
+export function loadBlockTtlMs(env: Env): number {
   const raw = env.LOGIN_PROXY_BLOCK_TTL_SEC;
   const n = raw === undefined || raw === "" ? NaN : Number(raw);
   const sec = Number.isFinite(n) && n > 0 ? n : DEFAULT_LOGIN_PROXY_BLOCK_TTL_SEC;
-  return sec * 1000;
+  // Cap at 30 days so blocked_until always stays a valid Date.
+  return Math.min(sec, MAX_LOGIN_PROXY_BLOCK_TTL_SEC) * 1000;
+}
+
+/** ADR-063 — keep the block map bounded: drop the soonest-expiring entries first. */
+function capLoginBlocked(blocked: Record<string, number>): Record<string, number> {
+  const entries = Object.entries(blocked);
+  if (entries.length <= MAX_LOGIN_BLOCKED_ENTRIES) return blocked;
+  entries.sort((a, b) => b[1] - a[1]);
+  return Object.fromEntries(entries.slice(0, MAX_LOGIN_BLOCKED_ENTRIES));
 }
 
 /** ADR-063 — drop block entries whose ``blocked_until`` has passed. */

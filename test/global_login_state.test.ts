@@ -7,6 +7,7 @@ import {
 import { describe, expect, it } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/types";
+import { loadBlockTtlMs } from "../src/global_login_state";
 
 declare module "cloudflare:test" {
   interface ProvidedEnv extends Env {}
@@ -856,12 +857,32 @@ describe("ADR-063 report_all_blocked", () => {
     expect(b).toMatchObject({ all_blocked: true, first: false });
   });
 
-  it("a new blocked episode alerts again", async () => {
+  it("a new episode alerts again once the previous alert's blocks have expired", async () => {
     const t1 = Date.now() + 120_000;
     await seedState({ login_blocked: { P1: t1 } });
     expect((await report(["P1"])).first).toBe(true);
-    await seedState({ login_blocked: { P1: t1 + 60_000 } });
+    await seedState({
+      last_all_blocked_alert_until: Date.now() - 1,
+      login_blocked: { P1: t1 + 60_000 },
+    });
     expect((await report(["P1"])).first).toBe(true);
+  });
+
+  it("a rolling re-block inside the alerted window does not alert again", async () => {
+    const now = Date.now();
+    await seedState({ login_blocked: { P1: now + 60_000, P2: now + 120_000, P3: now + 180_000 } });
+    expect((await report(["P1", "P2", "P3"])).first).toBe(true);
+    // P1 is re-tested, challenged again and re-blocked: the earliest value changes.
+    await seedState({ login_blocked: { P1: now + 400_000, P2: now + 120_000, P3: now + 180_000 } });
+    expect((await report(["P1", "P2", "P3"])).first).toBe(false);
+  });
+
+  it("different proxy lists inside the window do not flip-flop the alert", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1, P2: t1 + 1_000 } });
+    expect((await report(["P1", "P2"])).first).toBe(true);
+    expect((await report(["P2"])).first).toBe(false);
+    expect((await report(["P1", "P2"])).first).toBe(false);
   });
 
   it("one proxy unblocked: not all blocked, nothing recorded", async () => {
@@ -885,11 +906,16 @@ describe("ADR-063 report_all_blocked", () => {
     expect(rows.map((r) => r.id)).toEqual([`loginblk-${t1}`]);
   });
 
-  it("400 on bad bodies", async () => {
+  it("400 on bad bodies, and never an alert", async () => {
+    await seedState({ login_blocked: { P1: Date.now() + 120_000 } });
     await report([], "runner-A", 400);
     await report("P1", "runner-A", 400);
     await report(["P1", ""], "runner-A", 400);
+    await report(["P1", "   "], "runner-A", 400);
+    await report(["P1", 123], "runner-A", 400);
+    await report(Array.from({ length: 65 }, (_, i) => `P${i}`), "runner-A", 400);
     await report(["P1"], "", 400);
+    expect(await alertsNow()).toHaveLength(0);
   });
 
   it("is authenticated", async () => {
@@ -899,5 +925,64 @@ describe("ADR-063 report_all_blocked", () => {
       body: JSON.stringify({ holder_id: "x", proxies: ["P1"] }),
     });
     expect(res.status).toBe(401);
+  });
+});
+
+describe("ADR-063 review follow-ups", () => {
+  it("invalidate keeps login_blocked", async () => {
+    const until = Date.now() + 120_000;
+    await acquire("runner-A", "P1", 60_000);
+    const pub = await publish("runner-A", "P1", "_jdb_session=alpha");
+    await seedState({ login_blocked: { P2: until } });
+    await invalidate(pub.version);
+    expect((await getState()).login_blocked).toEqual({ P2: until });
+  });
+
+  it("a malformed stored login_blocked is reset to empty", async () => {
+    await seedState({ login_blocked: ["P1"] });
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("the success:false alias shape also applies the cf_challenge reason", async () => {
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_id: "P1", success: false, reason: "cf_challenge",
+    });
+    expect(Object.keys((await getState()).login_blocked!)).toEqual(["P1"]);
+  });
+
+  it("login_blocked is capped at 256 entries, dropping the soonest-expiring", async () => {
+    const base = Date.now() + 1_000_000;
+    const seeded: Record<string, number> = {};
+    for (let i = 0; i < 256; i++) seeded[`S${i}`] = base + i;
+    await seedState({ login_blocked: seeded });
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: "NEW", outcome: "failure", reason: "cf_challenge",
+    });
+    const blocked = (await getState()).login_blocked!;
+    expect(Object.keys(blocked)).toHaveLength(256);
+    expect(blocked.NEW).toBeDefined();
+    expect(blocked.S0).toBeUndefined();
+  });
+
+  it("publish clears the block of a proxy name longer than 256 characters", async () => {
+    const longName = "L".repeat(300);
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: longName, outcome: "failure", reason: "cf_challenge",
+    });
+    await acquire("runner-A", longName, 60_000);
+    await publish("runner-A", longName, "_jdb_session=alpha");
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it.each([
+    [undefined, 86_400_000],
+    ["", 86_400_000],
+    ["abc", 86_400_000],
+    ["0", 86_400_000],
+    ["-5", 86_400_000],
+    ["3600", 3_600_000],
+    ["99999999999", 30 * 86_400_000],
+  ])("loadBlockTtlMs(%j) is %d ms", (raw, expected) => {
+    expect(loadBlockTtlMs({ LOGIN_PROXY_BLOCK_TTL_SEC: raw } as Env)).toBe(expected);
   });
 });
