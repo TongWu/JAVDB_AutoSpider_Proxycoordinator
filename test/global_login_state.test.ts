@@ -964,14 +964,53 @@ describe("ADR-063 review follow-ups", () => {
     expect(blocked.S0).toBeUndefined();
   });
 
-  it("publish clears the block of a proxy name longer than 256 characters", async () => {
+  it("a proxy name longer than 256 characters is never stored as a block, and last_success_proxy keeps it whole", async () => {
     const longName = "L".repeat(300);
     await jsonPost("/login_state/record_attempt", {
       holder_id: "runner-A", proxy_name: longName, outcome: "failure", reason: "cf_challenge",
     });
+    expect((await getState()).login_blocked).toEqual({});
     await acquire("runner-A", longName, 60_000);
     await publish("runner-A", longName, "_jdb_session=alpha");
+    expect((await getState()).last_success_proxy).toBe(longName);
+  });
+
+  it("two names sharing a 256-character prefix never collide", async () => {
+    const a = "P".repeat(256) + "a";
+    const b = "P".repeat(256) + "b";
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: a, outcome: "failure", reason: "cf_challenge",
+    });
+    const r = await jsonPost<{ all_blocked: boolean }>(
+      "/login_state/report_all_blocked", { holder_id: "runner-A", proxies: [b] }, 400,
+    );
+    expect((r as any).error).toBeDefined();
+  });
+
+  it.each(["constructor", "toString", "hasOwnProperty", "valueOf"])(
+    "inherited property name %s is an ordinary proxy name",
+    async (name) => {
+      const none = await jsonPost<{ all_blocked: boolean; first: boolean }>(
+        "/login_state/report_all_blocked", { holder_id: "runner-A", proxies: [name] },
+      );
+      expect(none).toMatchObject({ all_blocked: false, first: false });
+      await jsonPost("/login_state/record_attempt", {
+        holder_id: "runner-A", proxy_name: name, outcome: "failure", reason: "cf_challenge",
+      });
+      expect(Object.keys((await getState()).login_blocked!)).toEqual([name]);
+      const yes = await jsonPost<{ all_blocked: boolean; first: boolean }>(
+        "/login_state/report_all_blocked", { holder_id: "runner-A", proxies: [name] },
+      );
+      expect(yes).toMatchObject({ all_blocked: true, first: true });
+    },
+  );
+
+  it("__proto__ is rejected by report_all_blocked and never stored as a block", async () => {
+    await jsonPost("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: "__proto__", outcome: "failure", reason: "cf_challenge",
+    });
     expect((await getState()).login_blocked).toEqual({});
+    await jsonPost("/login_state/report_all_blocked", { holder_id: "runner-A", proxies: ["__proto__"] }, 400);
   });
 
   it.each([

@@ -414,8 +414,8 @@ export class GlobalLoginState implements DurableObject {
     // blocks the proxy; the caller sends the record before releasing its
     // lease so no peer can try the same proxy first.
     const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
-    if (outcome === "failure" && body.reason === "cf_challenge") {
-      blocked[clipShortString(proxyName)] = now + loadBlockTtlMs(this.env);
+    if (outcome === "failure" && body.reason === "cf_challenge" && isBlockableProxyName(proxyName)) {
+      blocked[proxyName] = now + loadBlockTtlMs(this.env);
     }
     data.login_blocked = capLoginBlocked(blocked);
     await this.persistState(data);
@@ -491,19 +491,22 @@ export class GlobalLoginState implements DurableObject {
       !Array.isArray(proxies) ||
       proxies.length === 0 ||
       proxies.length > MAX_REPORTED_PROXIES ||
-      proxies.some((p) => typeof p !== "string" || p.trim() === "")
+      proxies.some((p) => typeof p !== "string" || !isBlockableProxyName(p.trim()))
     ) {
       return jsonResponse(
-        { error: "holder_id and a non-empty proxies list (max 64) are required" },
+        {
+          error:
+            "holder_id and a non-empty proxies list (max 64 names, each 1-256 characters) are required",
+        },
         400,
       );
     }
-    const names = (proxies as string[]).map((p) => clipShortString(p.trim()));
+    const names = (proxies as string[]).map((p) => p.trim());
 
     const now = Date.now();
     const data = await this.loadState();
     const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
-    const allBlocked = names.every((n) => blocked[n] !== undefined);
+    const allBlocked = names.every((n) => Object.hasOwn(blocked, n));
     if (!allBlocked) {
       const none: ReportAllBlockedResponse = {
         all_blocked: false, first: false, blocked_until_ms: 0, server_time: now,
@@ -594,10 +597,9 @@ export class GlobalLoginState implements DurableObject {
     data.cookie_ciphertext = ciphertext;
     data.version += 1;
     data.last_verified_at = now;
-    const storedName = clipShortString(proxyName);
-    data.last_success_proxy = storedName;
+    data.last_success_proxy = proxyName;
     const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
-    delete blocked[storedName];
+    delete blocked[proxyName];
     data.login_blocked = blocked;
     // Keep the lease intact: callers should release explicitly so they can
     // run any post-publish verification before relinquishing the mutex.
@@ -927,6 +929,16 @@ export function loadBlockTtlMs(env: Env): number {
   const sec = Number.isFinite(n) && n > 0 ? n : DEFAULT_LOGIN_PROXY_BLOCK_TTL_SEC;
   // Cap at 30 days so blocked_until always stays a valid Date.
   return Math.min(sec, MAX_LOGIN_PROXY_BLOCK_TTL_SEC) * 1000;
+}
+
+/**
+ * ADR-063 — a proxy name that may key the block map: 1 to 256 characters and
+ * not ``__proto__`` (an own ``__proto__`` key cannot be set on a plain object).
+ * Longer names are never real pool proxies, so they are ignored rather than
+ * clipped; clipping would let two distinct names collide.
+ */
+function isBlockableProxyName(name: string): boolean {
+  return name.length >= 1 && name.length <= 256 && name !== "__proto__";
 }
 
 /** ADR-063 — keep the block map bounded: drop the soonest-expiring entries first. */
