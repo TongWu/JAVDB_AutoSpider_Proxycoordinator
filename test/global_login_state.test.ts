@@ -838,3 +838,66 @@ describe("ADR-063 record_attempt reason", () => {
     expect(attempt?.detail).toBe("challenge after clearance");
   });
 });
+
+describe("ADR-063 report_all_blocked", () => {
+  interface Resp { all_blocked: boolean; first: boolean; blocked_until_ms: number; server_time: number }
+  const report = (proxies: unknown, holder: unknown = "runner-A", status = 200) =>
+    jsonPost<Resp>("/login_state/report_all_blocked", { holder_id: holder, proxies }, status);
+  const alertsNow = () =>
+    jsonGet<{ alerts: Array<{ id: string; kind: string }> }>("/alerts").then((r) =>
+      r.alerts.filter((a) => a.kind === "login_all_blocked"));
+
+  it("all listed proxies blocked: first once, then false", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1, P2: t1 + 5_000 } });
+    const a = await report(["P1", "P2"]);
+    expect(a).toMatchObject({ all_blocked: true, first: true, blocked_until_ms: t1 });
+    const b = await report(["P1", "P2"]);
+    expect(b).toMatchObject({ all_blocked: true, first: false });
+  });
+
+  it("a new blocked episode alerts again", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1 } });
+    expect((await report(["P1"])).first).toBe(true);
+    await seedState({ login_blocked: { P1: t1 + 60_000 } });
+    expect((await report(["P1"])).first).toBe(true);
+  });
+
+  it("one proxy unblocked: not all blocked, nothing recorded", async () => {
+    await seedState({ login_blocked: { P1: Date.now() + 120_000 } });
+    const r = await report(["P1", "P2"]);
+    expect(r).toMatchObject({ all_blocked: false, first: false, blocked_until_ms: 0 });
+    expect(await alertsNow()).toHaveLength(0);
+  });
+
+  it("expired entries do not count as blocked", async () => {
+    await seedState({ login_blocked: { P1: Date.now() - 1, P2: Date.now() + 120_000 } });
+    expect((await report(["P1", "P2"])).all_blocked).toBe(false);
+  });
+
+  it("the alert id is deterministic and recorded once", async () => {
+    const t1 = Date.now() + 120_000;
+    await seedState({ login_blocked: { P1: t1 } });
+    await report(["P1"]);
+    await report(["P1"]);
+    const rows = await alertsNow();
+    expect(rows.map((r) => r.id)).toEqual([`loginblk-${t1}`]);
+  });
+
+  it("400 on bad bodies", async () => {
+    await report([], "runner-A", 400);
+    await report("P1", "runner-A", 400);
+    await report(["P1", ""], "runner-A", 400);
+    await report(["P1"], "", 400);
+  });
+
+  it("is authenticated", async () => {
+    const res = await rawFetch("/login_state/report_all_blocked", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ holder_id: "x", proxies: ["P1"] }),
+    });
+    expect(res.status).toBe(401);
+  });
+});

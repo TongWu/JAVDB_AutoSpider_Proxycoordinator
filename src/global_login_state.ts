@@ -15,6 +15,8 @@ import {
   LOGIN_LEASE_TTL_MIN_MS,
   PublishRequest,
   PublishResponse,
+  ReportAllBlockedRequest,
+  ReportAllBlockedResponse,
   RECENT_ATTEMPTS_MAX_LEN,
   RecordAttemptOutcome,
   RecordAttemptRequest,
@@ -101,6 +103,8 @@ interface GlobalLoginStateData {
    * pre-ADR-063 snapshot defaults it to ``proxy_name`` in ``loadState``.
    */
   last_success_proxy?: string | null;
+  /** ADR-063 — id of the last all-blocked alert raised; the dedupe key. */
+  last_all_blocked_alert_id?: string | null;
   /**
    * ADR-063 — proxies whose signin POST was still Cloudflare-challenged
    * after the cf_clearance retry, mapped to ``blocked_until`` (ms epoch).
@@ -120,6 +124,9 @@ const HKDF_INFO = new TextEncoder().encode("aes-gcm-key");
  * while protecting the DO from a misconfigured caller storing megabytes.
  */
 const MAX_COOKIE_BYTES = 16 * 1024;
+
+/** ADR-063 — cap on the proxy list accepted by ``report_all_blocked``. */
+const MAX_REPORTED_PROXIES = 64;
 
 export class GlobalLoginState implements DurableObject {
   private state: DurableObjectState;
@@ -199,6 +206,8 @@ export class GlobalLoginState implements DurableObject {
           return await this.handleReleaseLease(request);
         case "/do/login_state/record_attempt":
           return await this.handleRecordAttempt(request);
+        case "/do/login_state/report_all_blocked":
+          return await this.handleReportAllBlocked(request);
         case "/do/login/history":
           return await this.handleLoginHistory(request);
         default:
@@ -460,6 +469,68 @@ export class GlobalLoginState implements DurableObject {
       recent_failure_count: failureCount,
       cooldown_until_ms: cooldownUntilMs,
       server_time: now,
+    };
+    return jsonResponse(response);
+  }
+
+  private async handleReportAllBlocked(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<ReportAllBlockedRequest>;
+    const holderId = String(body.holder_id ?? "").trim();
+    const proxies = body.proxies;
+    if (
+      !holderId ||
+      !Array.isArray(proxies) ||
+      proxies.length === 0 ||
+      proxies.length > MAX_REPORTED_PROXIES ||
+      proxies.some((p) => typeof p !== "string" || p.trim() === "")
+    ) {
+      return jsonResponse(
+        { error: "holder_id and a non-empty proxies list (max 64) are required" },
+        400,
+      );
+    }
+    const names = (proxies as string[]).map((p) => clipShortString(p.trim()));
+
+    const now = Date.now();
+    const data = await this.loadState();
+    const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
+    const allBlocked = names.every((n) => blocked[n] !== undefined);
+    if (!allBlocked) {
+      const none: ReportAllBlockedResponse = {
+        all_blocked: false, first: false, blocked_until_ms: 0, server_time: now,
+      };
+      return jsonResponse(none);
+    }
+
+    const earliest = Math.min(...names.map((n) => blocked[n]));
+    const alertId = `loginblk-${earliest}`;
+    const first = data.last_all_blocked_alert_id !== alertId;
+    if (first) {
+      // Persist the dedupe key before dispatching: a failed dispatch must
+      // not make the next report look like a new episode.
+      data.last_all_blocked_alert_id = alertId;
+      await this.persistState(data);
+      const alert: AlertEvent = {
+        id: alertId,
+        kind: "login_all_blocked",
+        ts: now,
+        severity: "warning",
+        summary: (
+          `Every login proxy is blocked until ${new Date(earliest).toISOString()} ` +
+          `(${names.length} proxies)`
+        ).slice(0, ALERT_SUMMARY_MAX_LEN),
+        details: { proxies: names, earliest_blocked_until_ms: earliest },
+      };
+      try {
+        await recordAndDispatch(this.env, alert);
+      } catch (err) {
+        console.warn("login_all_blocked alert dispatch error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    const response: ReportAllBlockedResponse = {
+      all_blocked: true, first, blocked_until_ms: earliest, server_time: now,
     };
     return jsonResponse(response);
   }

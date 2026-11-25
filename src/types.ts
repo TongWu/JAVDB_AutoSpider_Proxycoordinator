@@ -451,6 +451,24 @@ export interface RecordAttemptRequest {
   reason?: "cf_challenge";
 }
 
+export interface ReportAllBlockedRequest {
+  holder_id: string;
+  /** Every proxy the caller may log in through (1 to 64 names). */
+  proxies: string[];
+}
+
+export interface ReportAllBlockedResponse {
+  /** ``true`` iff every listed proxy has an unexpired login block. */
+  all_blocked: boolean;
+  /** ``true`` only for the first report of this blocked episode; the
+   *  caller sends the alert email only then. */
+  first: boolean;
+  /** Earliest ``blocked_until`` among the listed proxies; ``0`` when
+   *  ``all_blocked`` is false. */
+  blocked_until_ms: number;
+  server_time: number;
+}
+
 export interface RecordAttemptResponse {
   /** Number of recent attempts (all outcomes) within the window AFTER
    *  this attempt was appended.  Surfaced so the caller can ack the
@@ -1335,12 +1353,15 @@ export interface ConfigResponseWithMerged extends ConfigResponse {
  *   within the rolling 1h window.
  * - `login_cooldown` — GlobalLoginState entered a P2-C cooldown window
  *   (recent failure count crossed the threshold).
+ * - `login_all_blocked` — every proxy the spider may log in through is
+ *   login-blocked (ADR-063); deduplicated per blocked episode.
  * - `manual_test` — operator-triggered probe (`POST /alerts/test`).
  */
 export type AlertKind =
   | "session_failed"
   | "ban_spike"
   | "login_cooldown"
+  | "login_all_blocked"
   | "manual_test";
 
 /** Wire envelope for one alert event. Stored verbatim in

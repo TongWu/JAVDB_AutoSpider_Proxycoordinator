@@ -183,6 +183,7 @@ const DELETE_ALLOWED_PATHS = new Set<string>([
  * - `POST /login_state/publish`          — publish a fresh cookie (lease holder only).
  * - `POST /login_state/invalidate`       — mark current cookie bad (optimistic version lock).
  * - `POST /login_state/release_lease`    — owner releases the re-login mutex.
+ * - `POST /login_state/report_all_blocked` — ADR-063: dedupe the all-blocked alert per episode.
  * - `POST /login_state/record_attempt`   — append a `{success|failure}` record
  *   (P2-C) to the rolling buffer used by the cooldown function.
  *
@@ -328,6 +329,14 @@ export default {
           const body = await request.json();
           return await forwardToGlobalLoginStateDo(
             env, "/do/login_state/record_attempt", "POST", body,
+          );
+        }
+        case "/login_state/report_all_blocked": {
+          // ADR-063 — spider reports that every login proxy is blocked;
+          // the DO answers `first: true` once per blocked episode.
+          const body = await request.json();
+          return await forwardToGlobalLoginStateDo(
+            env, "/do/login_state/report_all_blocked", "POST", body,
           );
         }
         // ── P1-B: per-day movie claim shard (W2.2: sub-sharded by href) ─
