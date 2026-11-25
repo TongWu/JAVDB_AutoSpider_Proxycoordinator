@@ -795,3 +795,46 @@ describe("ADR-063 login block state", () => {
     expect((await getState()).login_blocked).toEqual({ P2: until });
   });
 });
+
+describe("ADR-063 record_attempt reason", () => {
+  const post = (body: Record<string, unknown>) =>
+    jsonPost<RecordAttemptResp>("/login_state/record_attempt", {
+      holder_id: "runner-A", proxy_name: "P1", ...body,
+    });
+
+  it("cf_challenge failure blocks the proxy for the TTL", async () => {
+    const r = await post({ outcome: "failure", reason: "cf_challenge" });
+    const s = await getState();
+    expect(Math.abs(s.login_blocked!.P1 - (r.server_time + 86_400_000))).toBeLessThan(2_000);
+  });
+
+  it("reason on a success is ignored", async () => {
+    await post({ outcome: "success", reason: "cf_challenge" });
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("an unknown reason is ignored and the call still succeeds", async () => {
+    await post({ outcome: "failure", reason: "other" });
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("no reason behaves as before", async () => {
+    const r = await post({ outcome: "failure" });
+    expect(r.recent_failure_count).toBe(1);
+    expect((await getState()).login_blocked).toEqual({});
+  });
+
+  it("a cf_challenge failure still counts toward the P2-C buffer", async () => {
+    const r = await post({ outcome: "failure", reason: "cf_challenge" });
+    expect(r.recent_failure_count).toBe(1);
+  });
+
+  it("detail is stored verbatim", async () => {
+    await post({ outcome: "failure", reason: "cf_challenge", detail: "challenge after clearance" });
+    const hist = await jsonGet<{ rows: Array<{ event_kind: string; detail: string | null }> }>(
+      "/login/history",
+    );
+    const attempt = hist.rows.find((r) => r.event_kind === "attempt");
+    expect(attempt?.detail).toBe("challenge after clearance");
+  });
+});

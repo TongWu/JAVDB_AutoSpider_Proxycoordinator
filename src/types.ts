@@ -445,6 +445,10 @@ export interface RecordAttemptRequest {
    *  successful login implicitly drains the failure ratio inside the
    *  sliding window; the cooldown function counts failures only. */
   outcome: RecordAttemptOutcome;
+  /** ADR-063 — only ``"cf_challenge"`` is recognised, and only with
+   *  ``outcome: "failure"``: it marks ``proxy_name`` login-blocked.
+   *  Anything else is ignored, so old clients are unaffected. */
+  reason?: "cf_challenge";
 }
 
 export interface RecordAttemptResponse {

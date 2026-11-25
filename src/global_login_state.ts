@@ -343,6 +343,7 @@ export class GlobalLoginState implements DurableObject {
       proxy_id?: string;
       success?: boolean;
       detail?: string;
+      reason?: string;
     };
     const holderId = String(body.holder_id ?? "").trim();
     // proxy_id is accepted as an alias for proxy_name.
@@ -391,6 +392,14 @@ export class GlobalLoginState implements DurableObject {
       pruned.shift();
     }
     data.recent_attempts = pruned;
+    // ADR-063: a signin POST still challenged after the clearance retry
+    // blocks the proxy; the caller sends the record before releasing its
+    // lease so no peer can try the same proxy first.
+    const blocked = pruneLoginBlocked(data.login_blocked ?? {}, now);
+    if (outcome === "failure" && body.reason === "cf_challenge") {
+      blocked[clipShortString(proxyName)] = now + loadBlockTtlMs(this.env);
+    }
+    data.login_blocked = blocked;
     await this.persistState(data);
 
     // Phase 2 / ADR-002 — login_event_log: attempt
